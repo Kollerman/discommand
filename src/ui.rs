@@ -125,6 +125,11 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect, split: bool) {
                 _ => DIM,
             };
             let mut spans = vec![Span::raw(indent), Span::styled(icon, icon_style), Span::styled(t.label.clone(), style)];
+            // Unread chats (and servers, folded categories, the DM list holding them).
+            let chat = matches!(t.kind, ItemKind::DmHeader | ItemKind::Guild | ItemKind::Category | ItemKind::Channel | ItemKind::Dm | ItemKind::WaChat);
+            if chat && t.unread {
+                spans.push(Span::styled(" ●", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+            }
             if t.mentions > 0 {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(format!(" {} ", t.mentions), Style::new().bg(Color::Red).fg(Color::White)));

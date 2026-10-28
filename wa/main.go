@@ -151,13 +151,25 @@ func (a *App) emitChats(ctx context.Context) {
 		a.fail("load chats: %v", err)
 		return
 	}
-	if chats == nil {
-		chats = []*Chat{}
-	}
+	shown := []*Chat{}
 	for _, c := range chats {
+		// Stored before such chats were filtered out.
+		if j, err := types.ParseJID(c.JID); err == nil && hiddenChat(j) {
+			continue
+		}
 		a.resolveChat(ctx, c)
+		shown = append(shown, c)
 	}
+	chats = shown
 	a.emit(event{"t": "chats", "chats": chats})
+}
+
+// hiddenChat tells chats that aren't conversations here: status updates and
+// broadcast lists, channels, and WhatsApp's announcement account
+// (0@s.whatsapp.net, which would show as a nameless "+0").
+func hiddenChat(j types.JID) bool {
+	return j.Server == types.BroadcastServer || j.Server == types.NewsletterServer ||
+		j.ToNonAD() == types.PSAJID || j.ToNonAD() == types.LegacyPSAJID
 }
 
 func (a *App) emitChat(ctx context.Context, jid string) {
@@ -383,7 +395,7 @@ func (a *App) onEvent(raw any) {
 
 func (a *App) onMessage(ctx context.Context, evt *events.Message, live bool) {
 	info := evt.Info
-	if info.Chat.Server == types.BroadcastServer || info.Chat.Server == types.NewsletterServer {
+	if hiddenChat(info.Chat) {
 		return
 	}
 	chatJID := a.canonical(ctx, info.Chat)
@@ -485,7 +497,7 @@ func (a *App) emitMsg(ctx context.Context, chat, id string) {
 func (a *App) onHistorySync(ctx context.Context, evt *events.HistorySync) {
 	for _, conv := range evt.Data.GetConversations() {
 		jid, err := types.ParseJID(conv.GetID())
-		if err != nil || jid.Server == types.BroadcastServer || jid.Server == types.NewsletterServer {
+		if err != nil || hiddenChat(jid) {
 			continue
 		}
 		for _, hm := range conv.GetMessages() {
