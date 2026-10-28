@@ -176,6 +176,18 @@ impl Api {
         self.request(Method::POST, "/auth/logout", Some(&body)).await.map(|_| ())
     }
 
+    /// Marks many channels read at once: (channel, newest message id).
+    pub async fn ack_bulk(&self, read: &[(String, String)]) -> Result<(), String> {
+        for chunk in read.chunks(100) {
+            let states: Vec<Value> = chunk
+                .iter()
+                .map(|(c, m)| json!({ "channel_id": c, "message_id": m, "read_state_type": 0 }))
+                .collect();
+            self.request(Method::POST, "/read-states/ack-bulk", Some(&json!({ "read_states": states }))).await?;
+        }
+        Ok(())
+    }
+
     pub async fn ack(&self, channel: &str, id: &str) -> Result<(), String> {
         let body = json!({ "token": null });
         self.request(Method::POST, &format!("/channels/{channel}/messages/{id}/ack"), Some(&body))

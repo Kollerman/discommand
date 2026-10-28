@@ -36,6 +36,8 @@ pub enum AppEvent {
     Cal(CalMsg),
     /// From the task tab of this service.
     Todo(Service, TodoMsg),
+    /// A newer release (its tag) is on GitHub.
+    Update(String),
 }
 
 pub enum TodoMsg {
@@ -121,6 +123,11 @@ impl Service {
             Service::Tasks => "Microsoft To Do",
             Service::Twos => "Twos",
         }
+    }
+
+    /// A chat service (with unread messages to mark read).
+    pub fn is_messaging(self) -> bool {
+        matches!(self, Service::Discord | Service::WhatsApp | Service::Matrix)
     }
 
     /// A chat service run through the WhatsApp helper protocol (`WaState`).
@@ -348,6 +355,8 @@ pub struct App {
     pub dirty: bool,
     pub quit: bool,
     pub logout: bool,
+    /// A newer release, shown in the status bar.
+    pub update: Option<String>,
 }
 
 impl App {
@@ -431,6 +440,7 @@ impl App {
             dirty: true,
             quit: false,
             logout: false,
+            update: None,
         }
     }
 
@@ -1559,6 +1569,10 @@ impl App {
             AppEvent::Pic { key, pic } => self.pics.finish(key, pic),
             AppEvent::Cal(msg) => self.on_cal(msg),
             AppEvent::Todo(s, msg) => self.on_todo(s, msg),
+            AppEvent::Update(tag) => {
+                self.status = format!("discommand {tag} is out: run git pull, then the install script again");
+                self.update = Some(tag);
+            }
         }
     }
 
@@ -1938,6 +1952,57 @@ impl App {
             let op = json!({"op": 14, "d": {"guild_id": g, "typing": false, "activities": false, "threads": false}});
             let _ = self.gw.send(op.to_string());
         }
+    }
+
+    /// Marks every chat of these messaging services read, on the service
+    /// too (WhatsApp sends read receipts only if they're on; Matrix sends
+    /// private ones unless public ones are on).
+    fn read_all(&mut self, services: &[Service]) {
+        let mut n = 0;
+        for &s in services.iter().filter(|s| s.built()) {
+            match s {
+                Service::Discord => {
+                    let st = &self.state;
+                    let unread: Vec<(String, u64)> = st
+                        .channels
+                        .values()
+                        .filter(|c| st.is_unread(c) || st.mention_count(&c.id) > 0)
+                        .map(|c| (c.id.clone(), c.last_id()))
+                        .filter(|(_, last)| *last > 0)
+                        .collect();
+                    for (id, last) in &unread {
+                        self.state.read.insert(id.clone(), *last);
+                        self.state.acked.insert(id.clone(), *last);
+                    }
+                    self.state.mentions.clear();
+                    n += unread.len();
+                    if !unread.is_empty() {
+                        let read: Vec<(String, String)> = unread.into_iter().map(|(c, last)| (c, last.to_string())).collect();
+                        let api = self.api.clone();
+                        self.spawn(async move {
+                            api.ack_bulk(&read).await.err().map(|e| AppEvent::Error(format!("Discord: marking read failed: {e}")))
+                        });
+                    }
+                }
+                Service::WhatsApp | Service::Matrix => {
+                    let chats: Vec<String> = self.chats(s).chats.values().filter(|c| c.unread > 0).map(|c| c.jid.clone()).collect();
+                    for jid in &chats {
+                        wa::send(self.cmd_of(s), json!({"c": "seen", "chat": jid}));
+                        if let Some(c) = self.chats_mut(s).chats.get_mut(jid) {
+                            c.unread = 0;
+                        }
+                    }
+                    n += chats.len();
+                }
+                _ => {}
+            }
+        }
+        self.status = match n {
+            0 => "nothing unread".into(),
+            1 => "marked 1 chat read".into(),
+            n => format!("marked {n} chats read"),
+        };
+        self.tree_dirty = true;
     }
 
     fn mark_read(&mut self, channel: &str) {
@@ -2331,13 +2396,14 @@ impl App {
                 self.status = format!("images {}", if self.pics.enabled { "on" } else { "off" });
             }
             "r" | "refresh" => self.refresh(),
+            // The messaging service shown (else all of them), or `:read all`.
             "read" => {
-                // Mark every channel read locally (no network traffic).
-                for (id, c) in &self.state.channels {
-                    self.state.read.insert(id.clone(), c.last_id());
+                let all = [Service::Discord, Service::WhatsApp, Service::Matrix];
+                if arg == "all" || !self.service.is_messaging() {
+                    self.read_all(&all);
+                } else {
+                    self.read_all(&[self.service]);
                 }
-                self.state.mentions.clear();
-                self.tree_dirty = true;
             }
             _ => self.status = format!("E492: Not an editor command: {cmd}"),
         }
@@ -2567,6 +2633,11 @@ impl App {
             }
             KeyCode::Char('?' | 'ß') => {
                 self.help = true;
+                return;
+            }
+            // Read all: every chat of the messaging service shown.
+            KeyCode::Char('A') if self.service.is_messaging() => {
+                self.read_all(&[self.service]);
                 return;
             }
             KeyCode::Char('i') | KeyCode::Char('a') if !matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos) => {

@@ -740,6 +740,16 @@ impl Mx {
                         let st = self.state.lock().unwrap();
                         (st.newest.get(&chat).cloned(), st.recent.receipts)
                     };
+                    // Not seen since the last start: ask the server for the newest event.
+                    let newest = match newest {
+                        Some(id) => Some(id),
+                        None => {
+                            let mut opts = MessagesOptions::backward();
+                            opts.limit = 1u32.into();
+                            let page = room.messages(opts).await.map_err(|e| e.to_string())?;
+                            page.chunk.first().and_then(|e| e.event_id()).map(|id| id.to_string())
+                        }
+                    };
                     if let Some(ev) = newest.as_deref().and_then(event_id) {
                         // Private receipts clear unread counts without telling anyone.
                         let kind = if public { ReceiptType::Read } else { ReceiptType::ReadPrivate };

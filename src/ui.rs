@@ -737,6 +737,9 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
             waiting.push(format!("{}: {n} unread", s.name()));
         }
     }
+    if let Some(tag) = &app.update {
+        waiting.push(format!("⬆ {tag}"));
+    }
     let other = if waiting.is_empty() { String::new() } else { format!(" {} ", waiting.join(" · ")) };
     // Open tasks due today or earlier, everywhere.
     let due = app.due_tasks();
@@ -881,7 +884,8 @@ const HELP: &[(&str, &str)] = &[
     ("", "COMMANDS"),
     (":b name", "open first matching channel"),
     (":r", "reload chat / sync calendar"),
-    (":read", "mark everything read (Discord)"),
+    ("A", "mark all chats of this service read"),
+    (":read  :read all", "the same / in every chat service"),
     (":images on|off", "show pictures in chats (on)"),
     (":wa receipts on", "send WhatsApp read receipts (off)"),
     (":wa logout", "unlink WhatsApp"),

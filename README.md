@@ -253,11 +253,11 @@ The app is modal like vim. Press `?` inside it for this list.
 
 | Mode | Keys |
 | --- | --- |
-| anywhere (normal) | `i`/`a` insert · `:` command · `/` or `Ctrl-k` find chat · `?` help · **`Shift-Tab` / `gt` next service, right `Shift-Tab` / `gT` previous, `2gt` the 2nd** (right Shift is detected on Windows only) · `Tab`, `Ctrl-w w`, `Ctrl-h`/`Ctrl-l` switch pane |
+| anywhere (normal) | `i`/`a` insert · **`A` mark every chat of this service read** · `:` command · `/` or `Ctrl-k` find chat · `?` help · **`Shift-Tab` / `gt` next service, right `Shift-Tab` / `gT` previous, `2gt` the 2nd** (right Shift is detected on Windows only) · `Tab`, `Ctrl-w w`, `Ctrl-h`/`Ctrl-l` switch pane |
 | sidebar | `j k` · `gg G` · counts (`5j`) · `l`/`o`/`Enter` open/expand · `h` collapse/parent · `za zo zc zM` |
 | messages | `j k Ctrl-u Ctrl-d` select · `gg` top + load history · `G`/`Esc` newest · `r`/`R` reply (ping/no ping) · `+` react (then `1`–`5`: ❤️ 👍 😂 💀 😅; the same again removes it) · `e` edit · `dd` delete · `o`/`gx` open link, attachment or WhatsApp media |
 | insert | `Enter` send · `Alt-Enter` newline · `↑` on empty input edits your last message · `Esc` normal · `Shift-Tab` switch service |
-| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` mark Discord read · `:images on\|off` · `:wa receipts on\|off` · `:wa logout` · `:q` quit · `:logout` |
+| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:images on\|off` · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
 
 Each service keeps its own open chat, sidebar position and unsent draft. The
 statusline shows which service is active, and how many unread chats or mentions
@@ -461,6 +461,20 @@ Users then never see a developer console.
    the binary is the documented approach. Still, keep the file out of public places.
 
 Discord and WhatsApp need nothing from the publisher: both log in by QR code.
+
+### Announcing updates
+
+discommand checks GitHub at startup and then once a day for a newer **release**. If
+there is one, the status line says so and keeps a `⬆ v0.2.0` hint. The repository
+has to be public for this; while it's private, the check finds nothing and stays
+silent. To publish an update:
+
+1. Raise `version` in `Cargo.toml` (e.g. `0.2.0`), commit and push.
+2. On GitHub: *Releases → Draft a new release*, tag `v0.2.0`, publish.
+
+Plain pushes don't trigger the notice; only releases do. The check is one small
+request to `api.github.com` (which sees the user's IP address, like any visit to
+GitHub). Users can turn it off by setting `DISCOMMAND_NO_UPDATE_CHECK=1`.
 
 ## Adding an integration
 

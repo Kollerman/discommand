@@ -15,6 +15,7 @@ mod text;
 mod todo;
 mod twos;
 mod ui;
+mod update;
 mod view;
 mod wa;
 
@@ -246,6 +247,12 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
     };
 
     let mx_cmds = if Service::Matrix.built() { start_matrix(&tx).await? } else { unbounded_channel().0 };
+    if update::enabled() {
+        let tx = tx.clone();
+        tokio::spawn(update::watch(move |tag| {
+            let _ = tx.send(AppEvent::Update(tag));
+        }));
+    }
 
     let mut app = App::new(api, tx, gw_tx, cmds, mx_cmds);
     app.cal_sync();
