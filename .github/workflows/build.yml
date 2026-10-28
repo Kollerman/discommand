@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [discord, whatsapp, calendar, todo, twos]
+        feature: [discord, whatsapp, matrix, calendar, todo, twos]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

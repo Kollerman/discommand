@@ -643,19 +643,27 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
         _ if app.finder.is_some() => (" FIND ", Color::Yellow),
         _ => (" NORMAL ", ACCENT),
     };
-    let (service, service_bg, other) = match app.service {
-        Service::Discord => {
-            let n = app.wa.unread_chats();
-            (" DISCORD ", Color::Indexed(99), if n > 0 { format!(" WhatsApp: {n} unread ") } else { String::new() })
-        }
-        Service::WhatsApp => {
-            let n: u32 = app.state.mentions.values().sum();
-            (" WHATSAPP ", WA_GREEN, if n > 0 { format!(" Discord: {n} mentions ") } else { String::new() })
-        }
-        Service::Calendar => (" CALENDAR ", Color::Yellow, String::new()),
-        Service::Tasks => (" TASKS ", Color::LightBlue, String::new()),
-        Service::Twos => (" TWOS ", Color::Indexed(209), String::new()),
+    let (service, service_bg) = match app.service {
+        Service::Discord => (" DISCORD ", Color::Indexed(99)),
+        Service::WhatsApp => (" WHATSAPP ", WA_GREEN),
+        Service::Matrix => (" MATRIX ", Color::Indexed(37)),
+        Service::Calendar => (" CALENDAR ", Color::Yellow),
+        Service::Tasks => (" TASKS ", Color::LightBlue),
+        Service::Twos => (" TWOS ", Color::Indexed(209)),
     };
+    // What's waiting in the other chat services.
+    let mut waiting = Vec::new();
+    let mentions: u32 = app.state.mentions.values().sum();
+    if app.service != Service::Discord && mentions > 0 {
+        waiting.push(format!("Discord: {mentions} mentions"));
+    }
+    for s in [Service::WhatsApp, Service::Matrix] {
+        let n = app.chats(s).unread_chats();
+        if app.service != s && n > 0 {
+            waiting.push(format!("{}: {n} unread", s.name()));
+        }
+    }
+    let other = if waiting.is_empty() { String::new() } else { format!(" {} ", waiting.join(" · ")) };
     // Open tasks due today or earlier, everywhere.
     let due = app.due_tasks();
     let other = if due > 0 { format!("{other} ☐ {due} due ") } else { other };
@@ -675,7 +683,10 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
     };
     let (name, conn) = match app.service {
         Service::Discord => (app.state.me.name().to_string(), app.conn.as_str()),
-        Service::WhatsApp => (app.wa.name.clone(), app.wa.conn.as_str()),
+        Service::WhatsApp | Service::Matrix => {
+            let chats = app.chats(app.service);
+            (if chats.name.is_empty() { chats.me.clone() } else { chats.name.clone() }, chats.conn.as_str())
+        }
         Service::Calendar if app.cal.status.is_empty() => ("Google Calendar".to_string(), "not connected"),
         Service::Calendar => (app.cal.account.clone(), app.cal.status.as_str()),
         Service::Tasks | Service::Twos if app.tasks().status.is_empty() => (app.service.name().to_string(), "not connected"),
@@ -764,7 +775,7 @@ const HELP: &[(&str, &str)] = &[
     ("i a", "insert mode (write message)"),
     (": ö", "command line"),
     ("/ - # ^k", "find channel"),
-    ("shift+tab  gt", "next service (Discord → WhatsApp → Calendar)"),
+    ("shift+tab  gt", "next service (Discord → WhatsApp → Matrix → …)"),
     ("rshift+tab  gT", "previous service · {n}gt: the n-th one"),
     ("tab ^w w", "switch pane (^h / ^l also work)"),
     ("? ß", "this help"),
@@ -800,6 +811,8 @@ const HELP: &[(&str, &str)] = &[
     (":images on|off", "show pictures in chats (on)"),
     (":wa receipts on", "send WhatsApp read receipts (off)"),
     (":wa logout", "unlink WhatsApp"),
+    (":mx receipts on", "send Matrix read receipts (off)"),
+    (":mx logout", "log out of Matrix"),
     (":cal setup FILE", "connect Google Calendar"),
     (":todo setup ID", "connect Microsoft To Do"),
     (":twos login KEY", "connect Twos"),
@@ -1083,7 +1096,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (gw, _) = tokio::sync::mpsc::unbounded_channel();
         let (wa, _) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(crate::api::Api::new("x").unwrap(), tx, gw, wa);
+        let (mx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(crate::api::Api::new("x").unwrap(), tx, gw, wa, mx);
         app.service = Service::Calendar;
         app.cal_view = CalView::Week;
         let monday = Local::now().date_naive() - Days::new(Local::now().weekday().num_days_from_monday() as u64);

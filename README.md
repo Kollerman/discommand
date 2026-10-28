@@ -1,9 +1,9 @@
 # discommand
 
-A small, vim-style terminal client for **Discord, WhatsApp, Google Calendar, Microsoft To Do and Twos**, written in Rust.
+A small, vim-style terminal client for **Discord, WhatsApp, Matrix, Google Calendar, Microsoft To Do and Twos**, written in Rust.
 It's inspired by [discordo](https://github.com/ayn2op/discordo) and runs natively on
 **Windows (x64 and ARM64), Linux (x64 and ARM64) and macOS (Apple Silicon and Intel)**.
-Press **Shift+Tab** to cycle Discord → WhatsApp → Calendar → Tasks, and **right Shift+Tab** to go back.
+Press **Shift+Tab** to cycle Discord → WhatsApp → Matrix → Calendar → Tasks → Twos, and **right Shift+Tab** to go back.
 
 What it does to save battery and memory:
 
@@ -12,7 +12,8 @@ What it does to save battery and memory:
 - Uses a zlib-compressed Discord gateway, so less radio time.
 - Drops presence, typing and member-list events unread, before any JSON parsing.
 - Doesn't subscribe to typing, activities or member lists.
-- Never sends typing or online status to WhatsApp, and sends no WhatsApp read receipts unless you turn them on.
+- Never sends typing or online status to WhatsApp or Matrix, and sends no read receipts unless you turn them on
+  (Matrix gets private receipts, which clear unread counts without telling anyone).
 - Shows pictures as low-resolution half-block art (`▀`, two pixels per cell) inside the
   chat. Discord's media proxy is asked for an ~80 px copy, and WhatsApp uses the small
   thumbnail already inside each message, so a picture costs a few KB. Pictures only load
@@ -20,11 +21,13 @@ What it does to save battery and memory:
   Selecting a message (`j`/`k`) loads its pictures in high resolution, filling the
   pane: a 320 px copy from Discord, or the original image from WhatsApp.
 
-Supported: Discord text channels and DMs; WhatsApp chats and groups (text, replies,
-edits, deletes, reactions shown, media opened on demand). Voice, calls, forums,
+Supported: Discord text channels and DMs; WhatsApp chats and groups; Matrix rooms
+and DMs, end-to-end encrypted ones included (text, replies, edits, deletes,
+reactions, media opened on demand). Voice, calls, forums,
 threads and status updates aren't supported.
 
-> **Heads-up:** both services forbid unofficial clients in their terms.
+> **Heads-up:** Discord and WhatsApp forbid unofficial clients in their terms (Matrix
+> is an open protocol and welcomes them).
 > Discord logs in with your user token. WhatsApp links as a companion device through
 > [whatsmeow](https://github.com/tulir/whatsmeow), the library behind mautrix-whatsapp.
 > Normal personal use is generally fine, but accounts can be banned, more readily on
@@ -163,6 +166,7 @@ sh install.sh --with discord,calendar          # Linux, macOS
 | --- | --- |
 | `discord` | Discord |
 | `whatsapp` | WhatsApp (the only one that needs Go) |
+| `matrix` | Matrix (the biggest: about 3–5 minutes of extra build time and a larger program) |
 | `calendar` | Google Calendar |
 | `todo` | Microsoft To Do |
 | `twos` | Twos |
@@ -183,8 +187,8 @@ shows what a build contains. With plain cargo:
 
 ## Login
 
-The chat services built in (Discord, WhatsApp) need their account; you log in on
-first start:
+The chat services built in (Discord, WhatsApp, Matrix) need their account; you log in
+on first start:
 
 1. **Discord:** a QR code appears. In the Discord app on your phone, open Settings →
    **Scan QR Code**, scan it and confirm. There's no password, captcha or 2FA prompt;
@@ -196,6 +200,12 @@ first start:
 2. **WhatsApp:** a QR code appears. On your phone go to WhatsApp → Settings →
    Linked devices → Link a device, and scan it. To link with a code instead, start
    with `discommand --wa-phone +491701234567`.
+3. **Matrix:** enter your Matrix ID (`@you:matrix.org`). Servers with the new login
+   (matrix.org and most others) open a sign-in page in the browser; older ones ask for
+   the password (hidden). Then enter your **recovery key** (Element: Settings →
+   Encryption) to read encrypted history: it verifies this device and fetches the
+   message keys from the server's key backup. Enter alone skips it; then only new
+   messages can be read.
 
 The config dir is `%APPDATA%` on Windows, `~/Library/Application Support` on macOS
 and `~/.config` on Linux. The WhatsApp
@@ -204,14 +214,15 @@ that file like a password. WhatsApp only syncs recent history when a device is
 linked. Older messages appear once the phone has sent them.
 
 - `discommand --logout` or `:logout` removes the saved Discord token.
-- `:wa logout` unlinks WhatsApp.
+- `:wa logout` unlinks WhatsApp, `:mx logout` logs out of Matrix.
 - `discommand --logout-a` logs out of **everything** (close discommand first):
   - **Discord:** logged out on Discord's side, so the old token stops working.
   - **WhatsApp:** unlinked, so it leaves your phone's *Linked devices*.
+  - **Matrix:** logged out on the server, so the session disappears from your devices list.
   - **Google:** access is revoked.
   - **Microsoft and Twos:** the saved logins are deleted.
-  - **Local data:** the WhatsApp chat history and cached pictures and downloads
-    are deleted too.
+  - **Local data:** the WhatsApp chat history, the Matrix store (keys, room state)
+    and cached pictures and downloads are deleted too.
 
   You can also revoke the Twos key under Twos → Settings → API Keys, and the
   Microsoft access at account.microsoft.com → Privacy.
@@ -263,6 +274,24 @@ keyboards), `-` or `#` opens the finder, and `ß` shows help. AltGr characters
 shortcuts.
 
 When the terminal is narrower than 70 columns (phones), only one pane is shown at a time.
+
+## Matrix
+
+Matrix is the third mode (`3gt`) and works like WhatsApp: rooms and DMs on the left,
+most recently active first (`#` rooms, `@` DMs), with the same keys for replying,
+editing, deleting, reacting and opening media. Encryption is handled by
+[matrix-rust-sdk](https://github.com/matrix-org/matrix-rust-sdk), the library behind
+Element X. Keys, room state and the session are stored in an encrypted SQLite
+database in `<config dir>/discommand/matrix/`, whose passphrase is kept with the other
+secrets.
+
+- Pictures: the server scales unencrypted ones; encrypted ones use the thumbnail the
+  sender attached.
+- Read receipts are private by default; `:mx receipts on` makes them public.
+- Spaces aren't shown as a tree; their rooms appear in the list. Invitations have to
+  be accepted in another app for now.
+- A message that can't be decrypted shows 🔒. Its key usually arrives from the key
+  backup; `:r` reloads the room.
 
 ## Calendar
 
@@ -336,7 +365,7 @@ until the next reminder or event change, with no polling.
 
 ## Tasks (Microsoft To Do)
 
-Microsoft To Do is optional. It's the fourth mode (`4gt`): your lists on the left
+Microsoft To Do is optional. It's the fifth mode (`5gt`): your lists on the left
 with their open tasks, the selected task's details on the right. Overdue tasks are
 red, tasks due today yellow, important ones bold. Tasks with a due date also appear in
 the calendar's all-day row (`☐ …`, in To Do blue), and the status line shows how many
@@ -375,7 +404,7 @@ has no date. Reminders ring the bell and show in the status line.
 
 ## Twos
 
-[Twos](https://www.twosapp.com) is the fifth mode (`5gt`) and works like the Tasks
+[Twos](https://www.twosapp.com) is the sixth mode (`6gt`) and works like the Tasks
 mode above, with the same keys: your open todos grouped by list, with **Today** first.
 New todos go to today's list unless you select another list. A date or time typed
 with a todo (`morgen 14:00 Arzt anrufen`) becomes its Twos reminder. Twos has no

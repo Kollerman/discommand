@@ -2,6 +2,8 @@ mod api;
 mod app;
 mod cal;
 mod gateway;
+#[cfg(feature = "matrix")]
+mod matrix;
 mod model;
 mod pics;
 mod qr;
@@ -27,10 +29,17 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::api::Api;
 use crate::app::{App, AppEvent, Service};
 
-#[cfg(not(any(feature = "discord", feature = "whatsapp", feature = "calendar", feature = "todo", feature = "twos")))]
-compile_error!("build with at least one integration: discord, whatsapp, calendar, todo, twos");
+#[cfg(not(any(
+    feature = "discord",
+    feature = "whatsapp",
+    feature = "matrix",
+    feature = "calendar",
+    feature = "todo",
+    feature = "twos"
+)))]
+compile_error!("build with at least one integration: discord, whatsapp, matrix, calendar, todo, twos");
 
-const USAGE: &str = "discommand — lightweight terminal client for Discord, WhatsApp,
+const USAGE: &str = "discommand — lightweight terminal client for Discord, WhatsApp, Matrix,
 Google Calendar, Microsoft To Do and Twos (whichever are built in, see --version)
 
 usage: discommand [--wa-phone NUMBER] [--discord-token] [--logout] [--logout-a] [--help] [--version]
@@ -46,8 +55,9 @@ WhatsApp is linked once by scanning a QR code (Linked devices).
   --logout           delete the saved Discord token and exit
                      (unlink WhatsApp with :wa logout inside the app)
   --logout-a         log out of everything: Discord, WhatsApp (unlinked),
-                     Google, Microsoft and Twos; also deletes the WhatsApp
-                     chat history and cached media. Close discommand first.";
+                     Matrix, Google, Microsoft and Twos; also deletes the
+                     WhatsApp chat history, the Matrix store and cached media.
+                     Close discommand first.";
 
 fn clean(t: &str) -> String {
     t.trim().trim_matches('"').trim().to_string()
@@ -130,6 +140,14 @@ async fn logout_all() {
         println!("Twos: API key removed (revoke it in Twos → Settings → API Keys)");
     }
 
+    #[cfg(feature = "matrix")]
+    if matrix::has_session() {
+        match matrix::logout().await {
+            Ok(()) => println!("Matrix: logged out"),
+            Err(e) => println!("Matrix: session deleted (the server didn't confirm the logout: {e})"),
+        }
+    }
+
     if let Some(db) = secret::data_dir().map(|d| d.join("whatsapp.db")).filter(|db| db.exists()) {
         match wa::unlink().await {
             Ok(true) => println!("WhatsApp: unlinked"),
@@ -191,6 +209,9 @@ fn main() {
 }
 
 async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> {
+    // Matrix's HTTP client uses rustls and needs its crypto backend chosen.
+    #[cfg(feature = "matrix")]
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let (tx, mut rx) = unbounded_channel::<AppEvent>();
     let (gw_tx, gw_rx) = unbounded_channel::<String>();
     // Without Discord built in, the API client has no token and is never used.
@@ -213,7 +234,7 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
         let wa_tx = tx.clone();
         tokio::spawn(async move {
             while let Some(ev) = events.recv().await {
-                if wa_tx.send(AppEvent::Wa(ev)).is_err() {
+                if wa_tx.send(AppEvent::Wa(Service::WhatsApp, ev)).is_err() {
                     return;
                 }
             }
@@ -224,12 +245,14 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
         (unbounded_channel().0, None, Vec::new())
     };
 
-    let mut app = App::new(api, tx, gw_tx, cmds);
+    let mx_cmds = if Service::Matrix.built() { start_matrix(&tx).await? } else { unbounded_channel().0 };
+
+    let mut app = App::new(api, tx, gw_tx, cmds, mx_cmds);
     app.cal_sync();
     app.todo_sync(Service::Tasks);
     app.todo_sync(Service::Twos);
     for ev in replay {
-        app.on_event(AppEvent::Wa(ev));
+        app.on_event(AppEvent::Wa(Service::WhatsApp, ev));
     }
     let mut terminal = ratatui::init();
     let _ = execute!(io::stdout(), EnableBracketedPaste);
@@ -251,6 +274,27 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
         println!("Logged out; saved token removed.");
     }
     res.map_err(|e| e.to_string())
+}
+
+/// Logs in to Matrix (in the terminal, before the UI) and starts syncing.
+#[cfg(feature = "matrix")]
+async fn start_matrix(tx: &UnboundedSender<AppEvent>) -> Result<UnboundedSender<String>, String> {
+    let client = matrix::login().await?;
+    let (mut events, cmds) = matrix::start(client);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = events.recv().await {
+            if tx.send(AppEvent::Wa(Service::Matrix, ev)).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(cmds)
+}
+
+#[cfg(not(feature = "matrix"))]
+async fn start_matrix(_: &UnboundedSender<AppEvent>) -> Result<UnboundedSender<String>, String> {
+    Ok(unbounded_channel().0)
 }
 
 async fn sleep_until(at: Option<std::time::Instant>) {

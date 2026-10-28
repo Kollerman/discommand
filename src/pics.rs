@@ -26,6 +26,8 @@ pub enum PicSrc {
     /// A WhatsApp message; `full` downloads the original instead of the
     /// embedded thumbnail.
     Wa { chat: String, id: String, full: bool },
+    /// The same for a Matrix message (`full`: a large copy, not the thumbnail).
+    Mx { chat: String, id: String, full: bool },
 }
 
 #[derive(Clone, Debug)]

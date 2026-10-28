@@ -1,5 +1,6 @@
 //! WhatsApp support: talks to the `discommand-wa` helper (whatsmeow) over
-//! JSON lines on its stdin/stdout.
+//! JSON lines on its stdin/stdout. Matrix speaks the same protocol, so the
+//! chat model here (`WaState`) serves both.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -38,6 +39,8 @@ pub struct WaMsg {
     pub sender_name: String,
     pub from_me: bool,
     pub ts: i64,
+    /// Milliseconds within `ts`, to order messages sent in the same second.
+    pub ms: u16,
     pub kind: String,
     pub text: String,
     pub file: String,
@@ -89,6 +92,8 @@ pub enum WaEvent {
 
 #[derive(Default)]
 pub struct WaState {
+    /// Matrix rather than WhatsApp (decides where pictures come from).
+    pub matrix: bool,
     pub me: String,
     pub name: String,
     pub receipts: bool,
@@ -127,7 +132,7 @@ impl WaState {
             *existing = m;
             return;
         }
-        let pos = list.iter().rposition(|x| (x.ts, &x.id) <= (m.ts, &m.id)).map_or(0, |i| i + 1);
+        let pos = list.iter().rposition(|x| x.order() <= m.order()).map_or(0, |i| i + 1);
         list.insert(pos, m);
         if list.len() > MAX_MESSAGES {
             let chat = list[0].chat.clone();
@@ -146,10 +151,10 @@ impl WaState {
         }
         if older {
             let existing = self.messages.entry(chat).or_default();
-            let first = existing.first().map(|m| (m.ts, m.id.clone()));
+            let first = existing.first().map(|m| (m.ts, m.ms, m.id.clone()));
             let mut list: Vec<WaMsg> = msgs
                 .into_iter()
-                .filter(|m| first.as_ref().map_or(true, |(ts, id)| (m.ts, &m.id) < (*ts, id)))
+                .filter(|m| first.as_ref().map_or(true, |(ts, ms, id)| m.order() < (*ts, *ms, id)))
                 .collect();
             let added = list.len();
             list.append(existing);
@@ -163,7 +168,7 @@ impl WaState {
                     list.push(m);
                 }
             }
-            list.sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
+            list.sort_by(|a, b| a.order().cmp(&b.order()));
             self.messages.insert(chat, list);
             0
         }
@@ -203,11 +208,17 @@ impl WaState {
     }
 
     pub fn view_messages(&self, chat: &str) -> Option<Vec<ViewMsg>> {
-        Some(self.messages.get(chat)?.iter().map(view).collect())
+        Some(self.messages.get(chat)?.iter().map(|m| view(m, self.matrix)).collect())
     }
 }
 
-fn view(m: &WaMsg) -> ViewMsg {
+impl WaMsg {
+    fn order(&self) -> (i64, u16, &str) {
+        (self.ts, self.ms, &self.id)
+    }
+}
+
+fn view(m: &WaMsg, matrix: bool) -> ViewMsg {
     let body = if m.deleted {
         "message deleted".to_string()
     } else {
@@ -248,12 +259,16 @@ fn view(m: &WaMsg) -> ViewMsg {
         dim: m.deleted,
         reactions: m.reactions.clone(),
         pics: if m.media && !m.deleted && matches!(m.kind.as_str(), "image" | "video" | "gif" | "sticker") {
+            let src = |full| {
+                let (chat, id) = (m.chat.clone(), m.id.clone());
+                if matrix { PicSrc::Mx { chat, id, full } } else { PicSrc::Wa { chat, id, full } }
+            };
             vec![PicRef {
                 key: pic_key(&m.chat, &m.id),
-                src: PicSrc::Wa { chat: m.chat.clone(), id: m.id.clone(), full: false },
+                src: src(false),
                 w: m.img_w,
                 h: m.img_h,
-                hd_src: PicSrc::Wa { chat: m.chat.clone(), id: m.id.clone(), full: true },
+                hd_src: src(true),
             }]
         } else {
             Vec::new()
@@ -431,10 +446,10 @@ mod tests {
     #[test]
     fn renders_media_and_deleted() {
         let m = WaMsg { kind: "image".into(), text: "look".into(), ..Default::default() };
-        assert_eq!(view(&m).body, "[image] look");
+        assert_eq!(view(&m, false).body, "[image] look");
         let m = WaMsg { kind: "voice".into(), text: "0:12".into(), ..Default::default() };
-        assert_eq!(view(&m).body, "[voice 0:12]");
+        assert_eq!(view(&m, false).body, "[voice 0:12]");
         let m = WaMsg { kind: "text".into(), deleted: true, ..Default::default() };
-        assert!(view(&m).dim);
+        assert!(view(&m, false).dim);
     }
 }

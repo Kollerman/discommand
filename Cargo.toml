@@ -6,13 +6,16 @@ description = "Lightweight, battery-friendly terminal Discord client"
 license = "MIT"
 
 [features]
-default = ["native-tls", "discord", "whatsapp", "calendar", "todo", "twos"]
+default = ["native-tls", "discord", "whatsapp", "matrix", "calendar", "todo", "twos"]
 
 # Integrations: build with any subset, e.g.
 #   cargo build --release --no-default-features --features native-tls,discord,calendar
 # (the install scripts take --with / -With for this). Each one is a Shift+Tab tab.
 discord = ["dep:rsa"]
 whatsapp = []
+# Matrix with end-to-end encryption (matrix-rust-sdk). Its HTTP client always uses
+# rustls; ring is its crypto backend (builds everywhere, unlike aws-lc).
+matrix = ["dep:matrix-sdk", "dep:rustls"]
 calendar = []
 todo = []
 twos = []
@@ -44,6 +47,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 sha2 = "0.10"
 rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"], optional = true }
 getrandom = "0.4"
+
+# Matrix: sessions, room state and encryption keys in an encrypted SQLite store
+# (SQLite is compiled in, so no system library is needed).
+matrix-sdk = { version = "0.19", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "bundled-sqlite"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI token encryption, EFS folder encryption, and telling left from right Shift.

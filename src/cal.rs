@@ -92,6 +92,42 @@ fn random_string(bytes: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
 }
 
+/// Waits (up to 5 minutes) for the browser to come back to the loopback
+/// `listener` with a query that `done` accepts, answers it with a short
+/// page, and returns the query string. Other requests get a 404.
+pub async fn await_redirect(listener: &TcpListener, done: impl Fn(&HashMap<String, String>) -> bool) -> Result<String, String> {
+    tokio::time::timeout(Duration::from_secs(300), async {
+        loop {
+            let (mut sock, _) = listener.accept().await.map_err(|e| e.to_string())?;
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let path = req.split_whitespace().nth(1).unwrap_or("/");
+            let url = Url::parse(&format!("http://localhost{path}")).ok();
+            let query: HashMap<String, String> = url.as_ref().map(|u| u.query_pairs().into_owned().collect()).unwrap_or_default();
+            if !done(&query) {
+                // Favicon requests and the like: answer and keep waiting.
+                let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                continue;
+            }
+            let body = if query.contains_key("error") {
+                "Sign-in was cancelled. You can close this tab."
+            } else {
+                "Signed in. You can close this tab and return to discommand."
+            };
+            let html = format!("<!doctype html><meta charset=utf-8><title>discommand</title><p style=\"font:16px sans-serif;margin:3em\">{body}</p>");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                html.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            return Ok(url.and_then(|u| u.query().map(String::from)).unwrap_or_default());
+        }
+    })
+    .await
+    .map_err(|_| "sign-in timed out (5 minutes)".to_string())?
+}
+
 /// Runs the browser login: listens on a loopback port for Google's
 /// redirect and exchanges the code for a refresh token.
 pub async fn login(mut creds: Creds, open: impl Fn(&str) -> std::io::Result<()>) -> Result<Creds, String> {
@@ -117,36 +153,11 @@ pub async fn login(mut creds: Creds, open: impl Fn(&str) -> std::io::Result<()>)
     .map_err(|e| e.to_string())?;
     open(url.as_str()).map_err(|e| format!("could not open the browser: {e}"))?;
 
-    let code = tokio::time::timeout(Duration::from_secs(300), async {
-        loop {
-            let (mut sock, _) = listener.accept().await.map_err(|e| e.to_string())?;
-            let mut buf = vec![0u8; 8192];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let path = req.split_whitespace().nth(1).unwrap_or("/");
-            let query: HashMap<String, String> = Url::parse(&format!("http://localhost{path}"))
-                .map(|u| u.query_pairs().into_owned().collect())
-                .unwrap_or_default();
-            let (ok, body) = match (query.get("code"), query.get("state")) {
-                (Some(code), Some(s)) if *s == state => (Some(code.clone()), "Signed in. You can close this tab and return to discommand."),
-                _ if query.contains_key("error") => (None, "Sign-in was cancelled. You can close this tab."),
-                _ => {
-                    // Favicon requests and the like: answer and keep waiting.
-                    let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
-                    continue;
-                }
-            };
-            let html = format!("<!doctype html><meta charset=utf-8><title>discommand</title><p style=\"font:16px sans-serif;margin:3em\">{body}</p>");
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
-                html.len()
-            );
-            let _ = sock.write_all(resp.as_bytes()).await;
-            return ok.ok_or_else(|| "sign-in was cancelled".to_string());
-        }
-    })
-    .await
-    .map_err(|_| "sign-in timed out (5 minutes)".to_string())??;
+    let query = await_redirect(&listener, |q| q.get("state") == Some(&state) || q.contains_key("error")).await?;
+    let code = Url::parse(&format!("http://localhost/?{query}"))
+        .ok()
+        .and_then(|u| u.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.into_owned()))
+        .ok_or("sign-in was cancelled")?;
 
     let http = reqwest::Client::new();
     let resp: Value = http

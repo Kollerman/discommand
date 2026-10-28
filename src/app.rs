@@ -30,7 +30,8 @@ pub enum AppEvent {
     Messages { channel: String, older: bool, result: Result<Vec<Message>, String> },
     Sent(Message),
     Error(String),
-    Wa(WaEvent),
+    /// From a chat service speaking the WhatsApp helper protocol (WhatsApp, Matrix).
+    Wa(Service, WaEvent),
     Pic { key: String, pic: Option<Pic> },
     Cal(CalMsg),
     /// From the task tab of this service.
@@ -71,6 +72,7 @@ pub struct MsgCache {
 pub enum Service {
     Discord,
     WhatsApp,
+    Matrix,
     Calendar,
     Tasks,
     Twos,
@@ -85,6 +87,8 @@ impl Service {
         Service::Discord,
         #[cfg(feature = "whatsapp")]
         Service::WhatsApp,
+        #[cfg(feature = "matrix")]
+        Service::Matrix,
         #[cfg(feature = "calendar")]
         Service::Calendar,
         #[cfg(feature = "todo")]
@@ -112,10 +116,16 @@ impl Service {
         match self {
             Service::Discord => "Discord",
             Service::WhatsApp => "WhatsApp",
+            Service::Matrix => "Matrix",
             Service::Calendar => "Google Calendar",
             Service::Tasks => "Microsoft To Do",
             Service::Twos => "Twos",
         }
+    }
+
+    /// A chat service run through the WhatsApp helper protocol (`WaState`).
+    pub fn is_wa_like(self) -> bool {
+        matches!(self, Service::WhatsApp | Service::Matrix)
     }
 
     /// A task tab (one task app each, see `TaskTab`).
@@ -264,6 +274,10 @@ pub struct App {
     pub wa: WaState,
     wa_cmd: UnboundedSender<String>,
     pub wa_current: Option<String>,
+    /// Matrix: the same as the three above.
+    pub mx: WaState,
+    mx_cmd: UnboundedSender<String>,
+    mx_current: Option<String>,
     /// Sidebar selection and unsent draft of each service while not shown.
     saved_trees: [ListState; Service::COUNT],
     saved_inputs: [Input; Service::COUNT],
@@ -335,7 +349,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(api: Api, tx: UnboundedSender<AppEvent>, gw: UnboundedSender<String>, wa_cmd: UnboundedSender<String>) -> Self {
+    pub fn new(
+        api: Api,
+        tx: UnboundedSender<AppEvent>,
+        gw: UnboundedSender<String>,
+        wa_cmd: UnboundedSender<String>,
+        mx_cmd: UnboundedSender<String>,
+    ) -> Self {
         Self {
             state: State::default(),
             api,
@@ -345,6 +365,9 @@ impl App {
             wa: WaState::default(),
             wa_cmd,
             wa_current: None,
+            mx: WaState { matrix: true, ..WaState::default() },
+            mx_cmd,
+            mx_current: None,
             saved_trees: Default::default(),
             saved_inputs: Default::default(),
             cal: {
@@ -411,10 +434,52 @@ impl App {
 
     // ---- service-neutral accessors (used by the UI) ---------------------
 
+    /// The chats of a WhatsApp-style service (WhatsApp or Matrix).
+    pub fn chats(&self, s: Service) -> &WaState {
+        if s == Service::Matrix {
+            &self.mx
+        } else {
+            &self.wa
+        }
+    }
+
+    fn chats_mut(&mut self, s: Service) -> &mut WaState {
+        if s == Service::Matrix {
+            &mut self.mx
+        } else {
+            &mut self.wa
+        }
+    }
+
+    fn cmd_of(&self, s: Service) -> &UnboundedSender<String> {
+        if s == Service::Matrix {
+            &self.mx_cmd
+        } else {
+            &self.wa_cmd
+        }
+    }
+
+    /// The open chat of a WhatsApp-style service.
+    fn open_of(&self, s: Service) -> &Option<String> {
+        if s == Service::Matrix {
+            &self.mx_current
+        } else {
+            &self.wa_current
+        }
+    }
+
+    fn open_of_mut(&mut self, s: Service) -> &mut Option<String> {
+        if s == Service::Matrix {
+            &mut self.mx_current
+        } else {
+            &mut self.wa_current
+        }
+    }
+
     pub fn current_chat(&self) -> Option<&str> {
         match self.service {
             Service::Discord => self.current.as_deref(),
-            Service::WhatsApp => self.wa_current.as_deref(),
+            Service::WhatsApp | Service::Matrix => self.open_of(self.service).as_deref(),
             Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
@@ -422,7 +487,7 @@ impl App {
     pub fn chat_title(&self, id: &str) -> String {
         match self.service {
             Service::Discord => self.state.channel_title(id),
-            Service::WhatsApp => self.wa.title(id),
+            Service::WhatsApp | Service::Matrix => self.chats(self.service).title(id),
             Service::Calendar | Service::Tasks | Service::Twos => String::new(),
         }
     }
@@ -430,7 +495,7 @@ impl App {
     pub fn author_of(&self, id: &str) -> Option<String> {
         match self.service {
             Service::Discord => self.current_messages().iter().find(|m| m.id == id).map(|m| m.author.name().to_string()),
-            Service::WhatsApp => self.wa_messages().iter().find(|m| m.id == id).map(|m| m.sender_name.clone()),
+            Service::WhatsApp | Service::Matrix => self.wa_messages().iter().find(|m| m.id == id).map(|m| m.sender_name.clone()),
             Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
@@ -439,6 +504,7 @@ impl App {
         match self.service {
             Service::Discord => format!("d:{id}"),
             Service::WhatsApp => format!("w:{id}"),
+            Service::Matrix => format!("m:{id}"),
             Service::Calendar => format!("c:{id}"),
             Service::Tasks => format!("t:{id}"),
             Service::Twos => format!("2:{id}"),
@@ -447,7 +513,7 @@ impl App {
 
     /// Changes whenever loaded messages of either service change.
     pub fn msg_version(&self) -> u64 {
-        self.state.version + self.wa.version + self.pics.version
+        self.state.version + self.wa.version + self.mx.version + self.pics.version
     }
 
     /// Starts loading the pictures the last draw asked for.
@@ -468,6 +534,9 @@ impl App {
                 PicSrc::Wa { chat, id, full } => {
                     wa::send(&self.wa_cmd, json!({"c": "thumb", "chat": chat, "id": id, "full": full, "key": r.key}))
                 }
+                PicSrc::Mx { chat, id, full } => {
+                    wa::send(&self.mx_cmd, json!({"c": "thumb", "chat": chat, "id": id, "full": full, "key": r.key}))
+                }
             }
         }
     }
@@ -475,7 +544,7 @@ impl App {
     pub fn chat_loading(&self, id: &str) -> bool {
         match self.service {
             Service::Discord => self.loading.contains(id),
-            Service::WhatsApp => self.wa.loading.contains(id),
+            Service::WhatsApp | Service::Matrix => self.chats(self.service).loading.contains(id),
             Service::Calendar | Service::Tasks | Service::Twos => false,
         }
     }
@@ -483,7 +552,7 @@ impl App {
     pub fn chat_complete(&self, id: &str) -> bool {
         match self.service {
             Service::Discord => self.state.complete.contains(id),
-            Service::WhatsApp => self.wa.complete.contains(id),
+            Service::WhatsApp | Service::Matrix => self.chats(self.service).complete.contains(id),
             Service::Calendar | Service::Tasks | Service::Twos => false,
         }
     }
@@ -491,15 +560,15 @@ impl App {
     pub fn view_messages(&self, id: &str) -> Option<Vec<ViewMsg>> {
         match self.service {
             Service::Discord => self.state.view_messages(id),
-            Service::WhatsApp => self.wa.view_messages(id),
+            Service::WhatsApp | Service::Matrix => self.chats(self.service).view_messages(id),
             Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
 
     fn wa_messages(&self) -> &[WaMsg] {
-        self.wa_current
+        self.open_of(self.service)
             .as_ref()
-            .and_then(|c| self.wa.messages.get(c))
+            .and_then(|c| self.chats(self.service).messages.get(c))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -507,7 +576,7 @@ impl App {
     fn current_len(&self) -> usize {
         match self.service {
             Service::Discord => self.current_messages().len(),
-            Service::WhatsApp => self.wa_messages().len(),
+            Service::WhatsApp | Service::Matrix => self.wa_messages().len(),
             Service::Calendar | Service::Tasks | Service::Twos => 0,
         }
     }
@@ -518,7 +587,7 @@ impl App {
                 let me = &self.state.me.id;
                 self.current_messages().iter().rposition(|m| &m.author.id == me)
             }
-            Service::WhatsApp => self.wa_messages().iter().rposition(|m| m.from_me && !m.deleted),
+            Service::WhatsApp | Service::Matrix => self.wa_messages().iter().rposition(|m| m.from_me && !m.deleted),
             Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
@@ -526,7 +595,7 @@ impl App {
     fn selected_id(&self) -> Option<String> {
         match self.service {
             Service::Discord => self.selected_message().map(|m| m.id.clone()),
-            Service::WhatsApp => self.wa_messages().get(self.msg_sel?).map(|m| m.id.clone()),
+            Service::WhatsApp | Service::Matrix => self.wa_messages().get(self.msg_sel?).map(|m| m.id.clone()),
             Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
@@ -543,7 +612,7 @@ impl App {
     pub fn rebuild_tree(&mut self) {
         self.tree_dirty = false;
         match self.service {
-            Service::WhatsApp => return self.rebuild_wa_tree(),
+            Service::WhatsApp | Service::Matrix => return self.rebuild_wa_tree(),
             Service::Calendar => return self.rebuild_cal_tree(),
             Service::Tasks | Service::Twos => return self.rebuild_todo_tree(),
             Service::Discord => {}
@@ -657,16 +726,16 @@ impl App {
 
     fn rebuild_wa_tree(&mut self) {
         let sel_id = self.tree.get(self.tree_sel()).map(|t| t.id.clone());
-        self.tree = self
-            .wa
+        let chats = self.chats(self.service);
+        let tree = chats
             .order
             .iter()
-            .filter_map(|jid| self.wa.chats.get(jid))
+            .filter_map(|jid| chats.chats.get(jid))
             .map(|c| TreeItem {
                 kind: ItemKind::WaChat,
                 id: c.jid.clone(),
                 depth: 0,
-                label: self.wa.label(&c.jid),
+                label: chats.label(&c.jid),
                 unread: c.unread > 0,
                 mentions: c.unread,
                 expanded: false,
@@ -675,6 +744,7 @@ impl App {
                 dim: false,
             })
             .collect();
+        self.tree = tree;
         if let Some(id) = sel_id {
             if let Some(i) = self.tree.iter().position(|t| t.id == id) {
                 self.tree_state.select(Some(i));
@@ -1479,64 +1549,65 @@ impl App {
                 self.tree_dirty = true;
             }
             AppEvent::Error(e) => self.status = e,
-            AppEvent::Wa(ev) => self.on_wa(ev),
+            AppEvent::Wa(s, ev) => self.on_wa(s, ev),
             AppEvent::Pic { key, pic } => self.pics.finish(key, pic),
             AppEvent::Cal(msg) => self.on_cal(msg),
             AppEvent::Todo(s, msg) => self.on_todo(s, msg),
         }
     }
 
-    fn on_wa(&mut self, ev: WaEvent) {
+    fn on_wa(&mut self, s: Service, ev: WaEvent) {
+        let viewing = |app: &Self, chat: &str| app.service == s && app.open_of(s).as_deref() == Some(chat);
         match ev {
             WaEvent::Linked { me, name, receipts } => {
-                self.wa.me = me;
-                self.wa.name = name;
-                self.wa.receipts = receipts;
-                if self.wa.conn.is_empty() {
-                    self.wa.conn = "connecting…".into();
+                let st = self.chats_mut(s);
+                st.me = me;
+                st.name = name;
+                st.receipts = receipts;
+                if st.conn.is_empty() {
+                    st.conn = "connecting…".into();
                 }
             }
             WaEvent::Chats { chats } => {
-                self.wa.set_chats(chats);
+                self.chats_mut(s).set_chats(chats);
                 self.tree_dirty = true;
             }
             WaEvent::Chat { chat } => {
-                let viewing = self.service == Service::WhatsApp && self.wa_current.as_deref() == Some(chat.jid.as_str());
-                if viewing && chat.unread > 0 {
-                    wa::send(&self.wa_cmd, json!({"c": "seen", "chat": chat.jid}));
+                if viewing(self, &chat.jid) && chat.unread > 0 {
+                    wa::send(self.cmd_of(s), json!({"c": "seen", "chat": chat.jid}));
                 }
-                self.wa.upsert_chat(chat);
+                self.chats_mut(s).upsert_chat(chat);
                 self.tree_dirty = true;
             }
             WaEvent::Msg { msg } => {
-                let viewing = self.service == Service::WhatsApp && self.wa_current.as_deref() == Some(msg.chat.as_str());
-                let chat = self.wa.chats.get(&msg.chat);
+                let viewing = viewing(self, &msg.chat);
+                let chat = self.chats(s).chats.get(&msg.chat);
                 // Edits and reactions also arrive as "msg"; only new incoming DMs ring.
                 let new = chat.map_or(true, |c| msg.ts >= c.last_ts) && !msg.edited && !msg.deleted;
                 if new && !msg.from_me && !viewing && !chat.is_some_and(|c| c.is_group) {
                     bell();
                 }
-                self.wa.upsert_msg(msg);
+                self.chats_mut(s).upsert_msg(msg);
                 if viewing {
                     self.clamp_sel();
                 }
             }
             WaEvent::History { chat, older, msgs, complete } => {
-                let viewing = self.service == Service::WhatsApp && self.wa_current.as_deref() == Some(chat.as_str());
+                let viewing = viewing(self, &chat);
                 if !older && viewing {
                     self.done_refreshing();
                 }
-                let added = self.wa.history(chat, older, msgs, complete);
+                let added = self.chats_mut(s).history(chat, older, msgs, complete);
                 if viewing {
                     if let Some(sel) = self.msg_sel.as_mut() {
                         *sel += added;
                     }
                 }
             }
-            WaEvent::Status { status } => self.wa.conn = status,
+            WaEvent::Status { status } => self.chats_mut(s).conn = status,
             WaEvent::Receipts { on } => {
-                self.wa.receipts = on;
-                self.status = format!("WhatsApp read receipts {}", if on { "on" } else { "off" });
+                self.chats_mut(s).receipts = on;
+                self.status = format!("{} read receipts {}", s.name(), if on { "on" } else { "off" });
             }
             WaEvent::File { path } => match open_file(&path) {
                 Ok(true) => {}
@@ -1558,22 +1629,23 @@ impl App {
                     _ => self.pics.finish(key, None),
                 }
             }
-            WaEvent::Error { msg } => self.status = format!("WhatsApp: {msg}"),
+            WaEvent::Error { msg } => self.status = format!("{}: {msg}", s.name()),
             WaEvent::Names => {
-                if let Some(chat) = self.wa.forget_messages(self.wa_current.as_deref()) {
-                    wa::send(&self.wa_cmd, json!({"c": "history", "chat": chat}));
+                let open = self.open_of(s).clone();
+                if let Some(chat) = self.chats_mut(s).forget_messages(open.as_deref()) {
+                    wa::send(self.cmd_of(s), json!({"c": "history", "chat": chat}));
                 }
                 self.clamp_sel();
                 self.tree_dirty = true;
             }
             WaEvent::Fatal { msg } | WaEvent::LoggedOut { msg } => {
-                self.wa.conn = "offline".into();
-                self.status = format!("WhatsApp: {msg} (restart discommand to link again)");
+                self.chats_mut(s).conn = "offline".into();
+                self.status = format!("{}: {msg} (restart discommand to log in again)", s.name());
             }
             WaEvent::Exited => {
-                self.wa.conn = "offline".into();
+                self.chats_mut(s).conn = "offline".into();
                 if self.status.is_empty() {
-                    self.status = "WhatsApp helper stopped".into();
+                    self.status = format!("{} stopped", s.name());
                 }
             }
             _ => {}
@@ -1718,13 +1790,14 @@ impl App {
                 self.state.complete.remove(&ch);
                 self.fetch(ch, None);
             }
-            Service::WhatsApp => {
+            Service::WhatsApp | Service::Matrix => {
                 // WhatsApp pushes messages; reconnecting is what fetches missed ones.
-                wa::send(&self.wa_cmd, json!({"c": "reconnect"}));
-                if let Some(chat) = self.wa_current.clone() {
-                    if self.wa.loading.insert(chat.clone()) {
-                        self.wa.version += 1;
-                        wa::send(&self.wa_cmd, json!({"c": "history", "chat": chat}));
+                let s = self.service;
+                wa::send(self.cmd_of(s), json!({"c": "reconnect"}));
+                if let Some(chat) = self.open_of(s).clone() {
+                    if self.chats_mut(s).loading.insert(chat.clone()) {
+                        self.chats_mut(s).version += 1;
+                        wa::send(self.cmd_of(s), json!({"c": "history", "chat": chat}));
                     }
                 }
             }
@@ -1829,16 +1902,17 @@ impl App {
         if matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos) {
             return;
         }
-        if self.service == Service::WhatsApp {
-            let Some(chat) = self.wa_current.clone() else { return };
-            if self.wa.complete.contains(&chat) || self.wa.loading.contains(&chat) {
+        if self.service.is_wa_like() {
+            let s = self.service;
+            let Some(chat) = self.open_of(s).clone() else { return };
+            if self.chats(s).complete.contains(&chat) || self.chats(s).loading.contains(&chat) {
                 return;
             }
             let Some(first) = self.wa_messages().first() else { return };
             let cmd = json!({"c": "history", "chat": chat, "before_ts": first.ts, "before_id": first.id});
-            self.wa.loading.insert(chat);
-            self.wa.version += 1;
-            wa::send(&self.wa_cmd, cmd);
+            self.chats_mut(s).loading.insert(chat);
+            self.chats_mut(s).version += 1;
+            wa::send(self.cmd_of(s), cmd);
             return;
         }
         let Some(ch) = self.current.clone() else { return };
@@ -1918,8 +1992,10 @@ impl App {
         self.enter_insert();
     }
 
+    /// Opens a chat of the WhatsApp-style service shown.
     pub fn open_wa_chat(&mut self, jid: String) {
-        if self.wa_current.as_deref() == Some(jid.as_str()) {
+        let s = self.service;
+        if self.open_of(s).as_deref() == Some(jid.as_str()) {
             self.enter_insert();
             return;
         }
@@ -1929,14 +2005,15 @@ impl App {
             self.mode = Mode::Normal;
             self.input.clear();
         }
-        if !self.wa.messages.contains_key(&jid) && self.wa.loading.insert(jid.clone()) {
-            self.wa.version += 1;
-            wa::send(&self.wa_cmd, json!({"c": "history", "chat": jid}));
+        let st = self.chats_mut(s);
+        if !st.messages.contains_key(&jid) && st.loading.insert(jid.clone()) {
+            st.version += 1;
+            wa::send(self.cmd_of(s), json!({"c": "history", "chat": jid}));
         }
-        if self.wa.chats.get(&jid).is_some_and(|c| c.unread > 0) {
-            wa::send(&self.wa_cmd, json!({"c": "seen", "chat": jid}));
+        if self.chats(s).chats.get(&jid).is_some_and(|c| c.unread > 0) {
+            wa::send(self.cmd_of(s), json!({"c": "seen", "chat": jid}));
         }
-        self.wa_current = Some(jid);
+        *self.open_of_mut(s) = Some(jid);
         self.tree_dirty = true;
         self.enter_insert();
     }
@@ -1946,7 +2023,7 @@ impl App {
         self.reveal_in_tree(&id);
         match self.service {
             Service::Discord => self.open_channel(id),
-            Service::WhatsApp => self.open_wa_chat(id),
+            Service::WhatsApp | Service::Matrix => self.open_wa_chat(id),
             Service::Calendar => {
                 self.cal_select(&id);
                 self.focus = Focus::Tree;
@@ -1980,10 +2057,11 @@ impl App {
         self.count = None;
         self.rebuild_tree();
         match self.service {
-            Service::WhatsApp => {
-                if let Some(jid) = self.wa_current.clone() {
-                    if self.wa.chats.get(&jid).is_some_and(|c| c.unread > 0) {
-                        wa::send(&self.wa_cmd, json!({"c": "seen", "chat": jid}));
+            Service::WhatsApp | Service::Matrix => {
+                let s = self.service;
+                if let Some(jid) = self.open_of(s).clone() {
+                    if self.chats(s).chats.get(&jid).is_some_and(|c| c.unread > 0) {
+                        wa::send(self.cmd_of(s), json!({"c": "seen", "chat": jid}));
                     }
                 }
             }
@@ -2093,8 +2171,8 @@ impl App {
             });
             return;
         }
-        if self.service == Service::WhatsApp {
-            let Some(chat) = self.wa_current.clone() else {
+        if self.service.is_wa_like() {
+            let Some(chat) = self.open_of(self.service).clone() else {
                 self.status = "open a chat first".into();
                 self.mode = mode;
                 return;
@@ -2106,7 +2184,7 @@ impl App {
                 Mode::Reply { id, .. } => json!({"c": "send", "chat": chat, "text": content, "reply_to": id}),
                 Mode::Normal => json!({"c": "send", "chat": chat, "text": content}),
             };
-            wa::send(&self.wa_cmd, cmd);
+            wa::send(self.cmd_of(self.service), cmd);
             return;
         }
         let Some(ch) = self.current.clone() else {
@@ -2136,7 +2214,7 @@ impl App {
                 .current_messages()
                 .get(idx)
                 .map(|m| (m.author.id == self.state.me.id, m.id.clone(), m.content.clone())),
-            Service::WhatsApp => self
+            Service::WhatsApp | Service::Matrix => self
                 .wa_messages()
                 .get(idx)
                 .map(|m| (m.from_me && m.kind == "text" && !m.deleted, m.id.clone(), m.text.clone())),
@@ -2163,9 +2241,10 @@ impl App {
     fn open_finder(&mut self) {
         let s = &self.state;
         let mut all = Vec::new();
-        if self.service == Service::WhatsApp {
-            for jid in &self.wa.order {
-                all.push((jid.clone(), self.wa.title(jid)));
+        if self.service.is_wa_like() {
+            let chats = self.chats(self.service);
+            for jid in &chats.order {
+                all.push((jid.clone(), chats.title(jid)));
             }
         }
         if self.service.is_tasks() {
@@ -2217,18 +2296,22 @@ impl App {
                     }
                 }
             }
-            "wa" | "cal" | "calendar" | "todo" | "tasks" | "twos" if !Self::command_service(name).built() => {
+            "wa" | "mx" | "matrix" | "cal" | "calendar" | "todo" | "tasks" | "twos" if !Self::command_service(name).built() => {
                 self.status = format!("{} isn't part of this build", Self::command_service(name).name());
             }
-            "wa" => match arg {
-                "receipts on" => wa::send(&self.wa_cmd, json!({"c": "receipts", "on": true})),
-                "receipts off" => wa::send(&self.wa_cmd, json!({"c": "receipts", "on": false})),
-                "receipts" => {
-                    self.status = format!("WhatsApp read receipts are {}", if self.wa.receipts { "on" } else { "off" })
+            "wa" | "mx" | "matrix" => {
+                let s = Self::command_service(name);
+                match arg {
+                    "receipts on" => wa::send(self.cmd_of(s), json!({"c": "receipts", "on": true})),
+                    "receipts off" => wa::send(self.cmd_of(s), json!({"c": "receipts", "on": false})),
+                    "receipts" => {
+                        let on = self.chats(s).receipts;
+                        self.status = format!("{} read receipts are {}", s.name(), if on { "on" } else { "off" })
+                    }
+                    "logout" => wa::send(self.cmd_of(s), json!({"c": "logout"})),
+                    _ => self.status = format!("usage: :{name} receipts on|off · :{name} logout"),
                 }
-                "logout" => wa::send(&self.wa_cmd, json!({"c": "logout"})),
-                _ => self.status = "usage: :wa receipts on|off · :wa logout".into(),
-            },
+            }
             "cal" | "calendar" => self.cal_command(arg),
             "todo" | "tasks" => self.todo_command(arg),
             "twos" => self.twos_command(arg),
@@ -2257,6 +2340,7 @@ impl App {
     fn command_service(name: &str) -> Service {
         match name {
             "wa" => Service::WhatsApp,
+            "mx" | "matrix" => Service::Matrix,
             "cal" | "calendar" => Service::Calendar,
             "twos" => Service::Twos,
             _ => Service::Tasks,
@@ -2704,13 +2788,13 @@ impl App {
                     api.react(&ch, &id, &emoji, add).await.err().map(|e| AppEvent::Error(format!("reaction failed: {e}")))
                 });
             }
-            Service::WhatsApp => {
+            Service::WhatsApp | Service::Matrix => {
                 let Some(m) = self.msg_sel.and_then(|i| self.wa_messages().get(i)) else { return };
                 if m.deleted {
                     return;
                 }
                 let cmd = json!({"c": "react", "chat": m.chat, "id": m.id, "text": emoji});
-                wa::send(&self.wa_cmd, cmd);
+                wa::send(self.cmd_of(self.service), cmd);
             }
             Service::Calendar | Service::Tasks | Service::Twos => {}
         }
@@ -2724,10 +2808,10 @@ impl App {
                 let api = self.api.clone();
                 self.spawn(async move { api.delete(&ch, &id).await.err().map(|e| AppEvent::Error(format!("delete failed: {e}"))) });
             }
-            Service::WhatsApp => {
+            Service::WhatsApp | Service::Matrix => {
                 let Some(m) = self.msg_sel.and_then(|i| self.wa_messages().get(i)) else { return };
                 let cmd = json!({"c": "delete", "chat": m.chat, "id": m.id});
-                wa::send(&self.wa_cmd, cmd);
+                wa::send(self.cmd_of(self.service), cmd);
             }
             Service::Calendar | Service::Tasks | Service::Twos => {}
         }
@@ -2742,14 +2826,14 @@ impl App {
             }
             return;
         }
-        if self.service == Service::WhatsApp {
+        if self.service.is_wa_like() {
             let Some(m) = self.msg_sel.and_then(|i| self.wa_messages().get(i)) else {
                 self.status = "select a message first (k)".into();
                 return;
             };
             if m.media && !m.deleted {
                 let cmd = json!({"c": "download", "chat": m.chat, "id": m.id});
-                wa::send(&self.wa_cmd, cmd);
+                wa::send(self.cmd_of(self.service), cmd);
             } else if let Some(url) = find_url(&m.text).map(String::from) {
                 if let Err(e) = open_url(&url) {
                     self.status = format!("could not open browser: {e}");
@@ -2861,7 +2945,7 @@ fn open_file(path: &str) -> std::io::Result<bool> {
 
 /// Opens a web link. Only http(s) is allowed: other schemes (file:, UNC
 /// paths, custom handlers) can launch local programs.
-fn open_url(url: &str) -> std::io::Result<()> {
+pub fn open_url(url: &str) -> std::io::Result<()> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err(std::io::Error::other("only http(s) links are opened"));
     }
