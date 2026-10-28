@@ -1,6 +1,6 @@
 # discommand
 
-A small, vim-style terminal client for **Discord, WhatsApp, Google Calendar and Microsoft To Do**, written in Rust.
+A small, vim-style terminal client for **Discord, WhatsApp, Google Calendar, Microsoft To Do and Twos**, written in Rust.
 It's inspired by [discordo](https://github.com/ayn2op/discordo) and runs natively on
 **Windows (x64 and ARM64), Linux (x64 and ARM64) and macOS (Apple Silicon and Intel)**.
 Press **Shift+Tab** to cycle Discord → WhatsApp → Calendar → Tasks, and **right Shift+Tab** to go back.
@@ -142,8 +142,17 @@ switches to a TLS stack written in Rust by itself.
 
 ### Choosing integrations
 
-By default all integrations are built in. To build only some, pass them to the
-install script:
+The install script asks which integrations to build, one at a time (Enter = yes):
+
+```text
+  Discord [Y/n]: y
+  WhatsApp (needs Go) [Y/n]: n
+  Google Calendar [Y/n]:
+  Microsoft To Do [Y/n]: n
+```
+
+Next time it offers to reuse that choice. To skip the questions, name the
+integrations directly:
 
 ```sh
 sh install.sh --with discord,calendar          # Linux, macOS
@@ -156,10 +165,12 @@ sh install.sh --with discord,calendar          # Linux, macOS
 | `whatsapp` | WhatsApp (the only one that needs Go) |
 | `calendar` | Google Calendar |
 | `todo` | Microsoft To Do |
+| `twos` | Twos |
 
 Integrations that aren't built in are left out of the program completely: no tab, no
-login at startup, no background activity. The script remembers your choice for later
-updates; `--with all` (or `-With all`) goes back to everything. `discommand --version`
+login at startup, no background activity. `--with all` (or `-With all`) builds
+everything. Without a terminal (for example in CI), the script doesn't ask and
+builds the last choice, or everything. `discommand --version`
 shows what a build contains. With plain cargo:
 `cargo build --release --no-default-features --features native-tls,discord,calendar`.
 
@@ -194,6 +205,16 @@ linked. Older messages appear once the phone has sent them.
 
 - `discommand --logout` or `:logout` removes the saved Discord token.
 - `:wa logout` unlinks WhatsApp.
+- `discommand --logout-a` logs out of **everything** (close discommand first):
+  - **Discord:** logged out on Discord's side, so the old token stops working.
+  - **WhatsApp:** unlinked, so it leaves your phone's *Linked devices*.
+  - **Google:** access is revoked.
+  - **Microsoft and Twos:** the saved logins are deleted.
+  - **Local data:** the WhatsApp chat history and cached pictures and downloads
+    are deleted too.
+
+  You can also revoke the Twos key under Twos → Settings → API Keys, and the
+  Microsoft access at account.microsoft.com → Privacy.
 
 ## Security
 
@@ -352,6 +373,24 @@ New tasks use the calendar's one-line syntax: `morgen 14:00 Arzt anrufen` is due
 tomorrow with a reminder at 14:00; `28.10. Steuer` is due on that date; `Milch kaufen`
 has no date. Reminders ring the bell and show in the status line.
 
+## Twos
+
+[Twos](https://www.twosapp.com) is the fifth mode (`5gt`) and works like the Tasks
+mode above, with the same keys: your open todos grouped by list, with **Today** first.
+New todos go to today's list unless you select another list. A date or time typed
+with a todo (`morgen 14:00 Arzt anrufen`) becomes its Twos reminder. Twos has no
+separate due date. Reminders show in the calendar (in orange) and ring the bell.
+
+**Connect.** In Twos (app or twosapp.com) open *Settings → API Keys*, create a key with
+the scopes `read:lists`, `read:things` and `write:things`, and run
+`:twos login <key>` in discommand. The key is stored encrypted like the other logins.
+`:twos logout` removes it, and revoking the key in Twos cuts access at once. No app
+registration is needed, so nothing goes into `keys/keys.env`.
+
+Twos only lists *upcoming* reminders, so a todo whose reminder has passed shows
+without a date. Twos allows 1000 API requests an hour; a sync takes a few, every 10
+minutes.
+
 ## Publishing a release
 
 To let other people sign in to Google and Microsoft with nothing but their account,
@@ -390,6 +429,8 @@ Each integration is a Cargo feature and a tab:
 2. Add a variant to `Service` in `src/app.rs` and an entry to `Service::ALL`, marked
    `#[cfg(feature = "…")]`. Tab order, Shift+Tab and `gt` follow from that list.
 3. Only start or connect it when `Service::YourService.built()` is true.
+   A task app only needs a `todo::Backend` variant (see `src/twos.rs`); the task
+   tab, calendar entries and reminders come with it.
 4. Add the name to `all=` in `install.sh`, to the table above and to the
    `features` job in `.github/workflows/build.yml`.
 Remember that both services' terms forbid unofficial clients, and say so to your users.

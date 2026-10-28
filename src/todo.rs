@@ -1,6 +1,8 @@
-//! Microsoft To Do via Microsoft Graph: device-code login, task sync,
-//! create/edit/complete/delete and reminders.
+//! Task lists: the model shared by the task tabs, the backends behind them
+//! (see `Backend`), and Microsoft To Do via Microsoft Graph: device-code
+//! login, task sync, create/edit/complete/delete and reminders.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -10,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::cal::{self, local_midnight};
 use crate::secret;
+use crate::twos::Twos;
 
 const AUTH: &str = "https://login.microsoftonline.com/common/oauth2/v2.0";
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
@@ -405,6 +408,54 @@ impl Todo {
     }
 }
 
+// ---- backends ------------------------------------------------------------------
+
+/// The service behind a task tab. A new task app is another variant here.
+#[derive(Clone)]
+pub enum Backend {
+    Microsoft(Arc<Todo>),
+    Twos(Arc<Twos>),
+}
+
+impl Backend {
+    /// All lists to show and their open tasks.
+    pub async fn sync(&self) -> Result<(Vec<TaskList>, Vec<Task>), String> {
+        match self {
+            Backend::Microsoft(t) => t.sync().await,
+            Backend::Twos(t) => t.sync().await,
+        }
+    }
+
+    /// Adds a task typed as one line (see `parse`).
+    pub async fn create(&self, list: &str, text: &str) -> Result<(), String> {
+        match self {
+            Backend::Microsoft(t) => t.create(list, text).await,
+            Backend::Twos(t) => t.create(list, text).await,
+        }
+    }
+
+    pub async fn update(&self, list: &str, id: &str, text: &str) -> Result<(), String> {
+        match self {
+            Backend::Microsoft(t) => t.update(list, id, text).await,
+            Backend::Twos(t) => t.update(id, text).await,
+        }
+    }
+
+    pub async fn set_done(&self, list: &str, id: &str, done: bool) -> Result<(), String> {
+        match self {
+            Backend::Microsoft(t) => t.set_done(list, id, done).await,
+            Backend::Twos(t) => t.set_done(id, done).await,
+        }
+    }
+
+    pub async fn delete(&self, list: &str, id: &str) -> Result<(), String> {
+        match self {
+            Backend::Microsoft(t) => t.delete(list, id).await,
+            Backend::Twos(t) => t.delete(id).await,
+        }
+    }
+}
+
 // ---- state ---------------------------------------------------------------------
 
 #[derive(Default)]
@@ -472,8 +523,8 @@ impl TodoState {
         }
     }
 
-    /// Open tasks with a due date as all-day calendar entries.
-    pub fn as_events(&self) -> Vec<cal::Event> {
+    /// Open tasks with a due date as all-day entries of calendar `cal`.
+    pub fn as_events(&self, cal: &str) -> Vec<cal::Event> {
         self.tasks
             .iter()
             .filter(|t| !t.done)
@@ -481,7 +532,7 @@ impl TodoState {
                 let d = t.due?;
                 Some(cal::Event {
                     id: t.key(),
-                    cal: TASKS_CALENDAR.into(),
+                    cal: cal.into(),
                     title: format!("☐ {}", t.title),
                     description: t.note.clone(),
                     location: String::new(),
@@ -496,8 +547,6 @@ impl TodoState {
     }
 }
 
-/// Calendar id of tasks shown in the calendar.
-pub const TASKS_CALENDAR: &str = "todo";
 
 #[cfg(test)]
 mod tests {

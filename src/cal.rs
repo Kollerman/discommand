@@ -56,6 +56,21 @@ impl Creds {
     }
 }
 
+/// Revokes a sign-in at Google, so its refresh token stops working.
+pub async fn revoke(refresh_token: &str) -> Result<(), String> {
+    let resp = reqwest::Client::new()
+        .post("https://oauth2.googleapis.com/revoke")
+        .form(&[("token", refresh_token)])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(resp.status().to_string())
+    }
+}
+
 /// The value of a variable set at runtime, or else baked in at build time.
 pub fn build_var(runtime: Option<String>, compiled: Option<&'static str>) -> Option<String> {
     runtime.or(compiled.map(String::from)).filter(|v| !v.trim().is_empty())
@@ -813,6 +828,8 @@ pub struct CalState {
     pub reminded_until: Option<DateTime<Local>>,
     google: Vec<Event>,
     tasks: Vec<Event>,
+    /// The task apps shown as calendars (also in `calendars`).
+    task_cals: Vec<CalInfo>,
 }
 
 impl CalState {
@@ -824,21 +841,29 @@ impl CalState {
         self.merge();
     }
 
-    /// To Do tasks to show as all-day entries (see `todo::TodoState::as_events`).
-    pub fn set_tasks(&mut self, tasks: Vec<Event>) {
+    /// Tasks to show as all-day entries (see `todo::TodoState::as_events`),
+    /// with the calendars they belong to: (id, name, color) per task app.
+    pub fn set_tasks(&mut self, tasks: Vec<Event>, cals: &[(&str, &str, [u8; 3])]) {
         self.tasks = tasks;
+        for c in self.task_cals.drain(..) {
+            self.calendars.remove(&c.id);
+        }
+        self.task_cals = cals
+            .iter()
+            .filter(|(id, ..)| self.tasks.iter().any(|t| t.cal == *id))
+            .map(|&(id, name, color)| CalInfo { id: id.into(), name: name.into(), color: Some(color), primary: false, writable: false })
+            .collect();
         self.merge();
     }
 
+    /// Whether an event is a task from a task app.
+    pub fn is_task(&self, e: &Event) -> bool {
+        self.task_cals.iter().any(|c| c.id == e.cal)
+    }
+
     fn merge(&mut self) {
-        let id = crate::todo::TASKS_CALENDAR;
-        if self.tasks.is_empty() {
-            self.calendars.remove(id);
-        } else {
-            self.calendars.insert(
-                id.into(),
-                CalInfo { id: id.into(), name: "Microsoft To Do".into(), color: Some([37, 100, 207]), primary: false, writable: false },
-            );
+        for c in &self.task_cals {
+            self.calendars.insert(c.id.clone(), c.clone());
         }
         self.events = self.google.iter().chain(&self.tasks).cloned().collect();
         self.events.sort_by(|a, b| (a.start, !a.all_day, &a.title).cmp(&(b.start, !b.all_day, &b.title)));

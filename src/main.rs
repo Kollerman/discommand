@@ -11,6 +11,7 @@ mod secret;
 mod state;
 mod text;
 mod todo;
+mod twos;
 mod ui;
 mod view;
 mod wa;
@@ -26,13 +27,13 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::api::Api;
 use crate::app::{App, AppEvent, Service};
 
-#[cfg(not(any(feature = "discord", feature = "whatsapp", feature = "calendar", feature = "todo")))]
-compile_error!("build with at least one integration: discord, whatsapp, calendar, todo");
+#[cfg(not(any(feature = "discord", feature = "whatsapp", feature = "calendar", feature = "todo", feature = "twos")))]
+compile_error!("build with at least one integration: discord, whatsapp, calendar, todo, twos");
 
 const USAGE: &str = "discommand — lightweight terminal client for Discord, WhatsApp,
-Google Calendar and Microsoft To Do (whichever are built in, see --version)
+Google Calendar, Microsoft To Do and Twos (whichever are built in, see --version)
 
-usage: discommand [--wa-phone NUMBER] [--discord-token] [--logout] [--help] [--version]
+usage: discommand [--wa-phone NUMBER] [--discord-token] [--logout] [--logout-a] [--help] [--version]
 
 The accounts of the chat services built in are required. The Discord token is read from $DISCORD_TOKEN,
 then from the saved token (encrypted with DPAPI on Windows), otherwise you
@@ -43,7 +44,10 @@ WhatsApp is linked once by scanning a QR code (Linked devices).
   --wa-phone NUMBER  link WhatsApp with a pairing code instead of a QR code
                      (international format, e.g. +491701234567)
   --logout           delete the saved Discord token and exit
-                     (unlink WhatsApp with :wa logout inside the app)";
+                     (unlink WhatsApp with :wa logout inside the app)
+  --logout-a         log out of everything: Discord, WhatsApp (unlinked),
+                     Google, Microsoft and Twos; also deletes the WhatsApp
+                     chat history and cached media. Close discommand first.";
 
 fn clean(t: &str) -> String {
     t.trim().trim_matches('"').trim().to_string()
@@ -94,10 +98,60 @@ async fn finish_login(token: String) -> Result<String, String> {
     Ok(token)
 }
 
+/// `--logout-a`: signs out of every service (on the service's side too
+/// where possible) and deletes all saved logins and local chat data.
+async fn logout_all() {
+    if let Some(token) = secret::load_token() {
+        let result = match Api::new(&token) {
+            Ok(api) => api.logout().await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => println!("Discord: logged out"),
+            Err(e) => println!("Discord: saved token removed (Discord didn't confirm the logout: {e})"),
+        }
+    }
+    secret::remove_token();
+
+    if let Some(c) = cal::Creds::load() {
+        match (c.refresh_token.is_empty(), cal::revoke(&c.refresh_token).await) {
+            (false, Ok(())) => println!("Google Calendar: signed out, access revoked"),
+            (false, Err(e)) => println!("Google Calendar: sign-in removed (Google didn't confirm the revocation: {e})"),
+            (true, _) => println!("Google Calendar: app setup removed"),
+        }
+        cal::Creds::remove();
+    }
+    if todo::Creds::load().is_some() {
+        todo::Creds::remove();
+        println!("Microsoft To Do: sign-in removed (the app's access can be revoked at account.microsoft.com → Privacy)");
+    }
+    if twos::load_key().is_some() {
+        twos::remove_key();
+        println!("Twos: API key removed (revoke it in Twos → Settings → API Keys)");
+    }
+
+    if let Some(db) = secret::data_dir().map(|d| d.join("whatsapp.db")).filter(|db| db.exists()) {
+        match wa::unlink().await {
+            Ok(true) => println!("WhatsApp: unlinked"),
+            Ok(false) => println!("WhatsApp: wasn't linked"),
+            Err(e) => println!("WhatsApp: couldn't unlink ({e}); remove it under Linked devices on your phone"),
+        }
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut name = db.clone().into_os_string();
+            name.push(suffix);
+            secret::wipe(std::path::Path::new(&name));
+        }
+        println!("WhatsApp: local session and chat history deleted");
+    }
+    let _ = std::fs::remove_dir_all(secret::cache_dir());
+    println!("Cached pictures and downloads deleted. Logged out of everything.");
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut wa_phone = None;
     let mut paste_token = false;
+    let mut logout_everything = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return println!("{USAGE}"),
@@ -109,6 +163,7 @@ fn main() {
                 secret::remove_token();
                 return println!("Saved Discord token removed.");
             }
+            "--logout-a" | "--logout-all" => logout_everything = true,
             "--discord-token" => paste_token = true,
             "--wa-phone" => match args.next() {
                 Some(n) => wa_phone = Some(n),
@@ -126,6 +181,9 @@ fn main() {
 
     // A single-threaded runtime: the app is I/O bound and this keeps CPU wakeups minimal.
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
+    if logout_everything {
+        return rt.block_on(logout_all());
+    }
     if let Err(e) = rt.block_on(run(wa_phone, paste_token)) {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -168,7 +226,8 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
 
     let mut app = App::new(api, tx, gw_tx, cmds);
     app.cal_sync();
-    app.todo_sync();
+    app.todo_sync(Service::Tasks);
+    app.todo_sync(Service::Twos);
     for ev in replay {
         app.on_event(AppEvent::Wa(ev));
     }

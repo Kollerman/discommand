@@ -6,7 +6,7 @@ description = "Lightweight, battery-friendly terminal Discord client"
 license = "MIT"
 
 [features]
-default = ["native-tls", "discord", "whatsapp", "calendar", "todo"]
+default = ["native-tls", "discord", "whatsapp", "calendar", "todo", "twos"]
 
 # Integrations: build with any subset, e.g.
 #   cargo build --release --no-default-features --features native-tls,discord,calendar
@@ -15,6 +15,7 @@ discord = ["dep:rsa"]
 whatsapp = []
 calendar = []
 todo = []
+twos = []
 
 # OS TLS stack: SChannel on Windows, Security.framework on macOS, OpenSSL on Linux.
 native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]

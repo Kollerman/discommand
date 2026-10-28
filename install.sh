@@ -2,14 +2,14 @@
 # Builds discommand and its WhatsApp helper and installs both into ~/.cargo/bin.
 # Works on Linux, macOS and Termux. Re-run after changes to update.
 #
-#   sh install.sh                          all integrations (or the last choice)
-#   sh install.sh --with discord,calendar  only these: discord, whatsapp, calendar, todo
+#   sh install.sh                          asks which integrations to build
+#   sh install.sh --with discord,calendar  only these: discord, whatsapp, calendar, todo, twos
 #   sh install.sh --with all               back to all of them
 set -e
 cd "$(dirname "$0")"
 
 # Every integration (the default features in Cargo.toml).
-all="discord,whatsapp,calendar,todo"
+all="discord,whatsapp,calendar,todo,twos"
 with=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -20,12 +20,39 @@ while [ $# -gt 0 ]; do
     esac
 done
 with=$(printf '%s' "$with" | tr 'A-Z ' 'a-z,' | tr -s ',' | sed 's/^,//; s/,$//')
+ask() {
+    printf '%s [Y/n] ' "$1"
+    read -r answer || answer=n
+    case "$answer" in ""|[Yy]*|[Jj]*) return 0 ;; *) return 1 ;; esac
+}
 # The choice is remembered in .integrations (not in git) for later updates.
+last=""
+[ -f .integrations ] && last=$(cat .integrations)
+if [ -z "$with" ]; then
+    if [ ! -t 0 ]; then
+        with="$last"
+    elif [ -n "$last" ] && ask "Build with the same integrations as last time ($last)?"; then
+        with="$last"
+    else
+        while [ -z "$with" ]; do
+            for name in discord whatsapp calendar todo twos; do
+                case $name in
+                    discord) label="Discord" ;;
+                    whatsapp) label="WhatsApp (needs Go)" ;;
+                    calendar) label="Google Calendar" ;;
+                    todo) label="Microsoft To Do" ;;
+                    twos) label="Twos" ;;
+                esac
+                ask "  $label" && with="${with:+$with,}$name"
+            done
+            [ -z "$with" ] && echo "Choose at least one."
+        done
+        [ "$with" = "$all" ] && with=all
+    fi
+fi
 if [ "$with" = all ]; then
     rm -f .integrations
     with=""
-elif [ -z "$with" ] && [ -f .integrations ]; then
-    with=$(cat .integrations)
 fi
 case ",${with:-$all}," in *,whatsapp,*) whatsapp=1 ;; *) whatsapp="" ;; esac
 
@@ -40,7 +67,7 @@ bin="${CARGO_HOME:-$HOME/.cargo}/bin"
 if [ -n "$with" ]; then
     echo "Integrations: $with"
 else
-    echo "Integrations: all (choose with --with discord,whatsapp,calendar,todo)"
+    echo "Integrations: all (choose with --with discord,whatsapp,calendar,todo,twos)"
 fi
 if [ -f keys/keys.env ]; then
     echo "Building with keys/keys.env (one-step Google/Microsoft sign-in)."

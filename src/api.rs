@@ -170,6 +170,12 @@ impl Api {
         self.request(if add { Method::PUT } else { Method::DELETE }, &path, None).await.map(|_| ())
     }
 
+    /// Ends this login on Discord's side: the token stops working.
+    pub async fn logout(&self) -> Result<(), String> {
+        let body = json!({ "provider": null, "voip_provider": null });
+        self.request(Method::POST, "/auth/logout", Some(&body)).await.map(|_| ())
+    }
+
     pub async fn ack(&self, channel: &str, id: &str) -> Result<(), String> {
         let body = json!({ "token": null });
         self.request(Method::POST, &format!("/channels/{channel}/messages/{id}/ack"), Some(&body))

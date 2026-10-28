@@ -152,7 +152,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
         None if app.service == Service::Calendar => {
             app.selected_event().map(|e| e.title.clone()).unwrap_or_else(|| "Calendar".into())
         }
-        None if app.service == Service::Tasks => app.selected_task().map(|t| t.title.clone()).unwrap_or_else(|| "Tasks".into()),
+        None if app.service.is_tasks() => app.selected_task().map(|t| t.title.clone()).unwrap_or_else(|| app.service.name().into()),
         None => "nothing open — / to find a chat, ? for help, shift+tab switches service".into(),
     };
     f.render_widget(
@@ -163,7 +163,7 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
 
     if app.service == Service::Calendar {
         draw_event(f, app, body);
-    } else if app.service == Service::Tasks {
+    } else if app.service.is_tasks() {
         draw_task(f, app, body);
     } else {
         draw_messages(f, app, body);
@@ -181,7 +181,7 @@ fn draw_input(f: &mut Frame, app: &App, input: Rect) {
     let (input_lines, cursor) = app.input.layout(width.saturating_sub(2));
     let focused = app.focus == Focus::Input;
     let cal = app.service == Service::Calendar;
-    let tasks = app.service == Service::Tasks;
+    let tasks = app.service.is_tasks();
     let label = match &app.mode {
         Mode::Normal if cal && focused => " new event — e.g. morgen 14:00 Zahnarzt @ Praxis ".into(),
         Mode::Normal if tasks && focused => " new task — e.g. morgen 14:00 Arzt anrufen (14:00 = reminder) ".into(),
@@ -212,7 +212,7 @@ fn draw_input(f: &mut Frame, app: &App, input: Rect) {
     if app.input.is_empty() && !focused {
         let hint = match app.service {
             Service::Calendar => "› press n to add an event",
-            Service::Tasks => "› n new task · x done · e edit · dd delete",
+            Service::Tasks | Service::Twos => "› n new task · x done · e edit · dd delete",
             _ => "› press i to type",
         };
         f.render_widget(Paragraph::new(Line::from(Span::styled(hint, DIM))), inner);
@@ -229,7 +229,7 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
     let width = area.width.saturating_sub(2).max(10) as usize;
     let label = |k: &str| Span::styled(format!("  {k:<10}"), DIM);
     let mut lines: Vec<Line> = vec![Line::from("")];
-    if let Some((uri, code)) = &app.todo.login {
+    if let Some((uri, code)) = &app.tasks().login {
         lines.push(Line::from("  Sign in to Microsoft:"));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![label("Open"), Span::raw(uri.clone())]));
@@ -249,7 +249,7 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
         if t.important {
             lines.push(Line::from(vec![label("Important"), Span::raw("yes")]));
         }
-        lines.push(Line::from(vec![label("List"), Span::raw(app.todo.list_name(&t.list).to_string())]));
+        lines.push(Line::from(vec![label("List"), Span::raw(app.tasks().list_name(&t.list).to_string())]));
         if !t.note.is_empty() {
             lines.push(Line::from(""));
             for l in wrap(&t.note, width.saturating_sub(2)) {
@@ -258,8 +258,12 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  x done · e edit · dd delete · n new task", DIM)));
-    } else if !app.todo_connected() && app.todo.status.is_empty() {
-        let steps: &[&str] = if crate::todo::builtin_client_id().is_some() { TODO_SIGN_IN } else { TODO_SETUP };
+    } else if !app.tasks_connected() && app.tasks().status.is_empty() {
+        let steps: &[&str] = match app.service {
+            Service::Twos => TWOS_SETUP,
+            _ if crate::todo::builtin_client_id().is_some() => TODO_SIGN_IN,
+            _ => TODO_SETUP,
+        };
         for l in steps {
             lines.push(Line::from(Span::raw(format!("  {l}"))));
         }
@@ -268,6 +272,17 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
     }
     f.render_widget(Paragraph::new(lines), area);
 }
+
+const TWOS_SETUP: &[&str] = &[
+    "Connect Twos:",
+    "",
+    "1. In Twos (app or twosapp.com): Settings → API Keys → create a key with",
+    "   the scopes read:lists, read:things and write:things.",
+    "2. Here, type:  :twos login <the key>   (it starts with twos_)",
+    "",
+    "The key is stored encrypted; :twos logout removes it.",
+    "New tasks go to today's list unless another list is selected.",
+];
 
 const TODO_SIGN_IN: &[&str] = &[
     "Connect Microsoft To Do:",
@@ -639,9 +654,10 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
         }
         Service::Calendar => (" CALENDAR ", Color::Yellow, String::new()),
         Service::Tasks => (" TASKS ", Color::LightBlue, String::new()),
+        Service::Twos => (" TWOS ", Color::Indexed(209), String::new()),
     };
     // Open tasks due today or earlier, everywhere.
-    let due = app.todo.due_count(Local::now().date_naive());
+    let due = app.due_tasks();
     let other = if due > 0 { format!("{other} ☐ {due} due ") } else { other };
     // The next event, everywhere.
     let now = chrono::Local::now();
@@ -662,8 +678,8 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
         Service::WhatsApp => (app.wa.name.clone(), app.wa.conn.as_str()),
         Service::Calendar if app.cal.status.is_empty() => ("Google Calendar".to_string(), "not connected"),
         Service::Calendar => (app.cal.account.clone(), app.cal.status.as_str()),
-        Service::Tasks if app.todo.status.is_empty() => ("Microsoft To Do".to_string(), "not connected"),
-        Service::Tasks => ("Microsoft To Do".to_string(), app.todo.status.as_str()),
+        Service::Tasks | Service::Twos if app.tasks().status.is_empty() => (app.service.name().to_string(), "not connected"),
+        Service::Tasks | Service::Twos => (app.service.name().to_string(), app.tasks().status.as_str()),
     };
     let right = format!(" {name} · {conn} ");
     let mut spans = vec![
@@ -786,6 +802,7 @@ const HELP: &[(&str, &str)] = &[
     (":wa logout", "unlink WhatsApp"),
     (":cal setup FILE", "connect Google Calendar"),
     (":todo setup ID", "connect Microsoft To Do"),
+    (":twos login KEY", "connect Twos"),
     (":q  :logout", "quit / quit and forget token"),
 ];
 
@@ -1024,7 +1041,7 @@ fn draw_grid_detail(f: &mut Frame, app: &App, area: Rect) {
             if let Some(c) = app.cal.calendars.get(&e.cal) {
                 s.push_str(&format!("  · {}", c.name));
             }
-            if e.cal == crate::todo::TASKS_CALENDAR {
+            if app.cal.is_task(e) {
                 s.push_str("  · x: done");
             }
             Line::from(Span::styled(truncate(&s, w), Style::new().add_modifier(Modifier::BOLD)))

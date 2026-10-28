@@ -348,6 +348,33 @@ fn print_qr(code: &str) {
 
 /// Runs before the TUI starts. Returns once the account is linked; the
 /// events consumed on the way are returned so the app can replay them.
+/// Unlinks this device from WhatsApp: Ok(false) if it wasn't linked.
+pub async fn unlink() -> Result<bool, String> {
+    let mut sc = spawn()?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut sent = false;
+        while let Some(ev) = sc.events.recv().await {
+            match ev {
+                WaEvent::Login | WaEvent::Qr { .. } => return Ok(false),
+                WaEvent::Linked { .. } if !sent => {
+                    send(&sc.cmds, json!({"c": "logout"}));
+                    sent = true;
+                }
+                WaEvent::LoggedOut { .. } => return Ok(true),
+                WaEvent::Error { msg } if sent => return Err(msg),
+                WaEvent::Fatal { msg } => return Err(msg),
+                WaEvent::Exited => break,
+                _ => {}
+            }
+        }
+        Err("the WhatsApp helper exited".to_string())
+    })
+    .await
+    .unwrap_or_else(|_| Err("no answer from WhatsApp".into()));
+    let _ = sc.child.kill().await;
+    result
+}
+
 pub async fn login(sc: &mut Sidecar, phone: Option<&str>) -> Result<Vec<WaEvent>, String> {
     let mut phone_sent = false;
     while let Some(ev) = sc.events.recv().await {

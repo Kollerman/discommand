@@ -39,7 +39,7 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
 }
 
 /// Overwrites a file before deleting it (best effort; SSDs may keep copies).
-fn wipe(path: &Path) {
+pub fn wipe(path: &Path) {
     if let Ok(meta) = fs::metadata(path) {
         let _ = fs::write(path, vec![0u8; meta.len() as usize]);
     }

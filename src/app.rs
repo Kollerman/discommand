@@ -15,7 +15,8 @@ use tokio::sync::Semaphore;
 
 use crate::api::Api;
 use crate::cal::{self, CalState, Creds, Google, Synced};
-use crate::todo::{self, Task, TaskList, Todo, TodoState, TASKS_CALENDAR};
+use crate::todo::{self, Backend, Task, TaskList, Todo, TodoState};
+use crate::twos::{self, Twos};
 use crate::gateway::GwEvent;
 use crate::model::*;
 use crate::pics::{self, Pic, PicRef, PicSrc, Pics};
@@ -32,7 +33,8 @@ pub enum AppEvent {
     Wa(WaEvent),
     Pic { key: String, pic: Option<Pic> },
     Cal(CalMsg),
-    Todo(TodoMsg),
+    /// From the task tab of this service.
+    Todo(Service, TodoMsg),
 }
 
 pub enum TodoMsg {
@@ -71,6 +73,7 @@ pub enum Service {
     WhatsApp,
     Calendar,
     Tasks,
+    Twos,
 }
 
 impl Service {
@@ -86,6 +89,8 @@ impl Service {
         Service::Calendar,
         #[cfg(feature = "todo")]
         Service::Tasks,
+        #[cfg(feature = "twos")]
+        Service::Twos,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -109,7 +114,13 @@ impl Service {
             Service::WhatsApp => "WhatsApp",
             Service::Calendar => "Google Calendar",
             Service::Tasks => "Microsoft To Do",
+            Service::Twos => "Twos",
         }
+    }
+
+    /// A task tab (one task app each, see `TaskTab`).
+    pub fn is_tasks(self) -> bool {
+        matches!(self, Service::Tasks | Service::Twos)
     }
 }
 
@@ -222,6 +233,27 @@ impl Finder {
     }
 }
 
+/// Calendar ids of the tasks each task app shows in the calendar.
+const TODO_CAL: &str = "todo";
+const TWOS_CAL: &str = "twos";
+
+/// A task tab: one task app's lists and tasks.
+#[derive(Default)]
+pub struct TaskTab {
+    pub state: TodoState,
+    api: Option<Backend>,
+    /// Task lists folded in the sidebar.
+    collapsed: HashSet<String>,
+    positioned: bool,
+}
+
+impl TaskTab {
+    fn new(api: Option<Backend>) -> Self {
+        let state = TodoState { reminded_until: Some(chrono::Local::now()), ..TodoState::default() };
+        Self { state, api, ..Self::default() }
+    }
+}
+
 pub struct App {
     pub state: State,
     api: Api,
@@ -256,11 +288,9 @@ pub struct App {
     /// The reaction picker is open for the selected message.
     pub react_picker: bool,
 
-    pub todo: TodoState,
-    todo_api: Option<std::sync::Arc<Todo>>,
-    /// Task lists folded in the sidebar.
-    todo_collapsed: HashSet<String>,
-    todo_positioned: bool,
+    /// The task tabs.
+    pub todo: TaskTab,
+    pub twos: TaskTab,
 
     pub focus: Focus,
     /// Pane to return to when leaving insert/command mode.
@@ -335,12 +365,12 @@ impl App {
             cal_detail: false,
             cal_sel: None,
             react_picker: false,
-            todo: TodoState { reminded_until: Some(chrono::Local::now()), ..TodoState::default() },
-            todo_api: todo::Creds::load()
-                .filter(|c| Service::Tasks.built() && !c.refresh_token.is_empty())
-                .map(|c| std::sync::Arc::new(Todo::new(c))),
-            todo_collapsed: HashSet::new(),
-            todo_positioned: false,
+            todo: TaskTab::new(
+                todo::Creds::load()
+                    .filter(|c| Service::Tasks.built() && !c.refresh_token.is_empty())
+                    .map(|c| Backend::Microsoft(Arc::new(Todo::new(c)))),
+            ),
+            twos: TaskTab::new(twos::load_key().filter(|_| Service::Twos.built()).map(|k| Backend::Twos(Arc::new(Twos::new(k))))),
             focus: Focus::Tree,
             last_pane: Focus::Tree,
             tree: Vec::new(),
@@ -385,7 +415,7 @@ impl App {
         match self.service {
             Service::Discord => self.current.as_deref(),
             Service::WhatsApp => self.wa_current.as_deref(),
-            Service::Calendar | Service::Tasks => None,
+            Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
 
@@ -393,7 +423,7 @@ impl App {
         match self.service {
             Service::Discord => self.state.channel_title(id),
             Service::WhatsApp => self.wa.title(id),
-            Service::Calendar | Service::Tasks => String::new(),
+            Service::Calendar | Service::Tasks | Service::Twos => String::new(),
         }
     }
 
@@ -401,7 +431,7 @@ impl App {
         match self.service {
             Service::Discord => self.current_messages().iter().find(|m| m.id == id).map(|m| m.author.name().to_string()),
             Service::WhatsApp => self.wa_messages().iter().find(|m| m.id == id).map(|m| m.sender_name.clone()),
-            Service::Calendar | Service::Tasks => None,
+            Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
 
@@ -411,6 +441,7 @@ impl App {
             Service::WhatsApp => format!("w:{id}"),
             Service::Calendar => format!("c:{id}"),
             Service::Tasks => format!("t:{id}"),
+            Service::Twos => format!("2:{id}"),
         }
     }
 
@@ -445,7 +476,7 @@ impl App {
         match self.service {
             Service::Discord => self.loading.contains(id),
             Service::WhatsApp => self.wa.loading.contains(id),
-            Service::Calendar | Service::Tasks => false,
+            Service::Calendar | Service::Tasks | Service::Twos => false,
         }
     }
 
@@ -453,7 +484,7 @@ impl App {
         match self.service {
             Service::Discord => self.state.complete.contains(id),
             Service::WhatsApp => self.wa.complete.contains(id),
-            Service::Calendar | Service::Tasks => false,
+            Service::Calendar | Service::Tasks | Service::Twos => false,
         }
     }
 
@@ -461,7 +492,7 @@ impl App {
         match self.service {
             Service::Discord => self.state.view_messages(id),
             Service::WhatsApp => self.wa.view_messages(id),
-            Service::Calendar | Service::Tasks => None,
+            Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
 
@@ -477,7 +508,7 @@ impl App {
         match self.service {
             Service::Discord => self.current_messages().len(),
             Service::WhatsApp => self.wa_messages().len(),
-            Service::Calendar | Service::Tasks => 0,
+            Service::Calendar | Service::Tasks | Service::Twos => 0,
         }
     }
 
@@ -488,7 +519,7 @@ impl App {
                 self.current_messages().iter().rposition(|m| &m.author.id == me)
             }
             Service::WhatsApp => self.wa_messages().iter().rposition(|m| m.from_me && !m.deleted),
-            Service::Calendar | Service::Tasks => None,
+            Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
 
@@ -496,7 +527,7 @@ impl App {
         match self.service {
             Service::Discord => self.selected_message().map(|m| m.id.clone()),
             Service::WhatsApp => self.wa_messages().get(self.msg_sel?).map(|m| m.id.clone()),
-            Service::Calendar | Service::Tasks => None,
+            Service::Calendar | Service::Tasks | Service::Twos => None,
         }
     }
 
@@ -514,7 +545,7 @@ impl App {
         match self.service {
             Service::WhatsApp => return self.rebuild_wa_tree(),
             Service::Calendar => return self.rebuild_cal_tree(),
-            Service::Tasks => return self.rebuild_todo_tree(),
+            Service::Tasks | Service::Twos => return self.rebuild_todo_tree(),
             Service::Discord => {}
         }
         let sel_key = self.tree.get(self.tree_sel()).map(|t| (t.kind, t.id.clone()));
@@ -725,8 +756,51 @@ impl App {
         self.google.is_some()
     }
 
-    pub fn todo_connected(&self) -> bool {
-        self.todo_api.is_some()
+    fn tab(&self, s: Service) -> &TaskTab {
+        if s == Service::Twos {
+            &self.twos
+        } else {
+            &self.todo
+        }
+    }
+
+    fn tab_mut(&mut self, s: Service) -> &mut TaskTab {
+        if s == Service::Twos {
+            &mut self.twos
+        } else {
+            &mut self.todo
+        }
+    }
+
+    /// The tasks of the task tab shown.
+    pub fn tasks(&self) -> &TodoState {
+        &self.tab(self.service).state
+    }
+
+    pub fn tasks_connected(&self) -> bool {
+        self.tab(self.service).api.is_some()
+    }
+
+    /// Open tasks due today or earlier, in all task apps.
+    pub fn due_tasks(&self) -> usize {
+        let today = chrono::Local::now().date_naive();
+        self.todo.state.due_count(today) + self.twos.state.due_count(today)
+    }
+
+    /// Shows the dated tasks of all task apps in the calendar.
+    fn show_tasks_in_cal(&mut self) {
+        let mut events = self.todo.state.as_events(TODO_CAL);
+        events.extend(self.twos.state.as_events(TWOS_CAL));
+        self.cal.set_tasks(events, &[(TODO_CAL, "Microsoft To Do", [37, 100, 207]), (TWOS_CAL, "Twos", [235, 140, 50])]);
+    }
+
+    /// The task tab a task shown in the calendar comes from.
+    fn task_service(cal: &str) -> Service {
+        if cal == TWOS_CAL {
+            Service::Twos
+        } else {
+            Service::Tasks
+        }
     }
 
     /// The event under the agenda selection or the time-grid cursor.
@@ -919,7 +993,10 @@ impl App {
         };
         let cal = earliest(
             self.google.as_ref().and_then(|_| self.cal.next_wake(now)),
-            self.todo_api.as_ref().and_then(|_| self.todo.next_wake(now)),
+            earliest(
+                self.todo.api.as_ref().and_then(|_| self.todo.state.next_wake(now)),
+                self.twos.api.as_ref().and_then(|_| self.twos.state.next_wake(now)),
+            ),
         );
         // The time grid's "now" line moves every 30 minutes.
         let grid = (self.service == Service::Calendar && self.cal_view != CalView::Agenda).then(|| {
@@ -952,57 +1029,62 @@ impl App {
         if self.cal.next_poll.is_some_and(|t| t <= std::time::Instant::now()) {
             self.cal_sync();
         }
-        let tasks: Vec<String> = self.todo.due_reminders(now).into_iter().map(|t| format!("☐ {}", t.title)).collect();
-        if !tasks.is_empty() {
-            self.status = format!("⏰ to do: {}", tasks.join(" · "));
-            bell();
-        }
-        if self.todo.next_poll.is_some_and(|t| t <= std::time::Instant::now()) {
-            self.todo_sync();
+        for s in [Service::Tasks, Service::Twos] {
+            let tasks: Vec<String> = self.tab_mut(s).state.due_reminders(now).into_iter().map(|t| format!("☐ {}", t.title)).collect();
+            if !tasks.is_empty() {
+                self.status = format!("⏰ {}: {}", s.name(), tasks.join(" · "));
+                bell();
+            }
+            if self.tab(s).state.next_poll.is_some_and(|t| t <= std::time::Instant::now()) {
+                self.todo_sync(s);
+            }
         }
         self.tree_dirty = true;
         self.dirty = true;
     }
 
-    // ---- Microsoft To Do -------------------------------------------------------
+    // ---- task tabs (Microsoft To Do, Twos) --------------------------------------
 
-    pub fn todo_sync(&mut self) {
-        let Some(api) = self.todo_api.clone() else { return };
-        if self.todo.syncing {
+    pub fn todo_sync(&mut self, s: Service) {
+        let tab = self.tab_mut(s);
+        let Some(api) = tab.api.clone() else { return };
+        if tab.state.syncing {
             return;
         }
-        self.todo.syncing = true;
-        self.todo.next_poll = None;
-        if self.todo.status.is_empty() {
-            self.todo.status = "syncing…".into();
+        tab.state.syncing = true;
+        tab.state.next_poll = None;
+        if tab.state.status.is_empty() {
+            tab.state.status = "syncing…".into();
         }
         self.spawn(async move {
-            Some(AppEvent::Todo(match api.sync().await {
+            Some(AppEvent::Todo(s, match api.sync().await {
                 Ok((lists, tasks)) => TodoMsg::Synced(lists, tasks),
                 Err(e) => TodoMsg::Error(e),
             }))
         });
     }
 
-    fn on_todo(&mut self, msg: TodoMsg) {
+    fn on_todo(&mut self, s: Service, msg: TodoMsg) {
         match msg {
             TodoMsg::Synced(lists, tasks) => {
-                self.todo.syncing = false;
-                self.todo.next_poll = Some(std::time::Instant::now() + todo::POLL);
-                self.todo.apply(lists, tasks);
+                let st = &mut self.tab_mut(s).state;
+                st.syncing = false;
+                st.next_poll = Some(std::time::Instant::now() + todo::POLL);
+                st.apply(lists, tasks);
                 self.done_refreshing();
             }
             TodoMsg::Error(e) => {
-                self.todo.syncing = false;
-                self.todo.login = None;
-                self.todo.next_poll = Some(std::time::Instant::now() + todo::POLL);
-                self.todo.status = "sync failed".into();
+                let st = &mut self.tab_mut(s).state;
+                st.syncing = false;
+                st.login = None;
+                st.next_poll = Some(std::time::Instant::now() + todo::POLL);
+                st.status = "sync failed".into();
                 self.status = e;
             }
             TodoMsg::DeviceCode(uri, code) => {
                 self.status = format!("Microsoft sign-in: open {uri} and enter {code}");
                 let _ = open_url(&uri);
-                self.todo.login = Some((uri, code));
+                self.todo.state.login = Some((uri, code));
             }
             TodoMsg::LoggedIn(creds) => {
                 if let Err(e) = creds.save() {
@@ -1010,19 +1092,19 @@ impl App {
                 } else {
                     self.status = "Microsoft To Do connected".into();
                 }
-                self.todo.login = None;
-                self.todo_api = Some(std::sync::Arc::new(Todo::new(creds)));
-                self.todo.status = "syncing…".into();
-                self.todo_sync();
+                self.todo.state.login = None;
+                self.todo.api = Some(Backend::Microsoft(Arc::new(Todo::new(creds))));
+                self.todo.state.status = "syncing…".into();
+                self.todo_sync(Service::Tasks);
             }
             TodoMsg::Changed(text, resync) => {
                 self.status = text;
                 if resync {
-                    self.todo_sync();
+                    self.todo_sync(s);
                 }
             }
         }
-        self.cal.set_tasks(self.todo.as_events());
+        self.show_tasks_in_cal();
         self.tree_dirty = true;
     }
 
@@ -1031,7 +1113,7 @@ impl App {
         self.status = "contacting Microsoft…".into();
         tokio::spawn(async move {
             let send = |m| {
-                let _ = tx.send(AppEvent::Todo(m));
+                let _ = tx.send(AppEvent::Todo(Service::Tasks, m));
             };
             match todo::device_code(&client_id).await {
                 Ok(dc) => {
@@ -1065,14 +1147,43 @@ impl App {
             },
             "logout" => {
                 todo::Creds::remove();
-                self.todo_api = None;
-                self.todo = TodoState::default();
-                self.cal.set_tasks(Vec::new());
+                self.todo = TaskTab::default();
+                self.show_tasks_in_cal();
                 self.tree_dirty = true;
                 self.status = "Microsoft To Do disconnected".into();
             }
-            "refresh" | "sync" | "" => self.todo_sync(),
+            "refresh" | "sync" | "" => self.todo_sync(Service::Tasks),
             _ => self.status = "usage: :todo setup <client id> · :todo login · :todo logout · :todo refresh".into(),
+        }
+    }
+
+    fn twos_command(&mut self, arg: &str) {
+        let (sub, rest) = arg.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((arg, ""));
+        match sub {
+            "login" | "key" => {
+                let key = rest.trim_matches('"');
+                if !twos::is_key(key) {
+                    self.status = "usage: :twos login <API key> (Twos → Settings → API Keys; it starts with twos_)".into();
+                    return;
+                }
+                if let Err(e) = twos::save_key(key) {
+                    self.status = format!("could not save the Twos key: {e}");
+                    return;
+                }
+                self.twos = TaskTab::new(Some(Backend::Twos(Arc::new(Twos::new(key.to_string())))));
+                self.status = "Twos connected".into();
+                self.todo_sync(Service::Twos);
+                self.tree_dirty = true;
+            }
+            "logout" => {
+                twos::remove_key();
+                self.twos = TaskTab::default();
+                self.show_tasks_in_cal();
+                self.tree_dirty = true;
+                self.status = "Twos disconnected".into();
+            }
+            "refresh" | "sync" | "" => self.todo_sync(Service::Twos),
+            _ => self.status = "usage: :twos login <API key> · :twos logout · :twos refresh".into(),
         }
     }
 
@@ -1080,10 +1191,11 @@ impl App {
         let sel_id = self.tree.get(self.tree_sel()).map(|t| t.id.clone());
         let today = chrono::Local::now().date_naive();
         let mut items = Vec::new();
-        for l in &self.todo.lists {
-            let tasks: Vec<&Task> = self.todo.tasks.iter().filter(|t| t.list == l.id).collect();
+        let tab = self.tab(self.service);
+        for l in &tab.state.lists {
+            let tasks: Vec<&Task> = tab.state.tasks.iter().filter(|t| t.list == l.id).collect();
             let open = tasks.iter().filter(|t| !t.done).count();
-            let shut = self.todo_collapsed.contains(&l.id);
+            let shut = tab.collapsed.contains(&l.id);
             items.push(TreeItem {
                 kind: ItemKind::TodoList,
                 id: l.id.clone(),
@@ -1129,10 +1241,11 @@ impl App {
             }
         }
         self.tree = items;
+        let positioned = self.tab(self.service).positioned;
         match sel_id.and_then(|id| self.tree.iter().position(|t| t.id == id)) {
-            Some(i) if self.todo_positioned => self.tree_state.select(Some(i)),
-            _ if !self.tree.is_empty() && !self.todo_positioned => {
-                self.todo_positioned = true;
+            Some(i) if positioned => self.tree_state.select(Some(i)),
+            _ if !self.tree.is_empty() && !positioned => {
+                self.tab_mut(self.service).positioned = true;
                 let first = self.tree.iter().position(|t| t.kind == ItemKind::TodoTask).unwrap_or(0);
                 self.tree_state.select(Some(first));
             }
@@ -1144,7 +1257,7 @@ impl App {
 
     pub fn selected_task(&self) -> Option<&Task> {
         let item = self.tree.get(self.tree_sel()).filter(|t| t.kind == ItemKind::TodoTask)?;
-        self.todo.find(&item.id)
+        self.tasks().find(&item.id)
     }
 
     /// The list new tasks go to: the selected one, else the default list.
@@ -1155,20 +1268,21 @@ impl App {
             Some(ItemKind::TodoTask) => self.selected_task().map(|t| t.list.clone()),
             _ => None,
         }
-        .or_else(|| self.todo.default_list().map(String::from))
+        .or_else(|| self.tasks().default_list().map(String::from))
     }
 
     /// Ticks a task off (or back on). It stays visible, struck through, until
     /// the next sync, so a mistaken `x` can be undone with another `x`.
-    fn toggle_task(&mut self, key: &str) {
-        let Some(api) = self.todo_api.clone() else { return };
-        let Some(t) = self.todo.find_mut(key) else { return };
+    fn toggle_task(&mut self, s: Service, key: &str) {
+        let tab = self.tab_mut(s);
+        let Some(api) = tab.api.clone() else { return };
+        let Some(t) = tab.state.find_mut(key) else { return };
         t.done = !t.done;
         let (list, id, done, title) = (t.list.clone(), t.id.clone(), t.done, t.title.clone());
-        self.cal.set_tasks(self.todo.as_events());
+        self.show_tasks_in_cal();
         self.tree_dirty = true;
         self.spawn(async move {
-            Some(AppEvent::Todo(match api.set_done(&list, &id, done).await {
+            Some(AppEvent::Todo(s, match api.set_done(&list, &id, done).await {
                 Ok(()) => TodoMsg::Changed(format!("{} \"{title}\"", if done { "done:" } else { "not done:" }), false),
                 Err(e) => TodoMsg::Error(e),
             }))
@@ -1178,8 +1292,8 @@ impl App {
     fn todo_key(&mut self, k: KeyEvent, pending: Option<char>) -> bool {
         match k.code {
             KeyCode::Char('n') | KeyCode::Char('i') | KeyCode::Char('a') => {
-                if self.todo_api.is_none() {
-                    self.status = "connect Microsoft To Do first (see the right pane)".into();
+                if !self.tasks_connected() {
+                    self.status = format!("connect {} first (see the right pane)", self.service.name());
                 } else {
                     self.mode = Mode::Normal;
                     self.enter_insert();
@@ -1195,16 +1309,17 @@ impl App {
             }
             KeyCode::Char('x') | KeyCode::Char(' ') if self.selected_task().is_some() => {
                 let key = self.selected_task().map(|t| t.key()).unwrap_or_default();
-                self.toggle_task(&key);
+                self.toggle_task(self.service, &key);
             }
             KeyCode::Char('d') if pending == Some('d') => {
-                let (Some(api), Some(t)) = (self.todo_api.clone(), self.selected_task()) else { return true };
+                let s = self.service;
+                let (Some(api), Some(t)) = (self.tab(s).api.clone(), self.selected_task()) else { return true };
                 let (key, list, id, title) = (t.key(), t.list.clone(), t.id.clone(), t.title.clone());
-                self.todo.tasks.retain(|t| t.key() != key);
-                self.cal.set_tasks(self.todo.as_events());
+                self.tab_mut(s).state.tasks.retain(|t| t.key() != key);
+                self.show_tasks_in_cal();
                 self.tree_dirty = true;
                 self.spawn(async move {
-                    Some(AppEvent::Todo(match api.delete(&list, &id).await {
+                    Some(AppEvent::Todo(s, match api.delete(&list, &id).await {
                         Ok(()) => TodoMsg::Changed(format!("deleted \"{title}\""), false),
                         Err(e) => TodoMsg::Error(e),
                     }))
@@ -1251,7 +1366,7 @@ impl App {
                 Creds::remove();
                 self.google = None;
                 self.cal = CalState::default();
-                self.cal.set_tasks(self.todo.as_events());
+                self.show_tasks_in_cal();
                 self.tree_dirty = true;
                 self.status = "Google Calendar disconnected".into();
             }
@@ -1297,13 +1412,15 @@ impl App {
             KeyCode::Char('w') if grid && !is_ctrl(&k) => self.cal_jump(true),
             KeyCode::Char('b') if grid && !is_ctrl(&k) => self.cal_jump(false),
             KeyCode::Char('t') if grid => self.cal_goto(chrono::Local::now()),
-            // To Do tasks shown in the calendar: x ticks them off; they're edited in Tasks mode.
-            KeyCode::Char('x') if pending != Some('g') && self.selected_event().is_some_and(|e| e.cal == TASKS_CALENDAR) => {
-                let key = self.selected_event().map(|e| e.id.clone()).unwrap_or_default();
-                self.toggle_task(&key);
+            // Tasks shown in the calendar: x ticks them off; they're edited in their own tab.
+            KeyCode::Char('x') if pending != Some('g') && self.selected_event().is_some_and(|e| self.cal.is_task(e)) => {
+                if let Some((key, s)) = self.selected_event().map(|e| (e.id.clone(), Self::task_service(&e.cal))) {
+                    self.toggle_task(s, &key);
+                }
             }
-            KeyCode::Char('e' | 'c' | 'o' | 'd') if self.selected_event().is_some_and(|e| e.cal == TASKS_CALENDAR) => {
-                self.status = "a To Do task: x ticks it off; edit it in Tasks mode (4gt)".into();
+            KeyCode::Char('e' | 'c' | 'o' | 'd') if self.selected_event().is_some_and(|e| self.cal.is_task(e)) => {
+                let s = self.selected_event().map(|e| Self::task_service(&e.cal)).unwrap_or(Service::Tasks);
+                self.status = format!("a {} task: x ticks it off; edit it in its tab ({}gt)", s.name(), s.index() + 1);
             }
             KeyCode::Char('e') | KeyCode::Char('c') => {
                 if let Some(e) = self.selected_event() {
@@ -1365,7 +1482,7 @@ impl App {
             AppEvent::Wa(ev) => self.on_wa(ev),
             AppEvent::Pic { key, pic } => self.pics.finish(key, pic),
             AppEvent::Cal(msg) => self.on_cal(msg),
-            AppEvent::Todo(msg) => self.on_todo(msg),
+            AppEvent::Todo(s, msg) => self.on_todo(s, msg),
         }
     }
 
@@ -1618,12 +1735,12 @@ impl App {
                 }
                 self.cal_sync();
             }
-            Service::Tasks => {
-                if self.todo_api.is_none() {
-                    self.status = "Microsoft To Do isn't connected (see the right pane)".into();
+            Service::Tasks | Service::Twos => {
+                if !self.tasks_connected() {
+                    self.status = format!("{} isn't connected (see the right pane)", self.service.name());
                     return;
                 }
-                self.todo_sync();
+                self.todo_sync(self.service);
             }
         }
         self.status = REFRESHING.into();
@@ -1709,7 +1826,7 @@ impl App {
     }
 
     fn fetch_older(&mut self) {
-        if matches!(self.service, Service::Calendar | Service::Tasks) {
+        if matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos) {
             return;
         }
         if self.service == Service::WhatsApp {
@@ -1834,7 +1951,7 @@ impl App {
                 self.cal_select(&id);
                 self.focus = Focus::Tree;
             }
-            Service::Tasks => self.focus = Focus::Tree,
+            Service::Tasks | Service::Twos => self.focus = Focus::Tree,
         }
     }
 
@@ -1875,7 +1992,7 @@ impl App {
                     self.mark_read(&ch);
                 }
             }
-            Service::Calendar | Service::Tasks => {}
+            Service::Calendar | Service::Tasks | Service::Twos => {}
         }
         if self.current_chat().is_none() && self.focus != Focus::Tree {
             self.focus = Focus::Tree;
@@ -1925,10 +2042,11 @@ impl App {
             self.input.clear();
             return;
         }
-        if self.service == Service::Tasks {
+        if self.service.is_tasks() {
             self.input.clear();
             self.leave_insert();
-            let Some(api) = self.todo_api.clone() else { return };
+            let s = self.service;
+            let Some(api) = self.tab(s).api.clone() else { return };
             let target = match mode {
                 Mode::Edit(key) => key.split_once('\n').map(|(l, id)| (l.to_string(), Some(id.to_string()))),
                 _ => self.target_list().map(|l| (l, None)),
@@ -1943,7 +2061,7 @@ impl App {
                     Some(id) => api.update(&list, id, &content).await,
                     None => api.create(&list, &content).await,
                 };
-                Some(AppEvent::Todo(match result {
+                Some(AppEvent::Todo(s, match result {
                     Ok(()) => TodoMsg::Changed(if id.is_some() { "task updated".into() } else { "task added".into() }, true),
                     Err(e) => TodoMsg::Error(e),
                 }))
@@ -2022,7 +2140,7 @@ impl App {
                 .wa_messages()
                 .get(idx)
                 .map(|m| (m.from_me && m.kind == "text" && !m.deleted, m.id.clone(), m.text.clone())),
-            Service::Calendar | Service::Tasks => None,
+            Service::Calendar | Service::Tasks | Service::Twos => None,
         };
         let Some((own, id, content)) = found else { return };
         if !own {
@@ -2050,9 +2168,9 @@ impl App {
                 all.push((jid.clone(), self.wa.title(jid)));
             }
         }
-        if self.service == Service::Tasks {
-            for t in &self.todo.tasks {
-                all.push((t.key(), format!("{} · {}", t.title, self.todo.list_name(&t.list))));
+        if self.service.is_tasks() {
+            for t in &self.tasks().tasks {
+                all.push((t.key(), format!("{} · {}", t.title, self.tasks().list_name(&t.list))));
             }
         }
         if self.service == Service::Calendar {
@@ -2099,7 +2217,7 @@ impl App {
                     }
                 }
             }
-            "wa" | "cal" | "calendar" | "todo" | "tasks" if !Self::command_service(name).built() => {
+            "wa" | "cal" | "calendar" | "todo" | "tasks" | "twos" if !Self::command_service(name).built() => {
                 self.status = format!("{} isn't part of this build", Self::command_service(name).name());
             }
             "wa" => match arg {
@@ -2113,6 +2231,7 @@ impl App {
             },
             "cal" | "calendar" => self.cal_command(arg),
             "todo" | "tasks" => self.todo_command(arg),
+            "twos" => self.twos_command(arg),
             "images" | "img" => {
                 self.pics.enabled = match arg {
                     "on" => true,
@@ -2139,6 +2258,7 @@ impl App {
         match name {
             "wa" => Service::WhatsApp,
             "cal" | "calendar" => Service::Calendar,
+            "twos" => Service::Twos,
             _ => Service::Tasks,
         }
     }
@@ -2359,7 +2479,7 @@ impl App {
                 self.help = true;
                 return;
             }
-            KeyCode::Char('i') | KeyCode::Char('a') if !matches!(self.service, Service::Calendar | Service::Tasks) => {
+            KeyCode::Char('i') | KeyCode::Char('a') if !matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos) => {
                 if self.current_chat().is_some() {
                     self.enter_insert();
                 } else {
@@ -2369,7 +2489,7 @@ impl App {
             }
             _ => {}
         }
-        if self.service == Service::Tasks {
+        if self.service.is_tasks() {
             if !self.todo_key(k, pending) {
                 self.tree_key(k, pending, n, count.is_some());
             }
@@ -2476,9 +2596,9 @@ impl App {
             }
             ItemKind::TodoList => {
                 if open {
-                    self.todo_collapsed.remove(&id);
+                    self.tab_mut(self.service).collapsed.remove(&id);
                 } else {
-                    self.todo_collapsed.insert(id);
+                    self.tab_mut(self.service).collapsed.insert(id);
                 }
             }
             _ => return,
@@ -2592,7 +2712,7 @@ impl App {
                 let cmd = json!({"c": "react", "chat": m.chat, "id": m.id, "text": emoji});
                 wa::send(&self.wa_cmd, cmd);
             }
-            Service::Calendar | Service::Tasks => {}
+            Service::Calendar | Service::Tasks | Service::Twos => {}
         }
     }
 
@@ -2609,7 +2729,7 @@ impl App {
                 let cmd = json!({"c": "delete", "chat": m.chat, "id": m.id});
                 wa::send(&self.wa_cmd, cmd);
             }
-            Service::Calendar | Service::Tasks => {}
+            Service::Calendar | Service::Tasks | Service::Twos => {}
         }
     }
 
