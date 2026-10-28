@@ -1,0 +1,8 @@
+/target
+/wa/discommand-wa
+/wa/discommand-wa.exe
+
+# The publisher keys (see keys/README.md) and anything else private.
+/keys/keys.env
+*.local.*
+    

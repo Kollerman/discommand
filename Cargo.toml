@@ -1,0 +1,47 @@
+[package]
+name = "discommand"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight, battery-friendly terminal Discord client"
+license = "MIT"
+
+[features]
+default = ["native-tls"]
+# OS TLS stack: SChannel on Windows, Security.framework on macOS, OpenSSL on Linux.
+native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
+# Pure-Rust TLS (handy for Termux / static Linux builds without OpenSSL headers).
+rustls = ["reqwest/rustls-tls-webpki-roots", "tokio-tungstenite/rustls-tls-webpki-roots"]
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "process", "io-util"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+flate2 = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+unicode-width = "0.2"
+dirs = "5"
+rpassword = "7"
+qrcode = { version = "0.14", default-features = false }
+# Pure-Rust decoders only: no C toolchain needed on ARM.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# Google sign-in (PKCE) and Discord's QR-code login.
+sha2 = "0.10"
+rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"] }
+getrandom = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI token encryption, EFS folder encryption, and telling left from right Shift.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

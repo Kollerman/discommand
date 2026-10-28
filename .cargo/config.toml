@@ -1,0 +1,6 @@
+# Windows on ARM without Visual Studio: build with llvm-mingw on PATH and
+#   cargo +stable-aarch64-pc-windows-gnullvm build --release
+[target.aarch64-pc-windows-gnullvm]
+linker = "aarch64-w64-mingw32-clang"
+# Link libunwind statically so the exe doesn't need llvm-mingw's DLLs at runtime.
+rustflags = ["-C", "target-feature=+crt-static"]
