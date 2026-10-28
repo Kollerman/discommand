@@ -60,6 +60,99 @@ struct Thing {
     #[serde(default)]
     favorited: bool,
     created: Option<String>,
+    /// todo, none (a plain note), dash, number, bullet or photo.
+    #[serde(default, rename = "type")]
+    kind: String,
+    /// Indent level.
+    #[serde(default)]
+    tabs: u32,
+    #[serde(default)]
+    header: bool,
+    #[serde(default)]
+    subheader: bool,
+}
+
+/// A Twos thing as a line of a task tab.
+fn to_task(t: Thing, list: &str, pos: u32, due: Option<NaiveDate>, reminder: Option<DateTime<Local>>, from: Option<NaiveDate>) -> Task {
+    let marker = match t.kind.as_str() {
+        "bullet" => "• ",
+        "dash" => "– ",
+        "number" => "1. ",
+        "photo" => "[photo] ",
+        _ => "",
+    };
+    let empty = t.text.trim().is_empty();
+    Task {
+        id: t.id,
+        list: list.to_string(),
+        title: if empty && t.kind == "todo" { "(no text)".into() } else { t.text },
+        note: t.note,
+        due,
+        reminder,
+        done: t.completed || t.canceled,
+        important: t.favorited,
+        created: t.created.and_then(|c| DateTime::parse_from_rfc3339(&c).ok()).map(|d| d.with_timezone(&Local)),
+        check: t.kind == "todo",
+        marker: marker.to_string(),
+        heading: t.header || t.subheader,
+        depth: t.tabs.min(6) as u8,
+        pos,
+        from,
+    }
+}
+
+/// Day lists are ordinary lists titled with their date. Today's title shows
+/// the format; titles in it from about a year around today are days.
+struct Days(HashMap<String, NaiveDate>);
+
+/// Date formats a day list title may have (the account's one is detected).
+const DAY_FORMATS: &[&str] = &[
+    "%a %b %d %Y",
+    "%a, %b %-d, %Y",
+    "%A, %B %-d, %Y",
+    "%a %b %-d, %Y",
+    "%a, %b %-d %Y",
+    "%A %B %-d, %Y",
+    "%b %-d, %Y",
+    "%B %-d, %Y",
+    "%a, %-d %b %Y",
+    "%A, %-d %B %Y",
+    "%-d %b %Y",
+    "%-d %B %Y",
+    "%Y-%m-%d",
+    "%-m/%-d/%Y",
+    "%m/%d/%Y",
+    "%-m/%-d/%y",
+    "%d.%m.%Y",
+    "%-d.%-m.%Y",
+    "%A, %B %-d",
+    "%a, %b %-d",
+    "%b %-d",
+];
+
+impl Days {
+    fn new(today_title: &str, today: NaiveDate) -> Days {
+        let title = today_title.trim();
+        let formats: Vec<&str> = match DAY_FORMATS.iter().find(|f| today.format(f).to_string() == title) {
+            Some(f) => vec![f],
+            None => DAY_FORMATS.to_vec(),
+        };
+        let mut map = HashMap::new();
+        // Nearest days first, so a title without a year means the closest date.
+        for n in 0..=400i64 {
+            for off in if n == 0 { vec![0] } else { vec![-n, n] } {
+                let Some(d) = today.checked_add_signed(chrono::TimeDelta::days(off)) else { continue };
+                for f in &formats {
+                    map.entry(d.format(f).to_string()).or_insert(d);
+                }
+            }
+        }
+        Days(map)
+    }
+
+    fn date(&self, title: &str) -> Option<NaiveDate> {
+        self.0.get(title.trim()).copied()
+    }
 }
 
 #[derive(Deserialize)]
@@ -140,10 +233,15 @@ impl Twos {
         self.call(Method::GET, Self::url(segments, query), None).await
     }
 
-    /// Today's list (where new things go), and the open todos of all lists.
+    /// Like the app: **Today** is today's whole day list (notes, headings and
+    /// done to-dos included), with the unfinished to-dos of earlier days
+    /// rolled over on top. Then upcoming days and other lists with open
+    /// to-dos.
     pub async fn sync(&self) -> Result<(Vec<TaskList>, Vec<Task>), String> {
-        let today: TList = serde_json::from_value(self.get(&["today"], &[("max_text", "1")]).await?["list"].take())
-            .map_err(|e| format!("Twos: {e}"))?;
+        let date = Local::now().date_naive();
+        let mut v = self.get(&["today"], &[]).await?;
+        let today: TList = serde_json::from_value(v["list"].take()).map_err(|e| format!("Twos: {e}"))?;
+        let page: Vec<Thing> = serde_json::from_value(v["things"].take()).unwrap_or_default();
 
         let mut things: Vec<Thing> = Vec::new();
         for page in 0..MAX_PAGES {
@@ -164,30 +262,61 @@ impl Twos {
 
         self.learn_names(&things).await?;
         let names = self.names.lock().unwrap().clone();
-        let mut lists = vec![TaskList { id: today.id.clone(), name: "Today".into(), default: true }];
-        for t in &things {
-            if !lists.iter().any(|l| l.id == t.list_id) {
-                let name = names.get(&t.list_id).filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| "(untitled list)".into());
-                lists.push(TaskList { id: t.list_id.clone(), name, default: false });
+        let days = Days::new(&today.title, date);
+        let mut pos = 0;
+        let mut task = |t: Thing, list: &str, from: Option<NaiveDate>| {
+            pos += 1;
+            let (when, at) = due.get(t.id.as_str()).copied().unzip();
+            to_task(t, list, pos, when, at.flatten(), from)
+        };
+
+        let mut lists = vec![TaskList { id: today.id.clone(), name: format!("Today · {}", date.format("%a %d %b")), default: true, pos: 0 }];
+        let (mut rolled, mut upcoming, mut other) = (Vec::new(), Vec::new(), Vec::new());
+        for t in things {
+            if t.list_id == today.id {
+                continue; // part of today's page
+            }
+            let title = names.get(&t.list_id).map(String::as_str).unwrap_or("");
+            match days.date(title) {
+                Some(d) if d < date => rolled.push((d, t)),
+                Some(d) => upcoming.push((d, t)),
+                None => other.push(t),
             }
         }
-        let tasks = things
-            .into_iter()
-            .map(|t| {
-                let (date, at) = due.get(t.id.as_str()).copied().unzip();
-                Task {
-                    title: if t.text.trim().is_empty() { "(no text)".into() } else { t.text },
-                    list: t.list_id,
-                    note: t.note,
-                    due: date,
-                    reminder: at.flatten(),
-                    done: false,
-                    important: t.favorited,
-                    created: t.created.and_then(|c| DateTime::parse_from_rfc3339(&c).ok()).map(|d| d.with_timezone(&Local)),
-                    id: t.id,
-                }
-            })
-            .collect();
+        // Rolled-over to-dos on top, oldest day first, as Twos shows them.
+        rolled.sort_by(|a, b| (a.0, &a.1.created).cmp(&(b.0, &b.1.created)));
+        let mut tasks: Vec<Task> = rolled.into_iter().map(|(d, t)| task(t, &today.id, Some(d))).collect();
+        let mut number = 0;
+        for t in page {
+            // Numbered lines count up within a run of them.
+            number = if t.kind == "number" { number + 1 } else { 0 };
+            let mut line = task(t, &today.id, None);
+            if number > 0 {
+                line.marker = format!("{number}. ");
+            }
+            tasks.push(line);
+        }
+        upcoming.sort_by(|a, b| (a.0, &a.1.created).cmp(&(b.0, &b.1.created)));
+        for (d, t) in upcoming {
+            if !lists.iter().any(|l| l.id == t.list_id) {
+                let name = match (d - date).num_days() {
+                    1 => format!("Tomorrow · {}", d.format("%a %d %b")),
+                    _ => d.format("%a %d %b %Y").to_string(),
+                };
+                lists.push(TaskList { id: t.list_id.clone(), name, default: false, pos: lists.len() as u32 });
+            }
+            let list = t.list_id.clone();
+            tasks.push(task(t, &list, None));
+        }
+        for t in other {
+            if !lists.iter().any(|l| l.id == t.list_id) {
+                let name = names.get(&t.list_id).filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| "(untitled list)".into());
+                // After the days, by name.
+                lists.push(TaskList { id: t.list_id.clone(), name, default: false, pos: u32::MAX });
+            }
+            let list = t.list_id.clone();
+            tasks.push(task(t, &list, None));
+        }
         Ok((lists, tasks))
     }
 
@@ -278,6 +407,43 @@ mod tests {
         let (d, t) = r.due().unwrap();
         assert_eq!(t.unwrap().with_timezone(&chrono::FixedOffset::east_opt(3600).unwrap()).format("%H:%M").to_string(), "09:30");
         assert_eq!(Some(d), t.map(|t| t.date_naive()));
+    }
+
+    #[test]
+    fn day_lists_are_recognized_by_title() {
+        let today = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+        // The format of today's title is detected and used for the others.
+        let days = Days::new("Wed Oct 28 2026", today);
+        assert_eq!(days.date("Tue Oct 27 2026"), NaiveDate::from_ymd_opt(2026, 10, 27));
+        assert_eq!(days.date("Fri Jan 01 2027"), NaiveDate::from_ymd_opt(2027, 1, 1));
+        assert_eq!(days.date("Groceries"), None);
+        let days = Days::new("Wednesday, October 28, 2026", today);
+        assert_eq!(days.date("Monday, October 26, 2026"), NaiveDate::from_ymd_opt(2026, 10, 26));
+        // Unknown format: every known one is tried.
+        let days = Days::new("", today);
+        assert_eq!(days.date("2026-10-20"), NaiveDate::from_ymd_opt(2026, 10, 20));
+    }
+
+    #[test]
+    fn things_become_lines() {
+        let thing = |kind: &str, completed: bool| Thing {
+            id: "t".into(),
+            list_id: "l".into(),
+            text: "Milk".into(),
+            note: String::new(),
+            completed,
+            canceled: false,
+            favorited: false,
+            created: None,
+            kind: kind.into(),
+            tabs: 1,
+            header: false,
+            subheader: false,
+        };
+        let t = to_task(thing("todo", true), "today", 3, None, None, None);
+        assert!(t.check && t.done && t.marker.is_empty() && t.depth == 1 && t.pos == 3);
+        let t = to_task(thing("bullet", false), "today", 4, None, None, None);
+        assert!(!t.check && t.marker == "• ");
     }
 
     #[test]

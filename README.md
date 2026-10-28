@@ -404,11 +404,23 @@ has no date. Reminders ring the bell and show in the status line.
 
 ## Twos
 
-[Twos](https://www.twosapp.com) is the sixth mode (`6gt`) and works like the Tasks
-mode above, with the same keys: your open todos grouped by list, with **Today** first.
-New todos go to today's list unless you select another list. A date or time typed
-with a todo (`morgen 14:00 Arzt anrufen`) becomes its Twos reminder. Twos has no
-separate due date. Reminders show in the calendar (in orange) and ring the bell.
+[Twos](https://www.twosapp.com) is the sixth mode (`6gt`) and follows the app's day model:
+
+- **Today** is today's whole day list, as in Twos: notes, bullets, numbered lines,
+  headings (bold) and indented lines, plus to-dos, also finished ones (struck through).
+- **Rollover:** unfinished to-dos from earlier days roll over and sit on top of Today,
+  marked with the day they came from (`↪ Tue 27 Oct`). Notes don't roll over.
+- **Upcoming days** (Tomorrow, …) with open to-dos follow, then your other lists with
+  their open to-dos.
+
+The keys are the same as in Tasks: `x` ticks a to-do off, and `n` adds one to the
+selected list (Today if nothing else is selected). `e` edits any line and `dd`
+deletes it. A date or time typed with a to-do (`morgen 14:00 Arzt anrufen`) becomes
+its Twos reminder, since Twos has no separate due date. Reminders show in the calendar
+(in orange) and ring the bell.
+
+Day lists are recognised by their title: today's title shows the date format your
+account uses.
 
 **Connect.** In Twos (app or twosapp.com) open *Settings → API Keys*, create a key with
 the scopes `read:lists`, `read:things` and `write:things`, and run

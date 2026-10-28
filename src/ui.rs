@@ -105,6 +105,7 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect, split: bool) {
                 ItemKind::TodoList => (fold, Style::new().add_modifier(Modifier::BOLD)),
                 ItemKind::TodoTask if t.dim => ("☑ ", Style::new()),
                 ItemKind::TodoTask => ("☐ ", Style::new()),
+                ItemKind::TodoNote => ("", Style::new()),
             };
             let mut style = base;
             if t.unread {
@@ -238,8 +239,13 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled("  (the page was opened in your browser; this updates by itself)", DIM)));
     } else if let Some(t) = app.selected_task() {
         let today = Local::now().date_naive();
-        let state = if t.done { "done" } else if t.overdue(today) { "overdue" } else { "open" };
-        lines.push(Line::from(vec![label("Status"), Span::raw(state)]));
+        if t.check {
+            let state = if t.done { "done" } else if t.overdue(today) { "overdue" } else { "open" };
+            lines.push(Line::from(vec![label("Status"), Span::raw(state)]));
+        }
+        if let Some(from) = t.from {
+            lines.push(Line::from(vec![label("Rolled"), Span::raw(format!("over from {}", from.format("%a %d %b")))]));
+        }
         if let Some(d) = t.due {
             lines.push(Line::from(vec![label("Due"), Span::raw(d.format("%a %d %b %Y").to_string())]));
         }
@@ -396,16 +402,79 @@ const CAL_SETUP: &[&str] = &[
     "phone; events in a Google calendar then show up in both.",
 ];
 
+/// The logo, in "ANSI Shadow" letters: faces (█) and their shadow.
+const LOGO: [&str; 6] = [
+    "██████╗ ██╗███████╗ ██████╗ ██████╗ ███╗   ███╗███╗   ███╗ █████╗ ███╗   ██╗██████╗",
+    "██╔══██╗██║██╔════╝██╔════╝██╔═══██╗████╗ ████║████╗ ████║██╔══██╗████╗  ██║██╔══██╗",
+    "██║  ██║██║███████╗██║     ██║   ██║██╔████╔██║██╔████╔██║███████║██╔██╗ ██║██║  ██║",
+    "██║  ██║██║╚════██║██║     ██║   ██║██║╚██╔╝██║██║╚██╔╝██║██╔══██║██║╚██╗██║██║  ██║",
+    "██████╔╝██║███████║╚██████╗╚██████╔╝██║ ╚═╝ ██║██║ ╚═╝ ██║██║  ██║██║ ╚████║██████╔╝",
+    "╚═════╝ ╚═╝╚══════╝ ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚═╝     ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝",
+];
+
+/// For narrow panes (already slanted).
+const LOGO_SMALL: [&str; 4] = [
+    r"     ___                                       __",
+    r" ___/ (_)__ _______  __ _  __ _  ___ ____  ___/ /",
+    r"/ _  / (_-</ __/ _ \/  ' \/  ' \/ _ `/ _ \/ _  /",
+    r"\_,_/_/___/\__/\___/_/_/_/_/_/_/\_,_/_//_/\_,_/",
+];
+
+/// The empty chat pane: the logo, leaning right (each row starts one
+/// column left of the one above), in a cyan → magenta neon gradient.
+fn draw_logo(f: &mut Frame, area: Rect) {
+    let (w, h) = (area.width as usize, area.height as usize);
+    let lean = LOGO.len() - 1;
+    let big_w = LOGO[1].chars().count() + lean;
+    let rows: Vec<String> = if w >= big_w + 2 && h >= LOGO.len() + 5 {
+        LOGO.iter().enumerate().map(|(i, l)| format!("{}{l}", " ".repeat(lean - i))).collect()
+    } else if w >= LOGO_SMALL[1].len() + 2 {
+        LOGO_SMALL.iter().map(|l| l.to_string()).collect()
+    } else {
+        vec!["discommand".to_string()]
+    };
+    let logo_w = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+    let neon = |x: usize| {
+        let t = x as f32 / logo_w.max(1) as f32;
+        let mix = |a: f32, b: f32| (a + (b - a) * t) as u8;
+        Color::Rgb(mix(0.0, 255.0), mix(230.0, 40.0), mix(255.0, 200.0))
+    };
+    let shadow = Style::new().fg(Color::Rgb(95, 45, 150));
+    let pad = " ".repeat(w.saturating_sub(logo_w) / 2);
+    let mut lines: Vec<Line> = Vec::new();
+    for row in &rows {
+        let mut spans = vec![Span::raw(pad.clone())];
+        for (x, c) in row.chars().enumerate() {
+            let style = match c {
+                ' ' => Style::new(),
+                // The big logo's shadow is drawn with box lines.
+                '╗' | '╔' | '║' | '═' | '╝' | '╚' => shadow,
+                _ => Style::new().fg(neon(x)).add_modifier(Modifier::BOLD),
+            };
+            spans.push(Span::styled(c.to_string(), style));
+        }
+        lines.push(Line::from(spans));
+    }
+    let center = |text: &str| " ".repeat(w.saturating_sub(text.chars().count()) / 2);
+    let tag = "░▒▓█ TERMINAL UPLINK █▓▒░";
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw(center(tag)),
+        Span::styled(tag, Style::new().fg(Color::Rgb(255, 40, 200)).add_modifier(Modifier::BOLD)),
+    ]));
+    let hint = "/ find a chat · j/k l open · shift+tab next service · ? help";
+    lines.push(Line::from(vec![Span::raw(center(hint)), Span::styled(hint, DIM)]));
+    let top = h.saturating_sub(lines.len()) / 2;
+    let mut all = vec![Line::from(""); top];
+    all.extend(lines);
+    f.render_widget(Paragraph::new(all), area);
+}
+
 fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     let h = area.height as usize;
     app.msg_height = h;
     let Some(chat) = app.current_chat().map(String::from) else {
-        let logo = vec![
-            Line::from(""),
-            Line::from(Span::styled("  discommand", Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))),
-            Line::from(Span::styled("  j/k move · l open · / find chat · shift+tab Discord/WhatsApp · ? help", DIM)),
-        ];
-        f.render_widget(Paragraph::new(logo), area);
+        draw_logo(f, area);
         return;
     };
     let width = area.width.saturating_sub(1).max(4) as usize;
@@ -1137,6 +1206,21 @@ mod tests {
         for y in 0..buf.area.height {
             let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
             println!("{line}");
+        }
+    }
+
+    /// Prints the empty chat pane at a wide and a narrow size.
+    #[test]
+    #[ignore]
+    fn preview_logo() {
+        for (w, h) in [(100, 16), (60, 10)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw_logo(f, f.area())).unwrap();
+            let buf = term.backend().buffer();
+            for y in 0..h {
+                let line: String = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                println!("{}", line.trim_end());
+            }
         }
     }
 }

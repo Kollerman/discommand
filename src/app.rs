@@ -200,6 +200,8 @@ pub enum ItemKind {
     CalEvent,
     TodoList,
     TodoTask,
+    /// A Twos line without a checkbox: a note, bullet or heading.
+    TodoNote,
 }
 
 pub struct TreeItem {
@@ -1264,7 +1266,7 @@ impl App {
         let tab = self.tab(self.service);
         for l in &tab.state.lists {
             let tasks: Vec<&Task> = tab.state.tasks.iter().filter(|t| t.list == l.id).collect();
-            let open = tasks.iter().filter(|t| !t.done).count();
+            let open = tasks.iter().filter(|t| t.check && !t.done).count();
             let shut = tab.collapsed.contains(&l.id);
             items.push(TreeItem {
                 kind: ItemKind::TodoList,
@@ -1293,15 +1295,19 @@ impl App {
                     Some(d) if d == today => Some([230, 190, 40]),
                     _ => None,
                 };
+                let mut label = format!("{}{}", t.marker, t.title);
+                if let Some(d) = due {
+                    label.push_str(&format!("  · {d}"));
+                }
+                if let Some(from) = t.from {
+                    label.push_str(&format!("  ↪ {}", from.format("%a %d %b")));
+                }
                 items.push(TreeItem {
-                    kind: ItemKind::TodoTask,
+                    kind: if t.check { ItemKind::TodoTask } else { ItemKind::TodoNote },
                     id: t.key(),
-                    depth: 1,
-                    label: match due {
-                        Some(d) => format!("{}  · {d}", t.title),
-                        None => t.title.clone(),
-                    },
-                    unread: t.important && !t.done,
+                    depth: 1 + t.depth as u16,
+                    label,
+                    unread: (t.important || t.heading) && !t.done,
                     mentions: 0,
                     expanded: false,
                     group: false,
@@ -1316,7 +1322,7 @@ impl App {
             Some(i) if positioned => self.tree_state.select(Some(i)),
             _ if !self.tree.is_empty() && !positioned => {
                 self.tab_mut(self.service).positioned = true;
-                let first = self.tree.iter().position(|t| t.kind == ItemKind::TodoTask).unwrap_or(0);
+                let first = self.tree.iter().position(|t| matches!(t.kind, ItemKind::TodoTask | ItemKind::TodoNote)).unwrap_or(0);
                 self.tree_state.select(Some(first));
             }
             _ => {}
@@ -1326,7 +1332,7 @@ impl App {
     }
 
     pub fn selected_task(&self) -> Option<&Task> {
-        let item = self.tree.get(self.tree_sel()).filter(|t| t.kind == ItemKind::TodoTask)?;
+        let item = self.tree.get(self.tree_sel()).filter(|t| matches!(t.kind, ItemKind::TodoTask | ItemKind::TodoNote))?;
         self.tasks().find(&item.id)
     }
 
@@ -1335,7 +1341,7 @@ impl App {
         let item = self.tree.get(self.tree_sel());
         match item.map(|t| t.kind) {
             Some(ItemKind::TodoList) => item.map(|t| t.id.clone()),
-            Some(ItemKind::TodoTask) => self.selected_task().map(|t| t.list.clone()),
+            Some(ItemKind::TodoTask | ItemKind::TodoNote) => self.selected_task().map(|t| t.list.clone()),
             _ => None,
         }
         .or_else(|| self.tasks().default_list().map(String::from))
@@ -1377,7 +1383,7 @@ impl App {
                     self.enter_insert();
                 }
             }
-            KeyCode::Char('x') | KeyCode::Char(' ') if self.selected_task().is_some() => {
+            KeyCode::Char('x') | KeyCode::Char(' ') if self.selected_task().is_some_and(|t| t.check) => {
                 let key = self.selected_task().map(|t| t.key()).unwrap_or_default();
                 self.toggle_task(self.service, &key);
             }

@@ -121,14 +121,17 @@ pub async fn finish_login(client_id: String, dc: DeviceCode) -> Result<Creds, St
 
 // ---- model ------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TaskList {
     pub id: String,
     pub name: String,
     pub default: bool,
+    /// Order among the other lists (the default list comes first anyway).
+    pub pos: u32,
 }
 
-#[derive(Clone, Debug)]
+/// A task, or (Twos) any line of a list: notes, bullets and headings too.
+#[derive(Clone, Debug, Default)]
 pub struct Task {
     pub id: String,
     pub list: String,
@@ -139,6 +142,17 @@ pub struct Task {
     pub done: bool,
     pub important: bool,
     pub created: Option<DateTime<Local>>,
+    /// A to-do with a checkbox (false for notes, bullets and headings).
+    pub check: bool,
+    /// Twos line style: what's drawn before a line without a checkbox
+    /// ("• ", "– ", "1. "), a heading, and the indent.
+    pub marker: String,
+    pub heading: bool,
+    pub depth: u8,
+    /// Place in its list as the app shows it (0: sorted by due date).
+    pub pos: u32,
+    /// Twos: the earlier day an unfinished to-do rolled over from.
+    pub from: Option<NaiveDate>,
 }
 
 impl Task {
@@ -157,7 +171,7 @@ impl Task {
     }
 
     pub fn overdue(&self, today: NaiveDate) -> bool {
-        !self.done && self.due.is_some_and(|d| d < today)
+        self.check && !self.done && self.due.is_some_and(|d| d < today)
     }
 }
 
@@ -358,7 +372,12 @@ impl Todo {
         let lists: Vec<TaskList> = glists
             .iter()
             .filter(|l| l.wellknown_list_name != "flaggedEmails")
-            .map(|l| TaskList { id: l.id.clone(), name: l.display_name.clone(), default: l.wellknown_list_name == "defaultList" })
+            .map(|l| TaskList {
+                id: l.id.clone(),
+                name: l.display_name.clone(),
+                default: l.wellknown_list_name == "defaultList",
+                pos: 0,
+            })
             .collect();
         // One list at a time: To Do lives in Exchange, which allows only a few
         // concurrent requests per mailbox and throttles beyond that.
@@ -384,6 +403,8 @@ impl Todo {
                 done: t.status == "completed",
                 important: t.importance == "high",
                 created: t.created_date_time.and_then(|c| DateTime::parse_from_rfc3339(&c).ok()).map(|d| d.with_timezone(&Local)),
+                check: true,
+                ..Task::default()
             })
             .collect())
     }
@@ -472,19 +493,21 @@ pub struct TodoState {
 
 impl TodoState {
     pub fn apply(&mut self, mut lists: Vec<TaskList>, tasks: Vec<Task>) {
-        // The default list ("Tasks") first, then by name.
-        lists.sort_by(|a, b| b.default.cmp(&a.default).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        // The default list ("Tasks", Twos' Today) first, then in the backend's order, then by name.
+        lists.sort_by(|a, b| {
+            b.default.cmp(&a.default).then(a.pos.cmp(&b.pos)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
         self.lists = lists;
         self.tasks = tasks;
         self.sort();
         self.status = format!("synced {}", Local::now().format("%H:%M"));
     }
 
-    /// Due tasks first (earliest first), then undated ones, newest first.
+    /// In the backend's order where it has one (Twos lists are pages);
+    /// otherwise due tasks first (earliest first), then undated ones, newest first.
     pub fn sort(&mut self) {
-        self.tasks.sort_by(|a, b| {
-            (a.due.is_none(), a.due, std::cmp::Reverse(a.created)).cmp(&(b.due.is_none(), b.due, std::cmp::Reverse(b.created)))
-        });
+        let key = |t: &Task| (t.pos, t.due.is_none(), t.due, std::cmp::Reverse(t.created));
+        self.tasks.sort_by(|a, b| key(a).cmp(&key(b)));
     }
 
     pub fn find(&self, key: &str) -> Option<&Task> {
@@ -505,17 +528,17 @@ impl TodoState {
 
     /// Open tasks due today or earlier.
     pub fn due_count(&self, today: NaiveDate) -> usize {
-        self.tasks.iter().filter(|t| !t.done && t.due.is_some_and(|d| d <= today)).count()
+        self.tasks.iter().filter(|t| t.check && !t.done && t.due.is_some_and(|d| d <= today)).count()
     }
 
     /// Reminders that came due since the last call.
     pub fn due_reminders(&mut self, now: DateTime<Local>) -> Vec<&Task> {
         let since = self.reminded_until.replace(now).unwrap_or(now);
-        self.tasks.iter().filter(|t| !t.done && t.reminder.is_some_and(|r| r > since && r <= now)).collect()
+        self.tasks.iter().filter(|t| t.check && !t.done && t.reminder.is_some_and(|r| r > since && r <= now)).collect()
     }
 
     pub fn next_wake(&self, now: DateTime<Local>) -> Option<Instant> {
-        let soonest = self.tasks.iter().filter(|t| !t.done).filter_map(|t| t.reminder).filter(|r| *r > now).min();
+        let soonest = self.tasks.iter().filter(|t| t.check && !t.done).filter_map(|t| t.reminder).filter(|r| *r > now).min();
         let at = soonest.and_then(|t| (t - now).to_std().ok()).map(|d| Instant::now() + d);
         match (at, self.next_poll) {
             (Some(a), Some(p)) => Some(a.min(p)),
@@ -527,7 +550,7 @@ impl TodoState {
     pub fn as_events(&self, cal: &str) -> Vec<cal::Event> {
         self.tasks
             .iter()
-            .filter(|t| !t.done)
+            .filter(|t| t.check && !t.done)
             .filter_map(|t| {
                 let d = t.due?;
                 Some(cal::Event {
@@ -576,6 +599,8 @@ mod tests {
             done: false,
             important: false,
             created: None,
+            check: true,
+            ..Task::default()
         };
         let e = parse(&t.to_entry(), now);
         assert_eq!((e.title.as_str(), e.due, e.reminder), ("Steuer", t.due, t.reminder));
