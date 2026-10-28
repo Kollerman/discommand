@@ -5,4 +5,4 @@
 # The publisher keys (see keys/README.md) and anything else private.
 /keys/keys.env
 *.local.*
-    
+    /.integrations

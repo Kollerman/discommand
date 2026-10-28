@@ -8,6 +8,19 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Each integration must also build on its own.
+  features:
+    name: Only ${{ matrix.feature }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [discord, whatsapp, calendar, todo]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release --no-default-features --features native-tls,${{ matrix.feature }}
+
   build:
     strategy:
       fail-fast: false

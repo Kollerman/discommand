@@ -5,6 +5,7 @@ mod gateway;
 mod model;
 mod pics;
 mod qr;
+#[cfg(feature = "discord")]
 mod ra;
 mod secret;
 mod state;
@@ -23,13 +24,17 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::api::Api;
-use crate::app::{App, AppEvent};
+use crate::app::{App, AppEvent, Service};
 
-const USAGE: &str = "discommand — lightweight terminal client for Discord and WhatsApp
+#[cfg(not(any(feature = "discord", feature = "whatsapp", feature = "calendar", feature = "todo")))]
+compile_error!("build with at least one integration: discord, whatsapp, calendar, todo");
+
+const USAGE: &str = "discommand — lightweight terminal client for Discord, WhatsApp,
+Google Calendar and Microsoft To Do (whichever are built in, see --version)
 
 usage: discommand [--wa-phone NUMBER] [--discord-token] [--logout] [--help] [--version]
 
-Both accounts are required. The Discord token is read from $DISCORD_TOKEN,
+The accounts of the chat services built in are required. The Discord token is read from $DISCORD_TOKEN,
 then from the saved token (encrypted with DPAPI on Windows), otherwise you
 log in once by scanning a QR code with the Discord app.
 WhatsApp is linked once by scanning a QR code (Linked devices).
@@ -57,6 +62,10 @@ async fn obtain_token(paste: bool) -> Result<String, String> {
             return Ok(clean(&t));
         }
     }
+    // Only called with Discord built in; the QR login (and RSA) are part of that feature.
+    #[cfg(not(feature = "discord"))]
+    let _ = paste;
+    #[cfg(feature = "discord")]
     if !paste {
         match ra::login().await {
             Ok(token) => return finish_login(clean(&token)).await,
@@ -92,7 +101,10 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return println!("{USAGE}"),
-            "-V" | "--version" => return println!("discommand {}", env!("CARGO_PKG_VERSION")),
+            "-V" | "--version" => {
+                let built: Vec<_> = Service::ALL.iter().map(|s| s.name()).collect();
+                return println!("discommand {} ({})", env!("CARGO_PKG_VERSION"), built.join(", "));
+            }
             "--logout" => {
                 secret::remove_token();
                 return println!("Saved Discord token removed.");
@@ -121,26 +133,38 @@ fn main() {
 }
 
 async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> {
-    let token = obtain_token(paste_token).await?;
-    let api = Api::new(&token)?;
     let (tx, mut rx) = unbounded_channel::<AppEvent>();
     let (gw_tx, gw_rx) = unbounded_channel::<String>();
-    // Discord connects while WhatsApp starts (or is being linked); its events queue up.
-    tokio::spawn(gateway::run(token, tx.clone(), gw_rx));
+    // Without Discord built in, the API client has no token and is never used.
+    let api = if Service::Discord.built() {
+        let token = obtain_token(paste_token).await?;
+        let api = Api::new(&token)?;
+        // Discord connects while WhatsApp starts (or is being linked); its events queue up.
+        tokio::spawn(gateway::run(token, tx.clone(), gw_rx));
+        api
+    } else {
+        Api::new("")?
+    };
 
     // Before the helper opens its database: encrypt data folders at rest.
     secret::protect_dirs();
-    let mut sidecar = wa::spawn()?;
-    let replay = wa::login(&mut sidecar, wa_phone.as_deref()).await?;
-    let wa::Sidecar { mut events, cmds, mut child } = sidecar;
-    let wa_tx = tx.clone();
-    tokio::spawn(async move {
-        while let Some(ev) = events.recv().await {
-            if wa_tx.send(AppEvent::Wa(ev)).is_err() {
-                return;
+    let (cmds, mut child, replay) = if Service::WhatsApp.built() {
+        let mut sidecar = wa::spawn()?;
+        let replay = wa::login(&mut sidecar, wa_phone.as_deref()).await?;
+        let wa::Sidecar { mut events, cmds, child } = sidecar;
+        let wa_tx = tx.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                if wa_tx.send(AppEvent::Wa(ev)).is_err() {
+                    return;
+                }
             }
-        }
-    });
+        });
+        (cmds, Some(child), replay)
+    } else {
+        // Commands to WhatsApp go nowhere.
+        (unbounded_channel().0, None, Vec::new())
+    };
 
     let mut app = App::new(api, tx, gw_tx, cmds);
     app.cal_sync();
@@ -158,8 +182,10 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
     app.flush_ack().await;
     // Closing the helper's stdin lets it disconnect cleanly; kill it if it hangs.
     drop(app);
-    if tokio::time::timeout(Duration::from_secs(3), child.wait()).await.is_err() {
-        let _ = child.kill().await;
+    if let Some(child) = child.as_mut() {
+        if tokio::time::timeout(Duration::from_secs(3), child.wait()).await.is_err() {
+            let _ = child.kill().await;
+        }
     }
     if logout {
         secret::remove_token();

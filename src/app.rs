@@ -74,9 +74,19 @@ pub enum Service {
 }
 
 impl Service {
-    /// Every integration, in Shift+Tab / `gt` order. A new integration is
-    /// added here; per-service state and switching follow from this list.
-    pub const ALL: [Service; 4] = [Service::Discord, Service::WhatsApp, Service::Calendar, Service::Tasks];
+    /// The integrations built in (Cargo features), in Shift+Tab / `gt` order.
+    /// A new integration gets a feature and an entry here; per-service state
+    /// and switching follow from this list.
+    pub const ALL: &'static [Service] = &[
+        #[cfg(feature = "discord")]
+        Service::Discord,
+        #[cfg(feature = "whatsapp")]
+        Service::WhatsApp,
+        #[cfg(feature = "calendar")]
+        Service::Calendar,
+        #[cfg(feature = "todo")]
+        Service::Tasks,
+    ];
     pub const COUNT: usize = Self::ALL.len();
 
     pub fn index(self) -> usize {
@@ -87,6 +97,19 @@ impl Service {
     pub fn step(self, by: isize) -> Service {
         let n = Self::COUNT as isize;
         Self::ALL[(self.index() as isize + by).rem_euclid(n) as usize]
+    }
+
+    pub fn built(self) -> bool {
+        Self::ALL.contains(&self)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Service::Discord => "Discord",
+            Service::WhatsApp => "WhatsApp",
+            Service::Calendar => "Google Calendar",
+            Service::Tasks => "Microsoft To Do",
+        }
     }
 }
 
@@ -288,7 +311,7 @@ impl App {
             api,
             tx,
             gw,
-            service: Service::Discord,
+            service: Service::ALL[0],
             wa: WaState::default(),
             wa_cmd,
             wa_current: None,
@@ -299,8 +322,9 @@ impl App {
                 c.reminded_until = Some(chrono::Local::now());
                 c
             },
+            // Only integrations built in connect; the others stay idle.
             google: Creds::load()
-                .filter(|c| !c.refresh_token.is_empty())
+                .filter(|c| Service::Calendar.built() && !c.refresh_token.is_empty())
                 .map(|c| std::sync::Arc::new(Google::new(c))),
             cal_positioned: false,
             cal_view: CalView::Week,
@@ -313,7 +337,7 @@ impl App {
             react_picker: false,
             todo: TodoState { reminded_until: Some(chrono::Local::now()), ..TodoState::default() },
             todo_api: todo::Creds::load()
-                .filter(|c| !c.refresh_token.is_empty())
+                .filter(|c| Service::Tasks.built() && !c.refresh_token.is_empty())
                 .map(|c| std::sync::Arc::new(Todo::new(c))),
             todo_collapsed: HashSet::new(),
             todo_positioned: false,
@@ -2075,6 +2099,9 @@ impl App {
                     }
                 }
             }
+            "wa" | "cal" | "calendar" | "todo" | "tasks" if !Self::command_service(name).built() => {
+                self.status = format!("{} isn't part of this build", Self::command_service(name).name());
+            }
             "wa" => match arg {
                 "receipts on" => wa::send(&self.wa_cmd, json!({"c": "receipts", "on": true})),
                 "receipts off" => wa::send(&self.wa_cmd, json!({"c": "receipts", "on": false})),
@@ -2105,6 +2132,14 @@ impl App {
                 self.tree_dirty = true;
             }
             _ => self.status = format!("E492: Not an editor command: {cmd}"),
+        }
+    }
+
+    fn command_service(name: &str) -> Service {
+        match name {
+            "wa" => Service::WhatsApp,
+            "cal" | "calendar" => Service::Calendar,
+            _ => Service::Tasks,
         }
     }
 
@@ -2741,12 +2776,13 @@ mod tests {
 
     #[test]
     fn services_cycle_both_ways() {
-        assert_eq!(Service::Discord.step(1), Service::WhatsApp);
-        assert_eq!(Service::Calendar.step(1), Service::Tasks);
-        assert_eq!(Service::Tasks.step(1), Service::Discord);
-        assert_eq!(Service::Discord.step(-1), Service::Tasks);
-        assert_eq!(Service::WhatsApp.step(-5), Service::Discord);
-        for (i, s) in Service::ALL.iter().enumerate() {
+        let all = Service::ALL;
+        let (first, last) = (all[0], all[all.len() - 1]);
+        assert_eq!(last.step(1), first);
+        assert_eq!(first.step(-1), last);
+        assert_eq!(first.step(all.len() as isize + 1), first.step(1));
+        assert_eq!(first.step(-(all.len() as isize) - 1), last);
+        for (i, s) in all.iter().enumerate() {
             assert_eq!(s.index(), i);
         }
     }

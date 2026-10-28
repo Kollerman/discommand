@@ -140,6 +140,29 @@ Opening links and files uses `xdg-open`. Without OpenSSL headers, `install.sh`
 switches to a TLS stack written in Rust by itself.
 *Termux (Android):* `pkg install rust golang git`, then the same steps (untested).
 
+### Choosing integrations
+
+By default all integrations are built in. To build only some, pass them to the
+install script:
+
+```sh
+sh install.sh --with discord,calendar          # Linux, macOS
+.\install.ps1 -With discord,calendar           # Windows
+```
+
+| Name | Integration |
+| --- | --- |
+| `discord` | Discord |
+| `whatsapp` | WhatsApp (the only one that needs Go) |
+| `calendar` | Google Calendar |
+| `todo` | Microsoft To Do |
+
+Integrations that aren't built in are left out of the program completely: no tab, no
+login at startup, no background activity. The script remembers your choice for later
+updates; `--with all` (or `-With all`) goes back to everything. `discommand --version`
+shows what a build contains. With plain cargo:
+`cargo build --release --no-default-features --features native-tls,discord,calendar`.
+
 ### Updating and uninstalling
 
 - **Update:** in the `discommand` folder run `git pull`, then the install script again.
@@ -149,7 +172,8 @@ switches to a TLS stack written in Rust by itself.
 
 ## Login
 
-Both accounts are required. On first start:
+The chat services built in (Discord, WhatsApp) need their account; you log in on
+first start:
 
 1. **Discord:** a QR code appears. In the Discord app on your phone, open Settings →
    **Scan QR Code**, scan it and confirm. There's no password, captcha or 2FA prompt;
@@ -357,6 +381,17 @@ Users then never see a developer console.
    the binary is the documented approach. Still, keep the file out of public places.
 
 Discord and WhatsApp need nothing from the publisher: both log in by QR code.
+
+## Adding an integration
+
+Each integration is a Cargo feature and a tab:
+
+1. Add a feature to `[features]` in `Cargo.toml`, and to `default`.
+2. Add a variant to `Service` in `src/app.rs` and an entry to `Service::ALL`, marked
+   `#[cfg(feature = "…")]`. Tab order, Shift+Tab and `gt` follow from that list.
+3. Only start or connect it when `Service::YourService.built()` is true.
+4. Add the name to `all=` in `install.sh`, to the table above and to the
+   `features` job in `.github/workflows/build.yml`.
 Remember that both services' terms forbid unofficial clients, and say so to your users.
 
 ## Troubleshooting

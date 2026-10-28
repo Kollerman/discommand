@@ -6,7 +6,16 @@ description = "Lightweight, battery-friendly terminal Discord client"
 license = "MIT"
 
 [features]
-default = ["native-tls"]
+default = ["native-tls", "discord", "whatsapp", "calendar", "todo"]
+
+# Integrations: build with any subset, e.g.
+#   cargo build --release --no-default-features --features native-tls,discord,calendar
+# (the install scripts take --with / -With for this). Each one is a Shift+Tab tab.
+discord = ["dep:rsa"]
+whatsapp = []
+calendar = []
+todo = []
+
 # OS TLS stack: SChannel on Windows, Security.framework on macOS, OpenSSL on Linux.
 native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
 # Pure-Rust TLS (handy for Termux / static Linux builds without OpenSSL headers).
@@ -32,7 +41,7 @@ qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 # Google sign-in (PKCE) and Discord's QR-code login.
 sha2 = "0.10"
-rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"] }
+rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"], optional = true }
 getrandom = "0.4"
 
 [target.'cfg(windows)'.dependencies]
