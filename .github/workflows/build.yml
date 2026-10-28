@@ -1,0 +1,49 @@
+# Builds and tests discommand on every supported platform. Runs without
+# keys/keys.env, so it never needs (or sees) the publisher's app IDs.
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows x64, os: windows-latest }
+          - { name: Windows ARM64, os: windows-11-arm }
+          - { name: Linux x64, os: ubuntu-latest }
+          - { name: Linux ARM64, os: ubuntu-24.04-arm }
+          - { name: macOS Apple Silicon, os: macos-latest }
+          - { name: macOS Intel, os: macos-latest, target: x86_64-apple-darwin, goarch: amd64 }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: wa/go.mod
+          cache-dependency-path: wa/go.sum
+
+      - name: Test (Rust)
+        if: ${{ !matrix.target }}
+        run: cargo test --release
+      - name: Build (Rust)
+        shell: bash
+        run: cargo build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Test (Go)
+        working-directory: wa
+        run: go test ./...
+      - name: Build (Go)
+        working-directory: wa
+        env:
+          CGO_ENABLED: "0"
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags "-s -w" -o discommand-wa .

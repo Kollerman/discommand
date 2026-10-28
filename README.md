@@ -1,8 +1,8 @@
 # discommand
 
 A small, vim-style terminal client for **Discord, WhatsApp, Google Calendar and Microsoft To Do**, written in Rust.
-It's inspired by [discordo](https://github.com/ayn2op/discordo) and builds as native
-binaries for ARM (Windows on ARM, Linux aarch64/armv7, Raspberry Pi, Termux) and x86.
+It's inspired by [discordo](https://github.com/ayn2op/discordo) and runs natively on
+**Windows (x64 and ARM64), Linux (x64 and ARM64) and macOS (Apple Silicon and Intel)**.
 Press **Shift+Tab** to cycle Discord → WhatsApp → Calendar → Tasks, and **right Shift+Tab** to go back.
 
 What it does to save battery and memory:
@@ -39,26 +39,113 @@ threads and status updates aren't supported.
 
 `discommand` looks for the helper next to its own executable, then on `PATH`.
 
-## Build and install
+## Install
 
-You need Rust and Go. The install scripts build both programs into `~/.cargo/bin`;
-re-run them to update.
+discommand is built from source. That takes a few minutes the first time, and you
+need **Rust**, **Go** (1.21 or newer) and **Git**. The install script builds both
+programs and puts them into `~/.cargo/bin`, which the Rust installer already added
+to your `PATH`.
 
-```sh
-./install.ps1    # Windows
-./install.sh     # Linux, macOS, Termux
-```
+> **One-step Google/Microsoft sign-in:** if you got a `keys.env` file from the
+> maintainer, copy it into the `keys/` folder **before** running the install script
+> (see [keys/README.md](keys/README.md)). Without it everything works too, but
+> Calendar and To Do need a one-time setup of your own (explained in the app).
 
-- **Windows on ARM without Visual Studio:** `install.ps1` uses
-  [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) (`*-ucrt-aarch64.zip`)
-  automatically when it's unpacked to `%LOCALAPPDATA%\llvm-mingw`. You also need
-  `rustup toolchain install stable-aarch64-pc-windows-gnullvm`. With *Visual Studio
-  Build Tools* (C++ workload, ARM64 tools) installed, plain `cargo` works instead.
-- **Linux ARM / Raspberry Pi:** the default TLS needs `libssl-dev`. `install.sh`
-  switches to pure-Rust TLS when OpenSSL isn't found.
-- **Termux:** `pkg install rust golang`, then `./install.sh` (untested).
-- The helper always builds with `CGO_ENABLED=0`, using SQLite written in pure Go,
-  so no C compiler is needed.
+### Windows (x64 and ARM64)
+
+1. Install the tools in PowerShell:
+
+   ```powershell
+   winget install Rustlang.Rustup GoLang.Go Git.Git
+   winget install Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+   ```
+
+   The second line installs the C++ build tools Rust needs (about 2 GB). Then
+   **close and reopen** the terminal.
+2. Download and install:
+
+   ```powershell
+   git clone https://github.com/Kollerman/discommand.git
+   cd discommand
+   # copy keys.env into the keys folder now, if you have it
+   powershell -ExecutionPolicy Bypass -File install.ps1
+   ```
+
+3. Start it with `discommand`.
+
+Use **Windows Terminal** (preinstalled on Windows 11) for correct colors and pictures.
+
+*Windows on ARM without Visual Studio:* instead of the build tools, unpack
+[llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases) (`*-ucrt-aarch64.zip`)
+to `%LOCALAPPDATA%\llvm-mingw` and run
+`rustup toolchain install stable-aarch64-pc-windows-gnullvm`. `install.ps1` uses it
+automatically.
+
+### macOS (Apple Silicon and Intel)
+
+1. Install the tools in Terminal:
+
+   ```sh
+   xcode-select --install                                          # compiler and git
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh  # Rust
+   ```
+
+   Install Go with `brew install go` or the installer from [go.dev/dl](https://go.dev/dl).
+   Then **open a new terminal**.
+2. Download and install:
+
+   ```sh
+   git clone https://github.com/Kollerman/discommand.git
+   cd discommand
+   # copy keys.env into the keys folder now, if you have it
+   sh install.sh
+   ```
+
+3. Start it with `discommand`.
+
+The built-in Terminal app shows only 256 colors, so pictures look rough there.
+[iTerm2](https://iterm2.com), [Ghostty](https://ghostty.org), [WezTerm](https://wezfurlong.org/wezterm/)
+or [kitty](https://sw.kovidgoyal.net/kitty/) look better.
+
+### Linux (x64 and ARM64, including Raspberry Pi)
+
+1. Install the tools:
+
+   ```sh
+   # Debian, Ubuntu, Raspberry Pi OS
+   sudo apt install build-essential pkg-config libssl-dev git golang
+   # Fedora
+   sudo dnf install gcc pkg-config openssl-devel git golang
+   # Arch
+   sudo pacman -S base-devel openssl git go
+
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh  # Rust
+   ```
+
+   Then **open a new terminal**. If your distribution's Go is older than 1.21, use
+   the one from [go.dev/dl](https://go.dev/dl). Newer versions fetch the exact Go
+   release they need by themselves.
+2. Download and install:
+
+   ```sh
+   git clone https://github.com/Kollerman/discommand.git
+   cd discommand
+   # copy keys.env into the keys folder now, if you have it
+   sh install.sh
+   ```
+
+3. Start it with `discommand`.
+
+Opening links and files uses `xdg-open`. Without OpenSSL headers, `install.sh`
+switches to a TLS stack written in Rust by itself.
+*Termux (Android):* `pkg install rust golang git`, then the same steps (untested).
+
+### Updating and uninstalling
+
+- **Update:** in the `discommand` folder run `git pull`, then the install script again.
+- **Uninstall:** run `discommand --logout` and `:wa logout` first if you want to sign
+  out. Then delete `discommand` and `discommand-wa` from `~/.cargo/bin`, and the
+  `discommand` folder in your config directory (see below).
 
 ## Login
 
@@ -75,7 +162,8 @@ Both accounts are required. On first start:
    Linked devices → Link a device, and scan it. To link with a code instead, start
    with `discommand --wa-phone +491701234567`.
 
-The config dir is `%APPDATA%` on Windows and `~/.config` on Linux. The WhatsApp
+The config dir is `%APPDATA%` on Windows, `~/Library/Application Support` on macOS
+and `~/.config` on Linux. The WhatsApp
 session and message history live in `<config dir>/discommand/whatsapp.db`; treat
 that file like a password. WhatsApp only syncs recent history when a device is
 linked. Older messages appear once the phone has sent them.
@@ -96,7 +184,8 @@ linked. Older messages appear once the phone has sent them.
   everything drawn, so names or messages can't send escape sequences to your terminal.
 - **Opening things:** links open only if they're http(s). Downloaded files open
   directly only for media, PDF and text types. Anything else (`.exe`, `.bat`, `.lnk`,
-  scripts, …) is shown selected in Explorer instead of being run. Downloaded file names
+  scripts, …) is shown selected in Explorer or Finder (or its folder is opened on Linux) instead of
+being run. Downloaded file names
   are sanitized, downloads are capped at 256 MB, and downloads older than a day are
   deleted.
 - **Privacy:** pictures from link previews load only through Discord's proxy, never

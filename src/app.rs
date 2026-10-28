@@ -2690,9 +2690,13 @@ fn open_file(path: &str) -> std::io::Result<bool> {
         let mut c = Command::new("explorer");
         c.arg(format!("/select,{path}"));
         c
+    } else if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.args(["-R", path]);
+        c
     } else {
         let dir = p.parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut c = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
+        let mut c = Command::new("xdg-open");
         c.arg(dir);
         c
     };
