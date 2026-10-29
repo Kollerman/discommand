@@ -43,7 +43,8 @@ compile_error!("build with at least one integration: discord, whatsapp, matrix, 
 const USAGE: &str = "discommand — lightweight terminal client for Discord, WhatsApp, Matrix,
 Google Calendar, Microsoft To Do and Twos (whichever are built in, see --version)
 
-usage: discommand [--wa-phone NUMBER] [--discord-token] [--logout] [--logout-a] [--help] [--version]
+usage: discommand [--wa-phone NUMBER] [--discord-token] [--logout] [--logout-a]
+                  [--check-update] [--help] [--version]
 
 The accounts of the chat services built in are required. The Discord token is read from $DISCORD_TOKEN,
 then from the saved token (encrypted with DPAPI on Windows), otherwise you
@@ -55,6 +56,9 @@ WhatsApp is linked once by scanning a QR code (Linked devices).
                      (international format, e.g. +491701234567)
   --logout           delete the saved Discord token and exit
                      (unlink WhatsApp with :wa logout inside the app)
+  --check-update     check now whether a newer version is on GitHub (it's
+                     also checked at startup and daily; off with
+                     DISCOMMAND_NO_UPDATE_CHECK=1)
   --logout-a         log out of everything: Discord, WhatsApp (unlinked),
                      Matrix, Google, Microsoft and Twos; also deletes the
                      WhatsApp chat history, the Matrix store and cached media.
@@ -171,6 +175,7 @@ fn main() {
     let mut wa_phone = None;
     let mut paste_token = false;
     let mut logout_everything = false;
+    let mut check_update = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return println!("{USAGE}"),
@@ -183,6 +188,7 @@ fn main() {
                 return println!("Saved Discord token removed.");
             }
             "--logout-a" | "--logout-all" => logout_everything = true,
+            "--check-update" => check_update = true,
             "--discord-token" => paste_token = true,
             "--wa-phone" => match args.next() {
                 Some(n) => wa_phone = Some(n),
@@ -202,6 +208,9 @@ fn main() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     if logout_everything {
         return rt.block_on(logout_all());
+    }
+    if check_update {
+        return println!("{}", rt.block_on(update::check_now()));
     }
     if let Err(e) = rt.block_on(run(wa_phone, paste_token)) {
         eprintln!("error: {e}");
