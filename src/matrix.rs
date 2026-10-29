@@ -18,7 +18,7 @@ use matrix_sdk::authentication::oauth::registration::{ApplicationType, ClientMet
 use matrix_sdk::authentication::oauth::{ClientId, OAuthSession, UserSession};
 use matrix_sdk::config::{SyncSettings, SyncToken};
 use matrix_sdk::encryption::{BackupDownloadStrategy, EncryptionSettings};
-use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings};
 use matrix_sdk::room::MessagesOptions;
 use matrix_sdk::ruma::api::client::filter::{FilterDefinition, LazyLoadOptions};
 use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
@@ -338,6 +338,16 @@ pub fn start(client: Client) -> (UnboundedReceiver<WaEvent>, UnboundedSender<Str
     let me = client.user_id().map(|u| u.to_string()).unwrap_or_default();
     let state: State = Arc::new(Mutex::new(Shared { recent: Recent::load(), ..Shared::default() }));
     let mx = Arc::new(Mx { client, me, state, tx });
+
+    // Pictures the SDK caches in its store expire like the other cached files.
+    tokio::spawn({
+        let mx = mx.clone();
+        async move {
+            let policy = MediaRetentionPolicy::new().with_last_access_expiry(Some(secret::CACHE_MAX_AGE));
+            let _ = mx.client.media().set_media_retention_policy(policy).await;
+            let _ = mx.client.media().clean().await;
+        }
+    });
 
     tokio::spawn({
         let mx = mx.clone();

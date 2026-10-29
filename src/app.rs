@@ -2365,6 +2365,12 @@ impl App {
             self.input.clear();
             return;
         }
+        // ":q" typed in insert mode is meant for vim, not for the chat.
+        if matches!(content.trim(), ":q" | ":q!" | ":qa" | ":qa!" | ":wq" | ":x" | ":quit") {
+            self.input.clear();
+            self.quit = true;
+            return;
+        }
         if self.service.is_tasks() {
             self.input.clear();
             self.leave_insert();
@@ -3158,10 +3164,9 @@ impl App {
             self.status = "select a message first (k)".into();
             return;
         };
-        let url = m
-            .attachments
-            .first()
-            .map(|a| a.url.clone())
+        // A picture opens in full quality; then files, then links.
+        let url = crate::state::full_picture(m)
+            .or_else(|| m.attachments.first().map(|a| a.url.clone()))
             .or_else(|| find_url(&m.content).map(String::from))
             .or_else(|| m.embeds.iter().find_map(|e| e.url.clone()));
         match url {
@@ -3222,7 +3227,7 @@ fn bell() {
 /// (.exe, .bat, .lnk, .js, …) could run code, so it is only shown in the
 /// file manager.
 const SAFE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "mp4", "mov", "webm", "mkv", "avi", "3gp", "mp3", "ogg",
+    "jpg", "jpeg", "jfif", "jpe", "png", "gif", "webp", "bmp", "heic", "mp4", "mov", "webm", "mkv", "avi", "3gp", "mp3", "ogg",
     "opus", "oga", "m4a", "aac", "wav", "flac", "pdf", "txt", "csv",
 ];
 

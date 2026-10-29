@@ -586,6 +586,21 @@ impl State {
     }
 }
 
+/// The first picture of a message in full quality: an image attachment's
+/// original, or an image/GIF link's full-size copy from Discord's proxy
+/// (without the size parameters used for the inline preview).
+pub fn full_picture(m: &Message) -> Option<String> {
+    if let Some(a) = m.attachments.iter().find(|a| a.is_image()) {
+        return Some(a.url.clone());
+    }
+    m.embeds
+        .iter()
+        .filter(|e| matches!(e.kind.as_deref(), Some("image" | "gifv")))
+        .find_map(|e| e.image.as_ref().or(e.thumbnail.as_ref()))
+        .map(|t| t.proxy_url.clone())
+        .filter(|u| !u.is_empty())
+}
+
 /// Image attachments plus previews of image/GIF links.
 fn message_pics(m: &Message) -> Vec<PicRef> {
     let mut out = Vec::new();

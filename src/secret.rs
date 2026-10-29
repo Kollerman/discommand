@@ -20,6 +20,32 @@ pub fn cache_dir() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("discommand")
 }
 
+/// How long downloads and other cached files are kept.
+pub const CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Deletes cached files older than `CACHE_MAX_AGE` (and folders left empty);
+/// run at startup to keep the cache from growing.
+pub fn prune_cache() {
+    if let Some(cutoff) = std::time::SystemTime::now().checked_sub(CACHE_MAX_AGE) {
+        prune(&cache_dir(), cutoff);
+    }
+}
+
+fn prune(dir: &Path, cutoff: std::time::SystemTime) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Not following links: only what's really inside the cache.
+        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
+        if meta.is_dir() {
+            prune(&path, cutoff);
+            let _ = fs::remove_dir(&path); // only succeeds when empty
+        } else if meta.modified().is_ok_and(|t| t < cutoff) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 fn create_private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -253,5 +279,28 @@ mod efs {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn prunes_only_old_files() {
+        let dir = std::env::temp_dir().join(format!("discommand-prune-{}", std::process::id()));
+        let sub = dir.join("whatsapp");
+        fs::create_dir_all(&sub).unwrap();
+        let (old, new) = (sub.join("old.jpg"), dir.join("new.jpg"));
+        fs::write(&old, b"x").unwrap();
+        fs::write(&new, b"x").unwrap();
+        let month_ago = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        fs::File::options().write(true).open(&old).unwrap().set_modified(month_ago).unwrap();
+
+        super::prune(&dir, SystemTime::now() - super::CACHE_MAX_AGE);
+        assert!(!old.exists() && !sub.exists(), "old file and its empty folder are gone");
+        assert!(new.exists(), "recent files stay");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

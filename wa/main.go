@@ -744,13 +744,14 @@ func (a *App) download(ctx context.Context, chat, id string) {
 		a.fail("file is too large to download here (%d MB)", n>>20)
 		return
 	}
-	name := m.File
-	if name == "" {
-		name = extension(&msg)
-	}
 	// Prefixed with the message id: names from other people never collide
-	// with or overwrite other files.
-	path := filepath.Join(a.cacheDir, safeName(id)+"_"+safeName(name))
+	// with or overwrite other files. Pictures and voice notes have no name:
+	// the id plus an extension, so the system knows how to open them.
+	file := safeName(id) + extension(&msg)
+	if m.File != "" {
+		file = safeName(id) + "_" + safeName(m.File)
+	}
+	path := filepath.Join(a.cacheDir, file)
 	if _, err := os.Stat(path); err != nil {
 		a.emit(event{"t": "status", "status": "downloading…"})
 		data, err := a.cli.DownloadAny(ctx, &msg)
@@ -883,6 +884,22 @@ func (a *App) thumbnail(ctx context.Context, chat, id string, full bool) []byte 
 	return []byte{}
 }
 
+var usualExt = map[string]string{
+	"image/jpeg":      ".jpg",
+	"image/png":       ".png",
+	"image/webp":      ".webp",
+	"image/gif":       ".gif",
+	"image/heic":      ".heic",
+	"video/mp4":       ".mp4",
+	"video/3gpp":      ".3gp",
+	"video/quicktime": ".mov",
+	"audio/ogg":       ".ogg",
+	"audio/mpeg":      ".mp3",
+	"audio/mp4":       ".m4a",
+	"audio/aac":       ".aac",
+	"application/pdf": ".pdf",
+}
+
 func extension(m *waE2E.Message) string {
 	var mimeType string
 	fallback := ".bin"
@@ -899,6 +916,10 @@ func extension(m *waE2E.Message) string {
 		mimeType = m.GetDocumentMessage().GetMimetype()
 	}
 	mimeType, _, _ = strings.Cut(mimeType, ";")
+	// The usual extension: the system's list is sorted, so JPEG would be ".jfif".
+	if ext, ok := usualExt[strings.ToLower(strings.TrimSpace(mimeType))]; ok {
+		return ext
+	}
 	if exts, err := mime.ExtensionsByType(mimeType); err == nil && len(exts) > 0 {
 		return exts[0]
 	}

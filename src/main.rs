@@ -237,6 +237,8 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
 
     // Before the helper opens its database: encrypt data folders at rest.
     secret::protect_dirs();
+    // Old downloads and cached files go (older than two weeks).
+    secret::prune_cache();
     let (cmds, mut child, replay) = if Service::WhatsApp.built() {
         let mut sidecar = wa::spawn()?;
         let replay = wa::login(&mut sidecar, wa_phone.as_deref()).await?;

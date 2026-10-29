@@ -136,3 +136,17 @@ func TestExtract(t *testing.T) {
 		t.Fatalf("preview %q", p)
 	}
 }
+
+func TestExtension(t *testing.T) {
+	jpeg := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Mimetype: proto.String("image/jpeg")}}
+	if got := extension(jpeg); got != ".jpg" {
+		t.Errorf("JPEG picture: got %q, want .jpg", got)
+	}
+	voice := &waE2E.Message{AudioMessage: &waE2E.AudioMessage{Mimetype: proto.String("audio/ogg; codecs=opus")}}
+	if got := extension(voice); got != ".ogg" {
+		t.Errorf("voice note: got %q, want .ogg", got)
+	}
+	if got := extension(&waE2E.Message{ImageMessage: &waE2E.ImageMessage{}}); got != ".jpg" {
+		t.Errorf("no type: got %q, want the .jpg fallback", got)
+	}
+}

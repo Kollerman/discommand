@@ -242,8 +242,10 @@ linked. Older messages appear once the phone has sent them.
   directly only for media, PDF and text types. Anything else (`.exe`, `.bat`, `.lnk`,
   scripts, …) is shown selected in Explorer or Finder (or its folder is opened on Linux) instead of
 being run. Downloaded file names
-  are sanitized, downloads are capped at 256 MB, and downloads older than a day are
-  deleted.
+  are sanitized and downloads are capped at 256 MB.
+- **Cleanup:** at every start, cached files older than two weeks are deleted (Matrix
+  downloads and the Matrix picture cache too). WhatsApp downloads go even sooner,
+  after a day.
 - **Privacy:** pictures from link previews load only through Discord's proxy, never
   directly from third-party sites, and picture downloads never carry your Discord token.
 
