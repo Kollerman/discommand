@@ -116,7 +116,8 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect, split: bool) {
             if matches!(t.kind, ItemKind::Channel | ItemKind::Dm | ItemKind::WaChat) && current == Some(t.id.as_str()) {
                 style = style.fg(Color::Cyan);
             }
-            if t.dim {
+            // Done tasks and muted chats (the open one keeps its highlight).
+            if t.dim && !(current == Some(t.id.as_str()) && t.kind != ItemKind::TodoTask) {
                 style = DIM;
                 if t.kind == ItemKind::TodoTask {
                     style = style.add_modifier(Modifier::CROSSED_OUT);
@@ -1025,6 +1026,7 @@ const HELP: &[(&str, &str)] = &[
     (":b name", "open first matching channel"),
     (":r", "reload chat / sync calendar"),
     ("A", "mark all chats of this service read"),
+    (":mute [1h]  :unmute", "mute the selected server/channel/DM"),
     (":read  :read all", "the same / in every chat service"),
     (":images on|off", "show pictures in chats (on)"),
     (":wa receipts on", "send WhatsApp read receipts (off)"),

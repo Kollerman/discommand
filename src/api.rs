@@ -7,7 +7,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
 
-use crate::model::{Message, User};
+use crate::model::{GuildSettings, Message, User};
 
 const BASE: &str = "https://discord.com/api/v10";
 const CHROME_VERSION: &str = "130.0.0.0";
@@ -116,6 +116,11 @@ impl Api {
             return Ok(text);
         }
         Err("rate limited, try again later".into())
+    }
+
+    /// Changes one server's notification settings ("@me": the DMs').
+    pub async fn guild_settings(&self, guild: &str, body: &Value) -> Result<GuildSettings, String> {
+        self.request_json(Method::PATCH, &format!("/users/@me/guilds/{guild}/settings"), Some(body)).await
     }
 
     async fn request_json<T: serde::de::DeserializeOwned>(

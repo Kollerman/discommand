@@ -371,6 +371,63 @@ pub enum ReadStates {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub struct MuteConfig {
+    /// Until when (ISO 8601); none: until unmuted.
+    #[serde(default, deserialize_with = "nullable")]
+    pub end_time: Option<String>,
+}
+
+/// One server's notification settings (`guild_id` empty: the DMs').
+#[derive(Debug, Default, Deserialize)]
+pub struct GuildSettings {
+    #[serde(default, deserialize_with = "nullable")]
+    pub guild_id: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub muted: bool,
+    #[serde(default)]
+    pub mute_config: Option<MuteConfig>,
+    /// A list of per-channel settings, or a map by channel id.
+    #[serde(default)]
+    pub channel_overrides: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ChannelOverride {
+    #[serde(default, deserialize_with = "nullable")]
+    pub channel_id: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub muted: bool,
+    #[serde(default)]
+    pub mute_config: Option<MuteConfig>,
+}
+
+impl GuildSettings {
+    pub fn overrides(&self) -> Vec<ChannelOverride> {
+        match &self.channel_overrides {
+            Value::Array(v) => v.iter().filter_map(|o| serde_json::from_value(o.clone()).ok()).collect(),
+            Value::Object(m) => m
+                .iter()
+                .filter_map(|(id, o)| {
+                    let mut o: ChannelOverride = serde_json::from_value(o.clone()).ok()?;
+                    if o.channel_id.is_empty() {
+                        o.channel_id = id.clone();
+                    }
+                    Some(o)
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum GuildSettingsList {
+    List(Vec<GuildSettings>),
+    Versioned { entries: Vec<GuildSettings> },
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct Folder {
     #[serde(default, deserialize_with = "nullable")]
     pub guild_ids: Vec<Value>,
@@ -394,6 +451,8 @@ pub struct Ready {
     pub read_state: Option<ReadStates>,
     #[serde(default)]
     pub user_settings: Option<UserSettings>,
+    #[serde(default)]
+    pub user_guild_settings: Option<GuildSettingsList>,
     #[serde(default, deserialize_with = "nullable")]
     pub merged_members: Vec<Vec<Member>>,
     #[serde(default, deserialize_with = "nullable")]

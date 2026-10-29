@@ -257,11 +257,15 @@ The app is modal like vim. Press `?` inside it for this list.
 | sidebar | `j k` · `gg G` · counts (`5j`) · `l`/`o`/`Enter` open/expand · `h` collapse/parent · `za zo zc zM` |
 | messages | `j k Ctrl-u Ctrl-d` select · `gg` top + load history · `G`/`Esc` newest · `r`/`R` reply (ping/no ping) · `+` react (then `1`–`5`: ❤️ 👍 😂 💀 😅; the same again removes it) · `e` edit · `dd` delete · `o`/`gx` open link, attachment or WhatsApp media |
 | insert | `Enter` send · `Alt-Enter` newline · `↑` on empty input edits your last message · `Esc` normal · `Shift-Tab` switch service |
-| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:images on\|off` · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
+| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:mute [15m\|1h\|8h\|24h\|7d]` / `:unmute` the selected Discord server, category, channel or DM · `:images on\|off` · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
 
 Each service keeps its own open chat, sidebar position and unsent draft. The
 statusline shows which service is active, and how many unread chats or mentions
 are waiting in the other one.
+
+**Muted Discord servers, categories, channels and DMs** (muted in Discord or with
+`:mute`) are dimmed and get no unread dot; mentions still show and ring, as in Discord.
+Timed mutes end by themselves.
 
 **WhatsApp read receipts are off by default.** Opening a chat marks it read on
 this device only; your contacts don't see blue ticks. `:wa receipts on` turns them

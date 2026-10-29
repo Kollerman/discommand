@@ -38,6 +38,8 @@ pub enum AppEvent {
     Todo(Service, TodoMsg),
     /// A newer release (its tag) is on GitHub.
     Update(String),
+    /// A server's notification settings after `:mute`/`:unmute`, and what to say.
+    Muted(GuildSettings, String),
 }
 
 pub enum TodoMsg {
@@ -645,7 +647,7 @@ impl App {
         let mut dm_unread = false;
         let mut dm_mentions = 0;
         for c in s.dms.iter().filter_map(|id| s.channels.get(id)) {
-            dm_unread |= s.is_unread(c);
+            dm_unread |= s.shows_unread(c);
             dm_mentions += s.mention_count(&c.id);
         }
         items.push(TreeItem {
@@ -667,12 +669,12 @@ impl App {
                     id: c.id.clone(),
                     depth: 1,
                     label: s.dm_label(c),
-                    unread: s.is_unread(c),
+                    unread: s.shows_unread(c),
                     mentions: s.mention_count(&c.id),
                     expanded: false,
                     group: false,
                     color: None,
-                    dim: false,
+                    dim: s.channel_muted(c),
                 });
             }
         }
@@ -690,7 +692,7 @@ impl App {
                 expanded: open,
                 group: false,
                 color: None,
-                dim: false,
+                dim: s.is_muted(&g.id),
             });
             if !open {
                 continue;
@@ -704,7 +706,7 @@ impl App {
                             id: cat.id.clone(),
                             depth: 1,
                             label: cat.name.clone().unwrap_or_default().to_uppercase(),
-                            unread: shut && chans.iter().any(|c| s.is_unread(c)),
+                            unread: shut && chans.iter().any(|c| s.shows_unread(c)),
                             mentions: if shut { chans.iter().map(|c| s.mention_count(&c.id)).sum() } else { 0 },
                             expanded: !shut,
                             group: false,
@@ -724,12 +726,12 @@ impl App {
                         id: c.id.clone(),
                         depth,
                         label: c.name.clone().unwrap_or_default(),
-                        unread: s.is_unread(c),
+                        unread: s.shows_unread(c),
                         mentions: s.mention_count(&c.id),
                         expanded: false,
                         group: false,
                         color: None,
-                        dim: false,
+                        dim: s.channel_muted(c),
                     });
                 }
             }
@@ -1714,6 +1716,11 @@ impl App {
                 self.tree_dirty = true;
             }
             AppEvent::Error(e) => self.status = e,
+            AppEvent::Muted(settings, text) => {
+                self.state.apply_guild_settings(settings);
+                self.status = text;
+                self.tree_dirty = true;
+            }
             AppEvent::Wa(s, ev) => self.on_wa(s, ev),
             AppEvent::Pic { key, pic } => self.pics.finish(key, pic),
             AppEvent::Cal(msg) => self.on_cal(msg),
@@ -1914,6 +1921,11 @@ impl App {
                     let acked = self.state.acked.entry(a.channel_id.clone()).or_default();
                     *acked = (*acked).max(id);
                     self.state.mentions.remove(&a.channel_id);
+                }
+            }
+            "USER_GUILD_SETTINGS_UPDATE" => {
+                if let Ok(s) = serde_json::from_str::<GuildSettings>(d) {
+                    self.state.apply_guild_settings(s);
                 }
             }
             _ => return,
@@ -2561,6 +2573,8 @@ impl App {
                 self.status = format!("images {}", if self.pics.enabled { "on" } else { "off" });
             }
             "r" | "refresh" => self.refresh(),
+            "mute" => self.mute(true, arg),
+            "unmute" => self.mute(false, arg),
             // The messaging service shown (else all of them), or `:read all`.
             "read" => {
                 let all = [Service::Discord, Service::WhatsApp, Service::Matrix];
@@ -2572,6 +2586,55 @@ impl App {
             }
             _ => self.status = format!("E492: Not an editor command: {cmd}"),
         }
+    }
+
+    /// `:mute [15m|1h|8h|24h]` / `:unmute`: the server, category, channel or
+    /// DM selected in the sidebar (the open channel when the chat has focus).
+    fn mute(&mut self, on: bool, arg: &str) {
+        if self.service != Service::Discord {
+            self.status = "muting is for Discord servers and channels".into();
+            return;
+        }
+        let secs = match arg {
+            "" => None,
+            a => match a.strip_suffix(['m', 'h', 'd']).and_then(|n| n.parse::<i64>().ok()) {
+                Some(n) if a.ends_with('m') => Some(n * 60),
+                Some(n) if a.ends_with('h') => Some(n * 3600),
+                Some(n) => Some(n * 86400),
+                None => {
+                    self.status = "usage: :mute [15m|1h|8h|24h|7d] · :unmute".into();
+                    return;
+                }
+            },
+        };
+        let item = self.tree.get(self.tree_sel()).filter(|_| self.focus == Focus::Tree);
+        let id = match item.map(|t| t.kind) {
+            Some(ItemKind::Guild | ItemKind::Category | ItemKind::Channel | ItemKind::Dm) => item.map(|t| t.id.clone()),
+            _ => self.current.clone(),
+        };
+        let Some(id) = id else {
+            self.status = "select a server or channel first".into();
+            return;
+        };
+        let end = secs.map(|s| (chrono::Utc::now() + chrono::TimeDelta::seconds(s)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let config = json!({ "end_time": end, "selected_time_window": secs.unwrap_or(-1) });
+        let (guild, name, body) = if let Some(g) = self.state.guilds.get(&id) {
+            (id.clone(), g.name.clone(), json!({ "muted": on, "mute_config": config }))
+        } else if let Some(c) = self.state.channels.get(&id) {
+            let name = if c.is_dm() { self.state.dm_label(c) } else { format!("#{}", c.name.as_deref().unwrap_or("?")) };
+            let guild = c.guild_id.clone().unwrap_or_else(|| "@me".into());
+            (guild, name, json!({ "channel_overrides": { id.clone(): { "muted": on, "mute_config": config } } }))
+        } else {
+            return;
+        };
+        self.status = format!("{} {name}…", if on { "muting" } else { "unmuting" });
+        let api = self.api.clone();
+        self.spawn(async move {
+            Some(match api.guild_settings(&guild, &body).await {
+                Ok(s) => AppEvent::Muted(s, format!("{} {name}", if on { "muted" } else { "unmuted" })),
+                Err(e) => AppEvent::Error(format!("Discord: {e}")),
+            })
+        });
     }
 
     fn command_service(name: &str) -> Service {

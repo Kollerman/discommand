@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Local, TimeZone, Utc};
 
 use crate::model::*;
 use crate::text::{sanitize, truncate};
@@ -34,6 +34,11 @@ pub struct State {
     /// Last message id acknowledged to the server, per channel.
     pub acked: HashMap<String, u64>,
     pub mentions: HashMap<String, u32>,
+    /// Muted servers, categories, channels and DMs by id, with when the
+    /// mute ends (none: until unmuted).
+    pub muted: HashMap<String, Option<DateTime<Utc>>>,
+    /// The ids each server's settings muted (key "" for the DMs), so an update replaces them.
+    mute_scope: HashMap<String, Vec<String>>,
     pub messages: HashMap<String, Vec<Message>>,
     /// Channels whose full history is loaded.
     pub complete: HashSet<String>,
@@ -79,6 +84,15 @@ impl State {
             self.channels.insert(c.id.clone(), c);
         }
         self.sort_dms();
+
+        let settings = match r.user_guild_settings {
+            Some(GuildSettingsList::List(v)) => v,
+            Some(GuildSettingsList::Versioned { entries }) => entries,
+            None => Vec::new(),
+        };
+        for s in settings {
+            self.apply_guild_settings(s);
+        }
 
         let entries = match r.read_state {
             Some(ReadStates::List(v)) => v,
@@ -264,6 +278,48 @@ impl State {
         self.read.get(&c.id).is_some_and(|&r| c.last_id() > r)
     }
 
+    /// Unread and worth a dot: not muted (mentions show anyway, as in Discord).
+    pub fn shows_unread(&self, c: &Channel) -> bool {
+        self.is_unread(c) && !self.channel_muted(c)
+    }
+
+    /// Replaces the mutes of one server (or of the DMs) with these settings.
+    pub fn apply_guild_settings(&mut self, s: GuildSettings) {
+        let scope = if s.guild_id == "@me" { String::new() } else { s.guild_id.clone() };
+        for id in self.mute_scope.remove(&scope).unwrap_or_default() {
+            self.muted.remove(&id);
+        }
+        let until = |cfg: &Option<MuteConfig>| {
+            cfg.as_ref().and_then(|c| c.end_time.as_deref()).and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&Utc))
+        };
+        let mut ids = Vec::new();
+        if s.muted && !scope.is_empty() {
+            self.muted.insert(scope.clone(), until(&s.mute_config));
+            ids.push(scope.clone());
+        }
+        for o in s.overrides().into_iter().filter(|o| o.muted && !o.channel_id.is_empty()) {
+            self.muted.insert(o.channel_id.clone(), until(&o.mute_config));
+            ids.push(o.channel_id);
+        }
+        self.mute_scope.insert(scope, ids);
+    }
+
+    /// A server, category, channel or DM muted by its own setting (and not expired).
+    pub fn is_muted(&self, id: &str) -> bool {
+        match self.muted.get(id) {
+            Some(Some(until)) => Utc::now() < *until,
+            Some(None) => true,
+            None => false,
+        }
+    }
+
+    /// Muted itself, or by its category or server.
+    pub fn channel_muted(&self, c: &Channel) -> bool {
+        self.is_muted(&c.id)
+            || c.parent_id.as_deref().is_some_and(|p| self.is_muted(p))
+            || c.guild_id.as_deref().is_some_and(|g| self.is_muted(g))
+    }
+
     pub fn mention_count(&self, id: &str) -> u32 {
         self.mentions.get(id).copied().unwrap_or(0)
     }
@@ -276,7 +332,7 @@ impl State {
                 continue;
             }
             mentions += self.mention_count(&c.id);
-            if !unread && self.is_unread(c) && self.can_view(g, c) {
+            if !unread && self.shows_unread(c) && self.can_view(g, c) {
                 unread = true;
             }
         }
@@ -633,6 +689,42 @@ pub fn parse_time(ts: &str) -> Option<DateTime<Local>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mutes_hide_unread_dots() {
+        let mut s = State::default();
+        let settings = |v: serde_json::Value| serde_json::from_value::<GuildSettings>(v).unwrap();
+        // READY's list form, with a category mute and an expired channel mute.
+        s.apply_guild_settings(settings(serde_json::json!({
+            "guild_id": "g", "muted": false, "mute_config": null,
+            "channel_overrides": [
+                { "channel_id": "cat", "muted": true, "mute_config": null },
+                { "channel_id": "old", "muted": true, "mute_config": { "end_time": "2020-01-01T00:00:00.000Z" } },
+                { "channel_id": "loud", "muted": false }
+            ]
+        })));
+        let chan = |id: &str, parent: Option<&str>| Channel {
+            id: id.into(),
+            guild_id: Some("g".into()),
+            parent_id: parent.map(String::from),
+            last_message_id: Some("9".into()),
+            ..Default::default()
+        };
+        s.read.insert("a".into(), 1);
+        s.read.insert("old".into(), 1);
+        assert!(!s.shows_unread(&chan("a", Some("cat"))), "muted by its category");
+        assert!(s.is_unread(&chan("a", Some("cat"))));
+        assert!(s.shows_unread(&chan("old", None)), "the mute has ended");
+        assert!(!s.is_muted("loud"));
+
+        // An update (the map form from PATCH) replaces the server's mutes.
+        s.apply_guild_settings(settings(serde_json::json!({ "guild_id": "g", "muted": true, "channel_overrides": {} })));
+        assert!(!s.is_muted("cat") && s.is_muted("g"));
+        assert!(!s.shows_unread(&chan("old", None)), "muted by its server");
+        // DMs' settings come with no guild id.
+        s.apply_guild_settings(settings(serde_json::json!({ "guild_id": null, "channel_overrides": { "dm": { "muted": true } } })));
+        assert!(s.is_muted("dm") && s.is_muted("g"));
+    }
 
     #[test]
     fn own_reactions_count_once() {
