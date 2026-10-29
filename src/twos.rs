@@ -1,6 +1,7 @@
 //! Twos (twosapp.com) via its REST API: open todos of all lists, today's
-//! list for new ones, and reminders as due times. Each user signs in with a
-//! personal API key (Twos → Settings → API Keys).
+//! list for new ones, whole lists as the app shows them, and reminders as
+//! due times. Each user signs in with a personal API key (Twos → Settings →
+//! API Keys).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -12,12 +13,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::secret;
-use crate::todo::{self, Task, TaskList};
+use crate::todo::{self, Page, Task, TaskList};
 
 const API: &str = "https://www.twosapp.com/api/v1";
 const SECRET_NAME: &str = "twos";
 /// Pages of 50 things read per sync, at most (Twos allows 1000 requests an hour).
 const MAX_PAGES: usize = 40;
+/// Pages of 50 lists read once at the start, at most, and how many at a time.
+const MAX_LIST_PAGES: usize = 60;
+const PARALLEL: usize = 4;
 
 pub fn load_key() -> Option<String> {
     let key = String::from_utf8(secret::load_secret(SECRET_NAME)?).ok()?;
@@ -37,11 +41,15 @@ pub fn is_key(key: &str) -> bool {
     key.starts_with("twos_") && key.len() > 12 && !key.contains(char::is_whitespace)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct TList {
     id: String,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    emoji: String,
+    #[serde(default)]
+    favorited: bool,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +78,14 @@ struct Thing {
     header: bool,
     #[serde(default)]
     subheader: bool,
+    #[serde(default)]
+    quote: bool,
+    #[serde(default)]
+    code: bool,
+    #[serde(default)]
+    url: String,
+    /// A line that links to another list.
+    list_ref: Option<String>,
 }
 
 /// A Twos thing as a line of a task tab.
@@ -95,15 +111,72 @@ fn to_task(t: Thing, list: &str, pos: u32, due: Option<NaiveDate>, reminder: Opt
         check: t.kind == "todo",
         marker: marker.to_string(),
         heading: t.header || t.subheader,
+        subheading: t.subheader,
+        quote: t.quote,
+        code: t.code,
+        url: t.url,
+        sublist: t.list_ref.filter(|l| !l.is_empty()),
         depth: t.tabs.min(6) as u8,
         pos,
         from,
     }
 }
 
+/// Due times of things by thing id.
+type DueTimes = HashMap<String, (NaiveDate, Option<DateTime<Local>>)>;
+
+fn due_times(reminders: &[Reminder]) -> DueTimes {
+    reminders.iter().filter_map(|r| Some((r.thing_id.clone(), r.due()?))).collect()
+}
+
+/// A list's things as lines, in order. Numbered lines count up within a
+/// run of them at the same indent.
+fn lines(things: Vec<Thing>, list: &str, due: &DueTimes, pos: &mut u32) -> Vec<Task> {
+    let mut numbers: Vec<u32> = Vec::new();
+    things
+        .into_iter()
+        .map(|t| {
+            let depth = t.tabs.min(6) as usize;
+            numbers.resize(depth + 1, 0);
+            numbers[depth] = if t.kind == "number" { numbers[depth] + 1 } else { 0 };
+            let n = numbers[depth];
+            *pos += 1;
+            let (when, at) = due.get(&t.id).copied().unzip();
+            let mut line = to_task(t, list, *pos, when, at.flatten(), None);
+            if n > 0 {
+                line.marker = format!("{n}. ");
+            }
+            line
+        })
+        .collect()
+}
+
+/// Twos writes some weekdays and months longer than chrono does ("Tues",
+/// "Thurs", "Sept").
+fn normalize(title: &str) -> String {
+    let words: Vec<String> = title
+        .split_whitespace()
+        .map(|w| {
+            let (word, tail) = w.split_at(w.trim_end_matches(',').len());
+            let word = match word {
+                "Tues" => "Tue",
+                "Weds" => "Wed",
+                "Thur" | "Thurs" => "Thu",
+                "Sept" => "Sep",
+                w => w,
+            };
+            format!("{word}{tail}")
+        })
+        .collect();
+    words.join(" ")
+}
+
 /// Day lists are ordinary lists titled with their date. Today's title shows
 /// the format; titles in it from about a year around today are days.
-struct Days(HashMap<String, NaiveDate>);
+struct Days {
+    dates: HashMap<String, NaiveDate>,
+    formats: Vec<&'static str>,
+}
 
 /// Date formats a day list title may have (the account's one is detected).
 const DAY_FORMATS: &[&str] = &[
@@ -132,8 +205,8 @@ const DAY_FORMATS: &[&str] = &[
 
 impl Days {
     fn new(today_title: &str, today: NaiveDate) -> Days {
-        let title = today_title.trim();
-        let formats: Vec<&str> = match DAY_FORMATS.iter().find(|f| today.format(f).to_string() == title) {
+        let title = normalize(today_title);
+        let formats: Vec<&'static str> = match DAY_FORMATS.iter().find(|f| today.format(f).to_string() == title) {
             Some(f) => vec![f],
             None => DAY_FORMATS.to_vec(),
         };
@@ -147,11 +220,13 @@ impl Days {
                 }
             }
         }
-        Days(map)
+        Days { dates: map, formats }
     }
 
+    /// The date of a day list; titles with a year can be of any date.
     fn date(&self, title: &str) -> Option<NaiveDate> {
-        self.0.get(title.trim()).copied()
+        let title = normalize(title);
+        self.dates.get(&title).copied().or_else(|| self.formats.iter().find_map(|f| NaiveDate::parse_from_str(&title, f).ok()))
     }
 }
 
@@ -178,17 +253,24 @@ impl Reminder {
     }
 }
 
+/// The account's lists, most recently changed first; all of them once
+/// `full` (read at the first sync, then kept up to date from the newest page).
+#[derive(Default)]
+struct Catalog {
+    lists: Vec<TList>,
+    full: bool,
+}
+
 pub struct Twos {
     http: reqwest::Client,
     key: String,
-    /// List titles by id, kept between syncs (Twos has a list per day).
-    names: Mutex<HashMap<String, String>>,
+    catalog: Mutex<Catalog>,
 }
 
 impl Twos {
     pub fn new(key: String) -> Self {
         let http = reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap_or_default();
-        Self { http, key, names: Mutex::new(HashMap::new()) }
+        Self { http, key, catalog: Mutex::new(Catalog::default()) }
     }
 
     fn url(segments: &[&str], query: &[(&str, &str)]) -> Url {
@@ -233,15 +315,16 @@ impl Twos {
         self.call(Method::GET, Self::url(segments, query), None).await
     }
 
-    /// Like the app: **Today** is today's whole day list (notes, headings and
-    /// done to-dos included), with the unfinished to-dos of earlier days
-    /// rolled over on top. Then upcoming days and other lists with open
-    /// to-dos.
-    pub async fn sync(&self) -> Result<(Vec<TaskList>, Vec<Task>), String> {
+    /// The sidebar: **Today** (its to-dos, with the unfinished ones of
+    /// earlier days rolled over on top, like the app), upcoming days and
+    /// lists with open to-dos, favorite lists, and every other list folded
+    /// under "More lists". Today's whole list comes along as a page.
+    pub async fn sync(&self) -> Result<(Vec<TaskList>, Vec<Task>, Vec<Page>), String> {
         let date = Local::now().date_naive();
         let mut v = self.get(&["today"], &[]).await?;
         let today: TList = serde_json::from_value(v["list"].take()).map_err(|e| format!("Twos: {e}"))?;
         let page: Vec<Thing> = serde_json::from_value(v["things"].take()).unwrap_or_default();
+        let mut reminders: Vec<Reminder> = serde_json::from_value(v["reminders"].take()).unwrap_or_default();
 
         let mut things: Vec<Thing> = Vec::new();
         for page in 0..MAX_PAGES {
@@ -254,29 +337,31 @@ impl Twos {
             }
         }
 
-        // Due times: Twos lists only upcoming reminders.
+        // Due times: today's list has its own; elsewhere Twos lists only upcoming reminders.
         let mut v = self.get(&["reminders"], &[]).await?;
-        let reminders: Vec<Reminder> = serde_json::from_value(v["reminders"].take()).unwrap_or_default();
-        let due: HashMap<&str, (NaiveDate, Option<DateTime<Local>>)> =
-            reminders.iter().filter_map(|r| Some((r.thing_id.as_str(), r.due()?))).collect();
+        reminders.extend(serde_json::from_value::<Vec<Reminder>>(v["reminders"].take()).unwrap_or_default());
+        let due = due_times(&reminders);
 
-        self.learn_names(&things).await?;
-        let names = self.names.lock().unwrap().clone();
+        self.refresh_catalog().await?;
+        self.learn_lists(&things).await;
+        let catalog = self.catalog.lock().unwrap().lists.clone();
+        let rank: HashMap<&str, usize> = catalog.iter().enumerate().map(|(i, l)| (l.id.as_str(), i)).collect();
         let days = Days::new(&today.title, date);
         let mut pos = 0;
-        let mut task = |t: Thing, list: &str, from: Option<NaiveDate>| {
-            pos += 1;
-            let (when, at) = due.get(t.id.as_str()).copied().unzip();
-            to_task(t, list, pos, when, at.flatten(), from)
+        let task = |t: Thing, list: &str, from: Option<NaiveDate>, pos: &mut u32| {
+            *pos += 1;
+            let (when, at) = due.get(&t.id).copied().unzip();
+            to_task(t, list, *pos, when, at.flatten(), from)
         };
 
-        let mut lists = vec![TaskList { id: today.id.clone(), name: format!("Today · {}", date.format("%a %d %b")), default: true, pos: 0 }];
+        let name = format!("Today · {}", date.format("%a %d %b"));
+        let mut lists = vec![TaskList { id: today.id.clone(), name: name.clone(), default: true, pos: 0, ..TaskList::default() }];
         let (mut rolled, mut upcoming, mut other) = (Vec::new(), Vec::new(), Vec::new());
         for t in things {
             if t.list_id == today.id {
                 continue; // part of today's page
             }
-            let title = names.get(&t.list_id).map(String::as_str).unwrap_or("");
+            let title = catalog.get(rank.get(t.list_id.as_str()).copied().unwrap_or(usize::MAX)).map(|l| l.title.as_str()).unwrap_or("");
             match days.date(title) {
                 Some(d) if d < date => rolled.push((d, t)),
                 Some(d) => upcoming.push((d, t)),
@@ -285,17 +370,13 @@ impl Twos {
         }
         // Rolled-over to-dos on top, oldest day first, as Twos shows them.
         rolled.sort_by(|a, b| (a.0, &a.1.created).cmp(&(b.0, &b.1.created)));
-        let mut tasks: Vec<Task> = rolled.into_iter().map(|(d, t)| task(t, &today.id, Some(d))).collect();
-        let mut number = 0;
-        for t in page {
-            // Numbered lines count up within a run of them.
-            number = if t.kind == "number" { number + 1 } else { 0 };
-            let mut line = task(t, &today.id, None);
-            if number > 0 {
-                line.marker = format!("{number}. ");
-            }
-            tasks.push(line);
-        }
+        let rolled: Vec<Task> = rolled.into_iter().map(|(d, t)| task(t, &today.id, Some(d), &mut pos)).collect();
+        let mut today_lines = rolled.clone();
+        today_lines.extend(lines(page, &today.id, &due, &mut pos));
+        // The sidebar has the to-dos; the main pane the whole list.
+        let mut tasks: Vec<Task> = today_lines.iter().filter(|t| t.check).cloned().collect();
+        let pages = vec![Page { list: today.id.clone(), title: name, emoji: today.emoji.clone(), lines: today_lines }];
+
         upcoming.sort_by(|a, b| (a.0, &a.1.created).cmp(&(b.0, &b.1.created)));
         for (d, t) in upcoming {
             if !lists.iter().any(|l| l.id == t.list_id) {
@@ -303,54 +384,101 @@ impl Twos {
                     1 => format!("Tomorrow · {}", d.format("%a %d %b")),
                     _ => d.format("%a %d %b %Y").to_string(),
                 };
-                lists.push(TaskList { id: t.list_id.clone(), name, default: false, pos: lists.len() as u32 });
+                lists.push(TaskList { id: t.list_id.clone(), name, pos: lists.len() as u32, ..TaskList::default() });
             }
             let list = t.list_id.clone();
-            tasks.push(task(t, &list, None));
+            tasks.push(task(t, &list, None, &mut pos));
         }
+        // Then favorites, then lists with open to-dos, most recently changed first.
+        let entry = |id: &str, more: bool| {
+            let i = rank.get(id).copied();
+            let l = i.map(|i| &catalog[i]);
+            let favorite = l.is_some_and(|l| l.favorited);
+            let base = if favorite { 1_000 } else if more { 100_000 } else { 10_000 };
+            TaskList {
+                id: id.to_string(),
+                name: l.map(|l| l.title.trim()).filter(|n| !n.is_empty()).unwrap_or("(untitled list)").to_string(),
+                pos: base + i.unwrap_or(50_000) as u32,
+                emoji: l.map(|l| l.emoji.clone()).unwrap_or_default(),
+                more: more && !favorite,
+                folded: true,
+                default: false,
+            }
+        };
         for t in other {
             if !lists.iter().any(|l| l.id == t.list_id) {
-                let name = names.get(&t.list_id).filter(|n| !n.is_empty()).cloned().unwrap_or_else(|| "(untitled list)".into());
-                // After the days, by name.
-                lists.push(TaskList { id: t.list_id.clone(), name, default: false, pos: u32::MAX });
+                lists.push(entry(&t.list_id, false));
             }
             let list = t.list_id.clone();
-            tasks.push(task(t, &list, None));
+            tasks.push(task(t, &list, None, &mut pos));
         }
-        Ok((lists, tasks))
-    }
-
-    /// Looks up the titles of lists not seen before: all lists page by page
-    /// first, then one by one for the rest (day lists may not be listed).
-    async fn learn_names(&self, things: &[Thing]) -> Result<(), String> {
-        let unknown = |names: &HashMap<String, String>| -> Vec<String> {
-            let mut ids: Vec<String> = things.iter().map(|t| t.list_id.clone()).filter(|id| !names.contains_key(id)).collect();
-            ids.sort();
-            ids.dedup();
-            ids
-        };
-        if unknown(&self.names.lock().unwrap()).is_empty() {
-            return Ok(());
-        }
-        for page in 0..20 {
-            let p = page.to_string();
-            let mut v = self.get(&["lists"], &[("page", &p)]).await?;
-            let lists: Vec<TList> = serde_json::from_value(v["lists"].take()).unwrap_or_default();
-            let mut names = self.names.lock().unwrap();
-            names.extend(lists.into_iter().map(|l| (l.id, l.title)));
-            if !v["has_more"].as_bool().unwrap_or(false) || unknown(&names).is_empty() {
-                break;
+        for l in &catalog {
+            if days.date(&l.title).is_none() && !lists.iter().any(|x| x.id == l.id) {
+                lists.push(entry(&l.id, true));
             }
         }
-        let rest = unknown(&self.names.lock().unwrap());
-        for id in rest.into_iter().take(20) {
+        Ok((lists, tasks, pages))
+    }
+
+    /// One whole list, in the app's order, with its reminders.
+    pub async fn page(&self, id: &str) -> Result<Page, String> {
+        let mut v = self.get(&["lists", id], &[]).await?;
+        let list: TList = serde_json::from_value(v["list"].take()).map_err(|e| format!("Twos: {e}"))?;
+        let things: Vec<Thing> = serde_json::from_value(v["things"].take()).map_err(|e| format!("Twos: {e}"))?;
+        let reminders: Vec<Reminder> = serde_json::from_value(v["reminders"].take()).unwrap_or_default();
+        let lines = lines(things, &list.id, &due_times(&reminders), &mut 0);
+        Ok(Page { list: list.id, title: list.title, emoji: list.emoji, lines })
+    }
+
+    async fn list_page(&self, page: usize) -> Result<(Vec<TList>, bool), String> {
+        let p = page.to_string();
+        let mut v = self.get(&["lists"], &[("page", &p)]).await?;
+        let lists: Vec<TList> = serde_json::from_value(v["lists"].take()).unwrap_or_default();
+        Ok((lists, v["has_more"].as_bool().unwrap_or(false)))
+    }
+
+    /// Reads all lists once (a few pages at a time), afterwards only the
+    /// newest page: changed lists move to the front.
+    async fn refresh_catalog(&self) -> Result<(), String> {
+        if self.catalog.lock().unwrap().full {
+            let (fresh, _) = self.list_page(0).await?;
+            let mut c = self.catalog.lock().unwrap();
+            c.lists.retain(|l| !fresh.iter().any(|f| f.id == l.id));
+            c.lists.splice(0..0, fresh);
+            return Ok(());
+        }
+        let mut all: Vec<TList> = Vec::new();
+        'pages: for start in (0..MAX_LIST_PAGES).step_by(PARALLEL) {
+            let batch = futures_util::future::join_all((start..start + PARALLEL).map(|p| self.list_page(p))).await;
+            for page in batch {
+                let (lists, more) = page?;
+                all.extend(lists);
+                if !more {
+                    break 'pages;
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|l| seen.insert(l.id.clone()));
+        *self.catalog.lock().unwrap() = Catalog { lists: all, full: true };
+        Ok(())
+    }
+
+    /// Looks up lists not in the catalog (e.g. archived ones) that hold open to-dos.
+    async fn learn_lists(&self, things: &[Thing]) {
+        let mut ids: Vec<String> = {
+            let c = self.catalog.lock().unwrap();
+            things.iter().map(|t| t.list_id.clone()).filter(|id| !c.lists.iter().any(|l| &l.id == id)).collect()
+        };
+        ids.sort();
+        ids.dedup();
+        for id in ids.into_iter().take(20) {
             let title = match self.get(&["fetch"], &[("id", &id)]).await {
                 Ok(v) => v["title"].as_str().unwrap_or("").to_string(),
                 Err(_) => String::new(),
             };
-            self.names.lock().unwrap().insert(id, title);
+            self.catalog.lock().unwrap().lists.push(TList { id, title, emoji: String::new(), favorited: false });
         }
-        Ok(())
     }
 
     pub async fn create(&self, list: &str, text: &str) -> Result<(), String> {
@@ -422,28 +550,34 @@ mod tests {
         // Unknown format: every known one is tried.
         let days = Days::new("", today);
         assert_eq!(days.date("2026-10-20"), NaiveDate::from_ymd_opt(2026, 10, 20));
+        // Twos' own abbreviations.
+        let days = Days::new("Wed Oct 28, 2026", today);
+        assert_eq!(days.date("Tues Oct 27, 2026"), NaiveDate::from_ymd_opt(2026, 10, 27));
+        assert_eq!(days.date("Thurs Sept 3, 2026"), NaiveDate::from_ymd_opt(2026, 9, 3));
+        assert_eq!(days.date("Tues Aug 6, 2019"), NaiveDate::from_ymd_opt(2019, 8, 6));
+        assert_eq!(days.date("VPS management"), None);
+    }
+
+    #[test]
+    fn numbered_lines_count_per_indent() {
+        let thing = |kind: &str, tabs: u32| Thing { kind: kind.into(), tabs, ..thing("x") };
+        let ls = lines(vec![thing("number", 0), thing("dash", 1), thing("number", 0), thing("number", 1), thing("dash", 0), thing("number", 0)], "l", &HashMap::new(), &mut 0);
+        let markers: Vec<&str> = ls.iter().map(|t| t.marker.as_str()).collect();
+        assert_eq!(markers, ["1. ", "– ", "2. ", "1. ", "– ", "1. "]);
+    }
+
+    fn thing(kind: &str) -> Thing {
+        serde_json::from_value(json!({ "id": "t", "list_id": "l", "text": "Milk", "type": kind, "tabs": 1 })).unwrap()
     }
 
     #[test]
     fn things_become_lines() {
-        let thing = |kind: &str, completed: bool| Thing {
-            id: "t".into(),
-            list_id: "l".into(),
-            text: "Milk".into(),
-            note: String::new(),
-            completed,
-            canceled: false,
-            favorited: false,
-            created: None,
-            kind: kind.into(),
-            tabs: 1,
-            header: false,
-            subheader: false,
-        };
-        let t = to_task(thing("todo", true), "today", 3, None, None, None);
+        let t = to_task(Thing { completed: true, ..thing("todo") }, "today", 3, None, None, None);
         assert!(t.check && t.done && t.marker.is_empty() && t.depth == 1 && t.pos == 3);
-        let t = to_task(thing("bullet", false), "today", 4, None, None, None);
+        let t = to_task(thing("bullet"), "today", 4, None, None, None);
         assert!(!t.check && t.marker == "• ");
+        let t = to_task(Thing { text: "---".into(), ..thing("dash") }, "l", 5, None, None, None);
+        assert!(t.is_divider());
     }
 
     #[test]

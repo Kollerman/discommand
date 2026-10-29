@@ -341,6 +341,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, rx: &mut Unbo
             if app.tree_dirty {
                 app.rebuild_tree();
             }
+            app.sync_page();
             terminal.draw(|f| ui::draw(f, app))?;
             app.dirty = false;
             app.load_pics();

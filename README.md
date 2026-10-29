@@ -404,18 +404,25 @@ has no date. Reminders ring the bell and show in the status line.
 
 ## Twos
 
-[Twos](https://www.twosapp.com) is the sixth mode (`6gt`) and follows the app's day model:
+[Twos](https://www.twosapp.com) is the sixth mode (`6gt`) and follows the app's day model.
+The **sidebar** holds the quick to-dos:
 
-- **Today** is today's whole day list, as in Twos: notes, bullets, numbered lines,
-  headings (bold) and indented lines, plus to-dos, also finished ones (struck through).
+- **Today** with its to-dos, also finished ones (struck through).
 - **Rollover:** unfinished to-dos from earlier days roll over and sit on top of Today,
   marked with the day they came from (`↪ Tue 27 Oct`). Notes don't roll over.
-- **Upcoming days** (Tomorrow, …) with open to-dos follow, then your other lists with
-  their open to-dos.
+- **Upcoming days** (Tomorrow, …) with open to-dos, then your favorite lists and the
+  lists with open to-dos (folded; `l` unfolds), and every other list under
+  **More lists**. `/` finds lists too.
 
-The keys are the same as in Tasks: `x` ticks a to-do off, and `n` adds one to the
-selected list (Today if nothing else is selected). `e` edits any line and `dd`
-deletes it. A date or time typed with a to-do (`morgen 14:00 Arzt anrufen`) becomes
+The **main pane** shows the selected list whole, centered like the web app and in its
+order: notes, bullets, numbered lines, headings, quotes, indented lines, dividers
+(`---`) and to-dos with their reminders. `Tab` (or `Ctrl+l`) moves into it: `j`/`k`
+select any line, a selected line shows its note, `Enter` opens a sub-list or a link,
+and `h` goes back to the sidebar.
+
+The keys are the same as in Tasks, in either pane: `x` ticks a to-do off, and `n` adds
+one to the selected list (Today if nothing else is selected). `e` edits any line and
+`dd` deletes it. A date or time typed with a to-do (`morgen 14:00 Arzt anrufen`) becomes
 its Twos reminder, since Twos has no separate due date. Reminders show in the calendar
 (in orange) and ring the bell.
 
@@ -428,9 +435,10 @@ the scopes `read:lists`, `read:things` and `write:things`, and run
 `:twos logout` removes it, and revoking the key in Twos cuts access at once. No app
 registration is needed, so nothing goes into `keys/keys.env`.
 
-Twos only lists *upcoming* reminders, so a todo whose reminder has passed shows
-without a date. Twos allows 1000 API requests an hour; a sync takes a few, every 10
-minutes.
+In the sidebar, a to-do outside Today whose reminder has passed shows without a date
+(Twos only lists *upcoming* reminders); its list in the main pane shows it. Twos allows
+1000 API requests an hour: the first sync reads all your lists (a few seconds), later
+ones take a few requests every 10 minutes, and each list shown is read once per sync.
 
 ## Publishing a release
 

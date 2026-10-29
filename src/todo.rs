@@ -2,6 +2,7 @@
 //! (see `Backend`), and Microsoft To Do via Microsoft Graph: device-code
 //! login, task sync, create/edit/complete/delete and reminders.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -128,6 +129,20 @@ pub struct TaskList {
     pub default: bool,
     /// Order among the other lists (the default list comes first anyway).
     pub pos: u32,
+    pub emoji: String,
+    /// Shown folded away under "More lists" (Twos lists without open to-dos).
+    pub more: bool,
+    /// Starts folded in the sidebar.
+    pub folded: bool,
+}
+
+/// A whole list as the app shows it (Twos): every line, in order.
+#[derive(Clone, Debug, Default)]
+pub struct Page {
+    pub list: String,
+    pub title: String,
+    pub emoji: String,
+    pub lines: Vec<Task>,
 }
 
 /// A task, or (Twos) any line of a list: notes, bullets and headings too.
@@ -148,6 +163,13 @@ pub struct Task {
     /// ("• ", "– ", "1. "), a heading, and the indent.
     pub marker: String,
     pub heading: bool,
+    /// The smaller heading (Twos' subheader); `heading` is set too.
+    pub subheading: bool,
+    pub quote: bool,
+    pub code: bool,
+    /// A link (opened with Enter), and the list a sub-list line points to.
+    pub url: String,
+    pub sublist: Option<String>,
     pub depth: u8,
     /// Place in its list as the app shows it (0: sorted by due date).
     pub pos: u32,
@@ -172,6 +194,12 @@ impl Task {
 
     pub fn overdue(&self, today: NaiveDate) -> bool {
         self.check && !self.done && self.due.is_some_and(|d| d < today)
+    }
+
+    /// A line that's only a separator ("---").
+    pub fn is_divider(&self) -> bool {
+        let t = self.title.trim();
+        !self.check && t.chars().count() >= 3 && t.chars().all(|c| matches!(c, '-' | '–' | '—' | '_' | '*' | '='))
     }
 }
 
@@ -208,7 +236,7 @@ impl Entry {
 }
 
 #[derive(Deserialize)]
-struct Page<T> {
+struct GPage<T> {
     #[serde(default = "Vec::new")]
     value: Vec<T>,
     #[serde(rename = "@odata.nextLink")]
@@ -357,7 +385,7 @@ impl Todo {
     async fn pages<T: serde::de::DeserializeOwned>(&self, mut url: Url) -> Result<Vec<T>, String> {
         let mut out = Vec::new();
         loop {
-            let page: Page<T> = serde_json::from_value(self.call(Method::GET, url, None).await?).map_err(|e| e.to_string())?;
+            let page: GPage<T> = serde_json::from_value(self.call(Method::GET, url, None).await?).map_err(|e| e.to_string())?;
             out.extend(page.value);
             match page.next.and_then(|n| Url::parse(&n).ok()) {
                 Some(next) => url = next,
@@ -376,7 +404,7 @@ impl Todo {
                 id: l.id.clone(),
                 name: l.display_name.clone(),
                 default: l.wellknown_list_name == "defaultList",
-                pos: 0,
+                ..TaskList::default()
             })
             .collect();
         // One list at a time: To Do lives in Exchange, which allows only a few
@@ -439,11 +467,23 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// All lists to show and their open tasks.
-    pub async fn sync(&self) -> Result<(Vec<TaskList>, Vec<Task>), String> {
+    /// All lists to show, their open tasks, and whole lists read on the way.
+    pub async fn sync(&self) -> Result<(Vec<TaskList>, Vec<Task>, Vec<Page>), String> {
         match self {
-            Backend::Microsoft(t) => t.sync().await,
+            Backend::Microsoft(t) => t.sync().await.map(|(lists, tasks)| (lists, tasks, Vec::new())),
             Backend::Twos(t) => t.sync().await,
+        }
+    }
+
+    /// Whether the main pane shows whole lists (`page`) rather than task details.
+    pub fn has_pages(&self) -> bool {
+        matches!(self, Backend::Twos(_))
+    }
+
+    pub async fn page(&self, list: &str) -> Result<Page, String> {
+        match self {
+            Backend::Microsoft(_) => Err("To Do lists have no pages".into()),
+            Backend::Twos(t) => t.page(list).await,
         }
     }
 
@@ -489,16 +529,23 @@ pub struct TodoState {
     pub reminded_until: Option<DateTime<Local>>,
     /// Device-code login in progress: (uri, code).
     pub login: Option<(String, String)>,
+    /// Whole lists by id (Twos), and the ones being read (or that failed,
+    /// until the next sync).
+    pub pages: HashMap<String, Page>,
+    pub loading: HashSet<String>,
 }
 
 impl TodoState {
-    pub fn apply(&mut self, mut lists: Vec<TaskList>, tasks: Vec<Task>) {
+    pub fn apply(&mut self, mut lists: Vec<TaskList>, tasks: Vec<Task>, pages: Vec<Page>) {
         // The default list ("Tasks", Twos' Today) first, then in the backend's order, then by name.
         lists.sort_by(|a, b| {
             b.default.cmp(&a.default).then(a.pos.cmp(&b.pos)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         self.lists = lists;
         self.tasks = tasks;
+        // Other lists are read again when shown.
+        self.pages = pages.into_iter().map(|p| (p.list.clone(), p)).collect();
+        self.loading.clear();
         self.sort();
         self.status = format!("synced {}", Local::now().format("%H:%M"));
     }
@@ -510,12 +557,24 @@ impl TodoState {
         self.tasks.sort_by(|a, b| key(a).cmp(&key(b)));
     }
 
+    /// A task, or any line of a whole list.
     pub fn find(&self, key: &str) -> Option<&Task> {
-        self.tasks.iter().find(|t| t.key() == key)
+        self.tasks.iter().chain(self.pages.values().flat_map(|p| &p.lines)).find(|t| t.key() == key)
     }
 
-    pub fn find_mut(&mut self, key: &str) -> Option<&mut Task> {
-        self.tasks.iter_mut().find(|t| t.key() == key)
+    /// Marks a task done everywhere it's shown (sidebar and list).
+    pub fn set_done(&mut self, key: &str, done: bool) {
+        let lines = self.pages.values_mut().flat_map(|p| p.lines.iter_mut());
+        for t in self.tasks.iter_mut().chain(lines).filter(|t| t.key() == key) {
+            t.done = done;
+        }
+    }
+
+    pub fn remove(&mut self, key: &str) {
+        self.tasks.retain(|t| t.key() != key);
+        for p in self.pages.values_mut() {
+            p.lines.retain(|t| t.key() != key);
+        }
     }
 
     pub fn list_name(&self, id: &str) -> &str {

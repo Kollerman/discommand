@@ -102,6 +102,8 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect, split: bool) {
                 ItemKind::WaChat => ("@ ", Style::new().fg(Color::Gray)),
                 ItemKind::CalDay => ("", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                 ItemKind::CalEvent => ("● ", Style::new()),
+                // Lists under "More lists" have nothing to fold.
+                ItemKind::TodoList if t.depth > 0 => ("≡ ", Style::new()),
                 ItemKind::TodoList => (fold, Style::new().add_modifier(Modifier::BOLD)),
                 ItemKind::TodoTask if t.dim => ("☑ ", Style::new()),
                 ItemKind::TodoTask => ("☐ ", Style::new()),
@@ -158,7 +160,11 @@ fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
         None if app.service == Service::Calendar => {
             app.selected_event().map(|e| e.title.clone()).unwrap_or_else(|| "Calendar".into())
         }
-        None if app.service.is_tasks() => app.selected_task().map(|t| t.title.clone()).unwrap_or_else(|| app.service.name().into()),
+        None if app.service.is_tasks() => match app.page() {
+            Some(p) if p.emoji.is_empty() => p.title.clone(),
+            Some(p) => format!("{} {}", p.emoji, p.title),
+            None => app.selected_task().map(|t| t.title.clone()).unwrap_or_else(|| app.service.name().into()),
+        },
         None => "nothing open — / to find a chat, ? for help, shift+tab switches service".into(),
     };
     f.render_widget(
@@ -218,7 +224,8 @@ fn draw_input(f: &mut Frame, app: &App, input: Rect) {
     if app.input.is_empty() && !focused {
         let hint = match app.service {
             Service::Calendar => "› press n to add an event",
-            Service::Tasks | Service::Twos => "› n new task · x done · e edit · dd delete",
+            Service::Twos => "› n new · x done · e edit · dd delete · ⇥ list pane · ⏎ open sub-list",
+            Service::Tasks => "› n new task · x done · e edit · dd delete",
             _ => "› press i to type",
         };
         f.render_widget(Paragraph::new(Line::from(Span::styled(hint, DIM))), inner);
@@ -242,6 +249,10 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![label("Code"), Span::styled(code.clone(), Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD))]));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("  (the page was opened in your browser; this updates by itself)", DIM)));
+    } else if app.page().is_some() {
+        return draw_page(f, app, area);
+    } else if app.page_loading() {
+        lines.push(Line::from(Span::styled("  loading the list…", DIM)));
     } else if let Some(t) = app.selected_task() {
         let today = Local::now().date_naive();
         if t.check {
@@ -282,6 +293,135 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(Span::styled("  select a task (j/k) · n new task · h/l fold lists", DIM)));
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// A whole list (Twos) in a centered column, like the web app. The
+/// selected line is highlighted and its note shown below it.
+fn draw_page(f: &mut Frame, app: &App, area: Rect) {
+    let Some(page) = app.page() else { return };
+    let w = area.width.saturating_sub(4).clamp(10, 80);
+    let col = Rect { x: area.x + (area.width - w.min(area.width)) / 2, width: w.min(area.width), ..area };
+    let width = col.width as usize;
+    let today = Local::now().date_naive();
+    let sel = app.page_sel();
+    let highlight = if app.focus == Focus::Messages {
+        Style::new().bg(Color::DarkGray)
+    } else {
+        Style::new().add_modifier(Modifier::UNDERLINED)
+    };
+
+    let title = if page.emoji.is_empty() { page.title.clone() } else { format!("{} {}", page.emoji, page.title) };
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(truncate(&title, width), Style::new().add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+    if page.lines.is_empty() {
+        lines.push(Line::from(Span::styled("(empty list)", DIM)));
+    }
+    let mut sel_rows = 0..0;
+    for (i, t) in page.lines.iter().enumerate() {
+        let selected = sel == Some(i);
+        // Headings get some air above them.
+        if t.heading && lines.len() > 3 && !lines.last().is_some_and(|l| l.width() == 0) {
+            lines.push(Line::from(""));
+        }
+        let first = lines.len();
+        let indent = "   ".repeat(t.depth as usize);
+        if t.is_divider() {
+            let rule = "─".repeat(width.saturating_sub(indent.len()));
+            lines.push(Line::from(vec![Span::raw(indent), Span::styled(rule, DIM)]));
+        } else {
+            let (mark, mark_style) = if t.check {
+                (if t.done { "☑ " } else { "☐ " }.to_string(), if t.done { DIM } else { Style::new().fg(Color::Gray) })
+            } else if t.sublist.is_some() {
+                ("→ ".to_string(), Style::new().fg(Color::Cyan))
+            } else if t.quote {
+                ("│ ".to_string(), DIM)
+            } else {
+                (t.marker.clone(), DIM)
+            };
+            let mut style = Style::new();
+            if t.heading && !t.subheading {
+                style = style.fg(Color::White).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            } else if t.heading {
+                style = style.fg(Color::White).add_modifier(Modifier::BOLD);
+            }
+            if t.quote {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if t.code {
+                style = style.fg(Color::Green);
+            }
+            if t.sublist.is_some() || !t.url.is_empty() {
+                style = style.fg(Color::Cyan);
+            }
+            if t.important && !t.done {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if t.done {
+                style = DIM.add_modifier(Modifier::CROSSED_OUT);
+            }
+
+            let mut extra: Vec<Span> = Vec::new();
+            let when = match (t.due, t.reminder) {
+                (_, Some(r)) => Some(r.format("%a %d %b %H:%M").to_string()),
+                (Some(d), None) => Some(d.format("%a %d %b").to_string()),
+                _ => None,
+            };
+            if let Some(when) = when {
+                let color = match t.due {
+                    _ if t.done => DIM,
+                    Some(d) if d < today => Style::new().fg(Color::Red),
+                    Some(d) if d == today => Style::new().fg(Color::Yellow),
+                    _ => DIM,
+                };
+                extra.push(Span::styled(format!("  ⏰ {when}"), color));
+            }
+            if let Some(from) = t.from {
+                extra.push(Span::styled(format!("  ↪ {}", from.format("%a %d %b")), DIM));
+            }
+            if t.important {
+                extra.push(Span::styled("  ★", Style::new().fg(Color::Yellow)));
+            }
+            if !t.note.is_empty() && !selected {
+                extra.push(Span::styled("  ✎", DIM));
+            }
+
+            let hang = " ".repeat(mark.width());
+            let text = if t.title.trim().is_empty() { " " } else { t.title.as_str() };
+            let wrapped = wrap(text, width.saturating_sub(indent.len() + mark.width()).max(8));
+            let n = wrapped.len();
+            for (j, part) in wrapped.into_iter().enumerate() {
+                let lead = if j == 0 { Span::styled(mark.clone(), mark_style) } else { Span::raw(hang.clone()) };
+                let mut spans = vec![Span::raw(indent.clone()), lead, Span::styled(part, style)];
+                if j + 1 == n {
+                    spans.append(&mut extra);
+                }
+                lines.push(Line::from(spans));
+            }
+            if selected && !t.note.is_empty() {
+                let pad = format!("{indent}{hang}");
+                for l in wrap(&t.note, width.saturating_sub(pad.len()).max(8)) {
+                    lines.push(Line::from(vec![Span::raw(pad.clone()), Span::styled(l, DIM)]));
+                }
+            }
+        }
+        if selected {
+            sel_rows = first..lines.len();
+            for l in &mut lines[first..] {
+                // The whole row, not only its text.
+                let fill = width.saturating_sub(l.width());
+                l.spans.push(Span::raw(" ".repeat(fill)));
+                *l = std::mem::take(l).patch_style(highlight);
+            }
+        }
+    }
+
+    // Scroll only as far as needed to keep the selection in view.
+    let h = area.height as usize;
+    let top = if sel_rows.end + 2 > h { (sel_rows.end + 2 - h).min(sel_rows.start) } else { 0 };
+    f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), col);
 }
 
 const TWOS_SETUP: &[&str] = &[

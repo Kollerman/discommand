@@ -41,8 +41,10 @@ pub enum AppEvent {
 }
 
 pub enum TodoMsg {
-    Synced(Vec<TaskList>, Vec<Task>),
+    Synced(Vec<TaskList>, Vec<Task>, Vec<todo::Page>),
     Error(String),
+    /// A whole list was read (or couldn't be).
+    Page(String, Result<todo::Page, String>),
     /// Login started: open this page and enter the code.
     DeviceCode(String, String),
     LoggedIn(todo::Creds),
@@ -255,15 +257,22 @@ impl Finder {
 /// Calendar ids of the tasks each task app shows in the calendar.
 const TODO_CAL: &str = "todo";
 const TWOS_CAL: &str = "twos";
+/// The sidebar section holding the lists without open to-dos.
+const MORE_LISTS: &str = "\u{1}more";
 
 /// A task tab: one task app's lists and tasks.
 #[derive(Default)]
 pub struct TaskTab {
     pub state: TodoState,
     api: Option<Backend>,
-    /// Task lists folded in the sidebar.
-    collapsed: HashSet<String>,
+    /// Task lists folded or unfolded in the sidebar (the opposite of how they start).
+    toggled: HashSet<String>,
+    /// "More lists" is unfolded.
+    more_open: bool,
     positioned: bool,
+    /// The list shown whole in the main pane (Twos), and its selected line.
+    page: Option<String>,
+    page_sel: Option<usize>,
 }
 
 impl TaskTab {
@@ -1140,7 +1149,7 @@ impl App {
         }
         self.spawn(async move {
             Some(AppEvent::Todo(s, match api.sync().await {
-                Ok((lists, tasks)) => TodoMsg::Synced(lists, tasks),
+                Ok((lists, tasks, pages)) => TodoMsg::Synced(lists, tasks, pages),
                 Err(e) => TodoMsg::Error(e),
             }))
         });
@@ -1148,13 +1157,22 @@ impl App {
 
     fn on_todo(&mut self, s: Service, msg: TodoMsg) {
         match msg {
-            TodoMsg::Synced(lists, tasks) => {
+            TodoMsg::Synced(lists, tasks, pages) => {
                 let st = &mut self.tab_mut(s).state;
                 st.syncing = false;
                 st.next_poll = Some(std::time::Instant::now() + todo::POLL);
-                st.apply(lists, tasks);
+                st.apply(lists, tasks, pages);
                 self.done_refreshing();
             }
+            TodoMsg::Page(list, page) => match page {
+                Ok(p) => {
+                    let st = &mut self.tab_mut(s).state;
+                    st.loading.remove(&list);
+                    st.pages.insert(list, p);
+                }
+                // Stays marked as loading, so it's tried again at the next sync, not on every redraw.
+                Err(e) => self.status = e,
+            },
             TodoMsg::Error(e) => {
                 let st = &mut self.tab_mut(s).state;
                 st.syncing = false;
@@ -1274,22 +1292,25 @@ impl App {
         let today = chrono::Local::now().date_naive();
         let mut items = Vec::new();
         let tab = self.tab(self.service);
-        for l in &tab.state.lists {
+        let list_item = |id: &str, depth: u16, label: String, expanded: bool| TreeItem {
+            kind: ItemKind::TodoList,
+            id: id.to_string(),
+            depth,
+            label,
+            unread: false,
+            mentions: 0,
+            expanded,
+            group: false,
+            color: None,
+            dim: false,
+        };
+        let name = |l: &TaskList| if l.emoji.is_empty() { l.name.clone() } else { format!("{} {}", l.emoji, l.name) };
+        let (top, more): (Vec<&TaskList>, Vec<&TaskList>) = tab.state.lists.iter().partition(|l| !l.more);
+        for l in top {
             let tasks: Vec<&Task> = tab.state.tasks.iter().filter(|t| t.list == l.id).collect();
             let open = tasks.iter().filter(|t| t.check && !t.done).count();
-            let shut = tab.collapsed.contains(&l.id);
-            items.push(TreeItem {
-                kind: ItemKind::TodoList,
-                id: l.id.clone(),
-                depth: 0,
-                label: if open > 0 { format!("{} ({open})", l.name) } else { l.name.clone() },
-                unread: false,
-                mentions: 0,
-                expanded: !shut,
-                group: false,
-                color: None,
-                dim: false,
-            });
+            let shut = l.folded != tab.toggled.contains(&l.id);
+            items.push(list_item(&l.id, 0, if open > 0 { format!("{} ({open})", name(l)) } else { name(l) }, !shut));
             if shut {
                 continue;
             }
@@ -1326,6 +1347,12 @@ impl App {
                 });
             }
         }
+        if !more.is_empty() {
+            items.push(list_item(MORE_LISTS, 0, format!("More lists ({})", more.len()), tab.more_open));
+            if tab.more_open {
+                items.extend(more.into_iter().map(|l| list_item(&l.id, 1, name(l), false)));
+            }
+        }
         self.tree = items;
         let positioned = self.tab(self.service).positioned;
         match sel_id.and_then(|id| self.tree.iter().position(|t| t.id == id)) {
@@ -1341,13 +1368,135 @@ impl App {
         self.set_tree_sel(sel);
     }
 
+    /// The selected task or line: in the whole list when the main pane has
+    /// focus, else in the sidebar.
     pub fn selected_task(&self) -> Option<&Task> {
+        if self.in_page() {
+            return self.page_task();
+        }
+        self.tree_task()
+    }
+
+    fn tree_task(&self) -> Option<&Task> {
         let item = self.tree.get(self.tree_sel()).filter(|t| matches!(t.kind, ItemKind::TodoTask | ItemKind::TodoNote))?;
         self.tasks().find(&item.id)
     }
 
+    /// The main pane (showing a whole list) has focus, or had it before typing.
+    pub fn in_page(&self) -> bool {
+        let pane = match self.focus {
+            Focus::Input | Focus::Command => self.last_pane,
+            f => f,
+        };
+        pane == Focus::Messages && self.page().is_some()
+    }
+
+    /// The whole list in the main pane (Twos), once read.
+    pub fn page(&self) -> Option<&todo::Page> {
+        let tab = self.tab(self.service);
+        tab.state.pages.get(tab.page.as_ref()?)
+    }
+
+    /// The main pane is waiting for its list.
+    pub fn page_loading(&self) -> bool {
+        let tab = self.tab(self.service);
+        tab.page.as_ref().is_some_and(|l| !tab.state.pages.contains_key(l))
+    }
+
+    pub fn page_sel(&self) -> Option<usize> {
+        self.tab(self.service).page_sel
+    }
+
+    fn page_task(&self) -> Option<&Task> {
+        self.page()?.lines.get(self.page_sel()?)
+    }
+
+    /// Keeps the main pane's list in step with the sidebar selection (while
+    /// the sidebar has focus) and reads it when it isn't loaded yet.
+    pub fn sync_page(&mut self) {
+        let s = self.service;
+        let Some(api) = self.tab(s).api.clone().filter(Backend::has_pages) else { return };
+        if !self.in_page() && self.focus != Focus::Input {
+            let item = self.tree.get(self.tree_sel());
+            let task = self.tree_task();
+            let list = match item.map(|t| t.kind) {
+                Some(ItemKind::TodoList) => item.map(|t| t.id.clone()).filter(|id| id != MORE_LISTS),
+                _ => task.map(|t| t.list.clone()),
+            };
+            let list = list.or_else(|| self.tasks().default_list().map(String::from));
+            let key = task.map(|t| t.key());
+            let tab = self.tab_mut(s);
+            tab.page_sel = key.and_then(|k| tab.state.pages.get(list.as_ref()?)?.lines.iter().position(|t| t.key() == k));
+            tab.page = list;
+        }
+        let tab = self.tab_mut(s);
+        let Some(list) = tab.page.clone() else { return };
+        if let Some(p) = tab.state.pages.get(&list) {
+            tab.page_sel = tab.page_sel.map(|i| i.min(p.lines.len().saturating_sub(1))).filter(|_| !p.lines.is_empty());
+            return;
+        }
+        if !tab.state.loading.insert(list.clone()) {
+            return;
+        }
+        self.spawn(async move {
+            let page = api.page(&list).await;
+            Some(AppEvent::Todo(s, TodoMsg::Page(list, page)))
+        });
+    }
+
+    /// Keys of the main pane while it shows a whole list.
+    fn page_key(&mut self, k: KeyEvent, pending: Option<char>, n: usize, counted: bool) {
+        let Some(len) = self.page().map(|p| p.lines.len()) else { return };
+        let last = len.saturating_sub(1);
+        let sel = self.page_sel();
+        let half = (self.msg_height / 2).max(1);
+        let down = |by: usize| sel.map_or(0, |i| (i + by).min(last));
+        let up = |by: usize| sel.map_or(0, |i| i.saturating_sub(by));
+        let to = match k.code {
+            KeyCode::Char('j') | KeyCode::Down => down(n),
+            KeyCode::Char('k') | KeyCode::Up => up(n),
+            KeyCode::Char('d') if is_ctrl(&k) => down(half),
+            KeyCode::Char('u') if is_ctrl(&k) => up(half),
+            KeyCode::PageDown => down(half * 2),
+            KeyCode::PageUp => up(half * 2),
+            KeyCode::Char('g') if pending == Some('g') => if counted { (n - 1).min(last) } else { 0 },
+            KeyCode::Char('g') => {
+                self.pending = Some('g');
+                return;
+            }
+            KeyCode::Char('G') | KeyCode::End => if counted { (n - 1).min(last) } else { last },
+            KeyCode::Home => 0,
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.focus = Focus::Tree;
+                return;
+            }
+            // A sub-list opens in place (h goes back to the sidebar's list); a link in the browser.
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('o') => {
+                let Some(t) = self.page_task() else { return };
+                if let Some(sub) = t.sublist.clone() {
+                    let tab = self.tab_mut(self.service);
+                    tab.page = Some(sub);
+                    tab.page_sel = Some(0);
+                } else if !t.url.is_empty() {
+                    let url = t.url.clone();
+                    if let Err(e) = open_url(&url) {
+                        self.status = format!("could not open {url}: {e}");
+                    }
+                }
+                return;
+            }
+            _ => return,
+        };
+        if len > 0 {
+            self.tab_mut(self.service).page_sel = Some(to);
+        }
+    }
+
     /// The list new tasks go to: the selected one, else the default list.
     fn target_list(&self) -> Option<String> {
+        if self.in_page() {
+            return self.page().map(|p| p.list.clone());
+        }
         let item = self.tree.get(self.tree_sel());
         match item.map(|t| t.kind) {
             Some(ItemKind::TodoList) => item.map(|t| t.id.clone()),
@@ -1362,9 +1511,9 @@ impl App {
     fn toggle_task(&mut self, s: Service, key: &str) {
         let tab = self.tab_mut(s);
         let Some(api) = tab.api.clone() else { return };
-        let Some(t) = tab.state.find_mut(key) else { return };
-        t.done = !t.done;
-        let (list, id, done, title) = (t.list.clone(), t.id.clone(), t.done, t.title.clone());
+        let Some(t) = tab.state.find(key) else { return };
+        let (list, id, done, title) = (t.list.clone(), t.id.clone(), !t.done, t.title.clone());
+        tab.state.set_done(key, done);
         self.show_tasks_in_cal();
         self.tree_dirty = true;
         self.spawn(async move {
@@ -1401,7 +1550,7 @@ impl App {
                 let s = self.service;
                 let (Some(api), Some(t)) = (self.tab(s).api.clone(), self.selected_task()) else { return true };
                 let (key, list, id, title) = (t.key(), t.list.clone(), t.id.clone(), t.title.clone());
-                self.tab_mut(s).state.tasks.retain(|t| t.key() != key);
+                self.tab_mut(s).state.remove(&key);
                 self.show_tasks_in_cal();
                 self.tree_dirty = true;
                 self.spawn(async move {
@@ -2150,6 +2299,19 @@ impl App {
 
     fn reveal_in_tree(&mut self, id: &str) {
         if self.service != Service::Discord {
+            if self.service.is_tasks() {
+                let list = self.tasks().find(id).map(|t| t.list.clone());
+                let (more, folded) = match self.tasks().lists.iter().find(|l| l.id == id) {
+                    Some(l) => (l.more, false),
+                    None => (false, self.tasks().lists.iter().any(|l| Some(&l.id) == list.as_ref() && l.folded)),
+                };
+                let tab = self.tab_mut(self.service);
+                tab.more_open |= more;
+                // A task in a folded list: unfold it.
+                if let Some(list) = list.filter(|_| folded) {
+                    tab.toggled.insert(list);
+                }
+            }
             self.rebuild_tree();
             if let Some(i) = self.tree.iter().position(|t| t.id == id) {
                 self.set_tree_sel(i);
@@ -2321,6 +2483,9 @@ impl App {
         if self.service.is_tasks() {
             for t in &self.tasks().tasks {
                 all.push((t.key(), format!("{} · {}", t.title, self.tasks().list_name(&t.list))));
+            }
+            for l in &self.tasks().lists {
+                all.push((l.id.clone(), format!("≡ {}", l.name)));
             }
         }
         if self.service == Service::Calendar {
@@ -2651,7 +2816,10 @@ impl App {
             _ => {}
         }
         if self.service.is_tasks() {
-            if !self.todo_key(k, pending) {
+            if self.todo_key(k, pending) {
+            } else if self.in_page() {
+                self.page_key(k, pending, n, count.is_some());
+            } else {
                 self.tree_key(k, pending, n, count.is_some());
             }
         } else if self.service == Service::Calendar {
@@ -2755,11 +2923,14 @@ impl App {
                     self.collapsed.insert(id);
                 }
             }
+            ItemKind::TodoList if id == MORE_LISTS => self.tab_mut(self.service).more_open = open,
             ItemKind::TodoList => {
-                if open {
-                    self.tab_mut(self.service).collapsed.remove(&id);
+                let folded = self.tasks().lists.iter().any(|l| l.id == id && l.folded);
+                let toggled = &mut self.tab_mut(self.service).toggled;
+                if open == folded {
+                    toggled.insert(id);
                 } else {
-                    self.tab_mut(self.service).collapsed.insert(id);
+                    toggled.remove(&id);
                 }
             }
             _ => return,
