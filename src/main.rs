@@ -103,7 +103,7 @@ async fn finish_login(token: String) -> Result<String, String> {
     let me = api.me().await?;
     println!("Logged in as {}.", me.name());
     match secret::save_token(&token) {
-        Ok(p) => println!("Token saved (encrypted on Windows) to {}", p.display()),
+        Ok(place) => println!("Token saved to {place}"),
         Err(e) => eprintln!("warning: could not save token: {e}"),
     }
     Ok(token)

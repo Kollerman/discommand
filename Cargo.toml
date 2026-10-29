@@ -57,6 +57,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # DPAPI token encryption, EFS folder encryption, and telling left from right Shift.
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_UI_Input_KeyboardAndMouse"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Logins are kept in the login Keychain.
+security-framework = "3"
+
 [profile.release]
 opt-level = 3
 lto = true

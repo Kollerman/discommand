@@ -3,6 +3,9 @@
 //! - Windows: the Discord token is encrypted with DPAPI (bound to the Windows
 //!   user account), and the data and cache folders are marked for EFS
 //!   encryption, so the WhatsApp session database is encrypted too.
+//! - macOS: logins are stored in the login Keychain (encrypted, unlocked
+//!   with the user's login). Files are the fallback if the Keychain refuses,
+//!   e.g. when it's locked in an SSH session.
 //! - Elsewhere: files are readable by the owner only (0600 / 0700).
 
 use std::fs;
@@ -51,8 +54,24 @@ fn secret_path(name: &str) -> Option<PathBuf> {
     data_dir().map(|d| d.join(file))
 }
 
-/// Stores a secret: DPAPI-encrypted on Windows, owner-only elsewhere.
-pub fn save_secret(name: &str, data: &[u8]) -> io::Result<PathBuf> {
+/// Stores a secret: in the Keychain on macOS, DPAPI-encrypted on Windows,
+/// owner-only elsewhere. Returns where it went.
+pub fn save_secret(name: &str, data: &[u8]) -> io::Result<String> {
+    #[cfg(target_os = "macos")]
+    match keychain::set(name, data) {
+        Ok(()) => {
+            // Don't leave an older copy on disk.
+            if let Some(p) = secret_path(name) {
+                wipe(&p);
+            }
+            return Ok("the macOS Keychain".into());
+        }
+        Err(e) => eprintln!("warning: Keychain unavailable ({e}); saving to a file instead"),
+    }
+    save_file(name, data).map(|p| p.display().to_string())
+}
+
+fn save_file(name: &str, data: &[u8]) -> io::Result<PathBuf> {
     let path = secret_path(name).ok_or_else(|| io::Error::other("no config directory"))?;
     create_private_dir(path.parent().unwrap())?;
     #[cfg(windows)]
@@ -62,13 +81,25 @@ pub fn save_secret(name: &str, data: &[u8]) -> io::Result<PathBuf> {
 }
 
 pub fn load_secret(name: &str) -> Option<Vec<u8>> {
-    let data = fs::read(secret_path(name)?).ok()?;
+    #[cfg(target_os = "macos")]
+    if let Some(data) = keychain::get(name) {
+        return Some(data);
+    }
+    let path = secret_path(name)?;
+    let data = fs::read(&path).ok()?;
     #[cfg(windows)]
     let data = dpapi::unprotect(&data)?;
+    // A file from an older version (or a Keychain fallback): move it in.
+    #[cfg(target_os = "macos")]
+    if keychain::set(name, &data).is_ok() {
+        wipe(&path);
+    }
     Some(data)
 }
 
 pub fn remove_secret(name: &str) {
+    #[cfg(target_os = "macos")]
+    keychain::delete(name);
     if let Some(p) = secret_path(name) {
         wipe(&p);
     }
@@ -88,7 +119,7 @@ pub fn load_token() -> Option<String> {
     Some(token)
 }
 
-pub fn save_token(token: &str) -> io::Result<PathBuf> {
+pub fn save_token(token: &str) -> io::Result<String> {
     save_secret("token", token.as_bytes())
 }
 
@@ -108,6 +139,26 @@ pub fn protect_dirs() {
         if create_private_dir(&dir).is_ok() {
             efs::encrypt_tree(&dir);
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod keychain {
+    use security_framework::passwords::{delete_generic_password, get_generic_password, set_generic_password};
+
+    /// Each secret is a generic password of this service, named by its account.
+    const SERVICE: &str = "discommand";
+
+    pub fn get(name: &str) -> Option<Vec<u8>> {
+        get_generic_password(SERVICE, name).ok()
+    }
+
+    pub fn set(name: &str, data: &[u8]) -> Result<(), String> {
+        set_generic_password(SERVICE, name, data).map_err(|e| e.to_string())
+    }
+
+    pub fn delete(name: &str) {
+        let _ = delete_generic_password(SERVICE, name);
     }
 }
 
