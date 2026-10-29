@@ -1,27 +1,60 @@
-# Builds and tests discommand on every supported platform. Runs without
-# keys/keys.env, so it never needs (or sees) the publisher's app IDs.
+# Checks discommand. Runs without keys/keys.env, so it never needs (or sees)
+# the publisher's app IDs.
+#
+# - Every push to master and every pull request: one quick Linux job (tests,
+#   each integration on its own, the WhatsApp helper). Changes to docs only
+#   don't start it.
+# - Releases (tags v*) and manual runs ("Run workflow" on the Actions tab):
+#   optimised builds on all six platforms.
 name: build
 
 on:
   push:
+    branches: [master, main]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "keys/**", "LICENSE"]
   pull_request:
+    paths-ignore: ["**.md", "keys/**", "LICENSE"]
+  release:
+    types: [published]
   workflow_dispatch:
 
+# A newer push cancels the run still going for the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # Each integration must also build on its own.
-  features:
-    name: Only ${{ matrix.feature }}
+  check:
+    name: Tests (Linux)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        feature: [discord, whatsapp, matrix, calendar, todo, twos]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --release --no-default-features --features native-tls,${{ matrix.feature }}
+      # Reuses compiled dependencies between runs: minutes instead of a quarter hour.
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: wa/go.mod
+          cache-dependency-path: wa/go.sum
+
+      - name: Test (Rust, all integrations)
+        run: cargo test
+      - name: Each integration on its own
+        run: |
+          for f in discord whatsapp matrix calendar todo twos; do
+            echo "::group::$f"
+            cargo check --no-default-features --features native-tls,$f
+            echo "::endgroup::"
+          done
+      - name: Test (Go)
+        working-directory: wa
+        run: go test ./...
 
   build:
+    # Only for releases and manual runs.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: check
     strategy:
       fail-fast: false
       matrix:
@@ -39,21 +72,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: wa/go.mod
           cache-dependency-path: wa/go.sum
 
-      - name: Test (Rust)
-        if: ${{ !matrix.target }}
-        run: cargo test --release
       - name: Build (Rust)
         shell: bash
         run: cargo build --release ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
-
-      - name: Test (Go)
-        working-directory: wa
-        run: go test ./...
       - name: Build (Go)
         working-directory: wa
         env:

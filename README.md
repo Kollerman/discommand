@@ -499,7 +499,7 @@ Each integration is a Cargo feature and a tab:
    A task app only needs a `todo::Backend` variant (see `src/twos.rs`); the task
    tab, calendar entries and reminders come with it.
 4. Add the name to `all=` in `install.sh`, to the table above and to the
-   `features` job in `.github/workflows/build.yml`.
+   integration loop in `.github/workflows/build.yml`.
 Remember that both services' terms forbid unofficial clients, and say so to your users.
 
 ## Troubleshooting
