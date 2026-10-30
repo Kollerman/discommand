@@ -3,13 +3,13 @@
 # Works on Linux, macOS and Termux. Re-run after changes to update.
 #
 #   sh install.sh                          asks which integrations to build
-#   sh install.sh --with discord,calendar  only these: discord, whatsapp, matrix, calendar, todo, twos
+#   sh install.sh --with discord,calendar  only these: discord, whatsapp, matrix, calendar, todo, twos, moodle
 #   sh install.sh --with all               back to all of them
 set -e
 cd "$(dirname "$0")"
 
 # Every integration (the default features in Cargo.toml).
-all="discord,whatsapp,matrix,calendar,todo,twos"
+all="discord,whatsapp,matrix,calendar,todo,twos,moodle"
 with=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,7 +35,7 @@ if [ -z "$with" ]; then
         with="$last"
     else
         while [ -z "$with" ]; do
-            for name in discord whatsapp matrix calendar todo twos; do
+            for name in discord whatsapp matrix calendar todo twos moodle; do
                 case $name in
                     discord) label="Discord" ;;
                     whatsapp) label="WhatsApp (needs Go)" ;;
@@ -43,6 +43,7 @@ if [ -z "$with" ]; then
                     calendar) label="Google Calendar" ;;
                     todo) label="Microsoft To Do" ;;
                     twos) label="Twos" ;;
+                    moodle) label="Moodle (university / school)" ;;
                 esac
                 ask "  $label" && with="${with:+$with,}$name"
             done
@@ -68,7 +69,7 @@ bin="${CARGO_HOME:-$HOME/.cargo}/bin"
 if [ -n "$with" ]; then
     echo "Integrations: $with"
 else
-    echo "Integrations: all (choose with --with discord,whatsapp,matrix,calendar,todo,twos)"
+    echo "Integrations: all (choose with --with discord,whatsapp,matrix,calendar,todo,twos,moodle)"
 fi
 if [ -f keys/keys.env ]; then
     echo "Building with keys/keys.env (one-step Google/Microsoft sign-in)."

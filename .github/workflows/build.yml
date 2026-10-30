@@ -42,7 +42,7 @@ jobs:
         run: cargo test
       - name: Each integration on its own
         run: |
-          for f in discord whatsapp matrix calendar todo twos; do
+          for f in discord whatsapp matrix calendar todo twos moodle; do
             echo "::group::$f"
             cargo check --no-default-features --features native-tls,$f
             echo "::endgroup::"

@@ -16,6 +16,7 @@ use tokio::sync::Semaphore;
 use crate::api::Api;
 use crate::cal::{self, CalState, Creds, Google, Synced};
 use crate::todo::{self, Backend, Task, TaskList, Todo, TodoState};
+use crate::moodle::{self, Moodle};
 use crate::twos::{self, Twos};
 use crate::gateway::GwEvent;
 use crate::model::*;
@@ -52,6 +53,8 @@ pub enum TodoMsg {
     LoggedIn(todo::Creds),
     /// A task changed; the text is shown, and `true` re-syncs.
     Changed(String, bool),
+    /// A file linked from a page was downloaded (its path), to be opened.
+    File(Result<String, String>),
 }
 
 pub enum CalMsg {
@@ -82,6 +85,7 @@ pub enum Service {
     Calendar,
     Tasks,
     Twos,
+    Moodle,
 }
 
 impl Service {
@@ -101,6 +105,8 @@ impl Service {
         Service::Tasks,
         #[cfg(feature = "twos")]
         Service::Twos,
+        #[cfg(feature = "moodle")]
+        Service::Moodle,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -126,6 +132,7 @@ impl Service {
             Service::Calendar => "Google Calendar",
             Service::Tasks => "Microsoft To Do",
             Service::Twos => "Twos",
+            Service::Moodle => "Moodle",
         }
     }
 
@@ -141,7 +148,7 @@ impl Service {
 
     /// A task tab (one task app each, see `TaskTab`).
     pub fn is_tasks(self) -> bool {
-        matches!(self, Service::Tasks | Service::Twos)
+        matches!(self, Service::Tasks | Service::Twos | Service::Moodle)
     }
 }
 
@@ -259,6 +266,7 @@ impl Finder {
 /// Calendar ids of the tasks each task app shows in the calendar.
 const TODO_CAL: &str = "todo";
 const TWOS_CAL: &str = "twos";
+const MOODLE_CAL: &str = "moodle";
 /// The sidebar section holding the lists without open to-dos.
 const MORE_LISTS: &str = "\u{1}more";
 
@@ -325,6 +333,7 @@ pub struct App {
     /// The task tabs.
     pub todo: TaskTab,
     pub twos: TaskTab,
+    pub moodle: TaskTab,
 
     pub focus: Focus,
     /// Pane to return to when leaving insert/command mode.
@@ -415,6 +424,9 @@ impl App {
                     .filter(|c| Service::Tasks.built() && !c.refresh_token.is_empty())
                     .map(|c| Backend::Microsoft(Arc::new(Todo::new(c)))),
             ),
+            moodle: TaskTab::new(
+                moodle::Creds::load().filter(|_| Service::Moodle.built()).map(|c| Backend::Moodle(Arc::new(Moodle::new(c)))),
+            ),
             twos: TaskTab::new(twos::load_key().filter(|_| Service::Twos.built()).map(|k| Backend::Twos(Arc::new(Twos::new(k))))),
             focus: Focus::Tree,
             last_pane: Focus::Tree,
@@ -503,7 +515,7 @@ impl App {
         match self.service {
             Service::Discord => self.current.as_deref(),
             Service::WhatsApp | Service::Matrix => self.open_of(self.service).as_deref(),
-            Service::Calendar | Service::Tasks | Service::Twos => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
         }
     }
 
@@ -511,7 +523,7 @@ impl App {
         match self.service {
             Service::Discord => self.state.channel_title(id),
             Service::WhatsApp | Service::Matrix => self.chats(self.service).title(id),
-            Service::Calendar | Service::Tasks | Service::Twos => String::new(),
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => String::new(),
         }
     }
 
@@ -519,7 +531,7 @@ impl App {
         match self.service {
             Service::Discord => self.current_messages().iter().find(|m| m.id == id).map(|m| m.author.name().to_string()),
             Service::WhatsApp | Service::Matrix => self.wa_messages().iter().find(|m| m.id == id).map(|m| m.sender_name.clone()),
-            Service::Calendar | Service::Tasks | Service::Twos => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
         }
     }
 
@@ -531,6 +543,7 @@ impl App {
             Service::Calendar => format!("c:{id}"),
             Service::Tasks => format!("t:{id}"),
             Service::Twos => format!("2:{id}"),
+            Service::Moodle => format!("md:{id}"),
         }
     }
 
@@ -568,7 +581,7 @@ impl App {
         match self.service {
             Service::Discord => self.loading.contains(id),
             Service::WhatsApp | Service::Matrix => self.chats(self.service).loading.contains(id),
-            Service::Calendar | Service::Tasks | Service::Twos => false,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => false,
         }
     }
 
@@ -576,7 +589,7 @@ impl App {
         match self.service {
             Service::Discord => self.state.complete.contains(id),
             Service::WhatsApp | Service::Matrix => self.chats(self.service).complete.contains(id),
-            Service::Calendar | Service::Tasks | Service::Twos => false,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => false,
         }
     }
 
@@ -584,7 +597,7 @@ impl App {
         match self.service {
             Service::Discord => self.state.view_messages(id),
             Service::WhatsApp | Service::Matrix => self.chats(self.service).view_messages(id),
-            Service::Calendar | Service::Tasks | Service::Twos => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
         }
     }
 
@@ -600,7 +613,7 @@ impl App {
         match self.service {
             Service::Discord => self.current_messages().len(),
             Service::WhatsApp | Service::Matrix => self.wa_messages().len(),
-            Service::Calendar | Service::Tasks | Service::Twos => 0,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => 0,
         }
     }
 
@@ -611,7 +624,7 @@ impl App {
                 self.current_messages().iter().rposition(|m| &m.author.id == me)
             }
             Service::WhatsApp | Service::Matrix => self.wa_messages().iter().rposition(|m| m.from_me && !m.deleted),
-            Service::Calendar | Service::Tasks | Service::Twos => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
         }
     }
 
@@ -619,7 +632,7 @@ impl App {
         match self.service {
             Service::Discord => self.selected_message().map(|m| m.id.clone()),
             Service::WhatsApp | Service::Matrix => self.wa_messages().get(self.msg_sel?).map(|m| m.id.clone()),
-            Service::Calendar | Service::Tasks | Service::Twos => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
         }
     }
 
@@ -637,7 +650,7 @@ impl App {
         match self.service {
             Service::WhatsApp | Service::Matrix => return self.rebuild_wa_tree(),
             Service::Calendar => return self.rebuild_cal_tree(),
-            Service::Tasks | Service::Twos => return self.rebuild_todo_tree(),
+            Service::Tasks | Service::Twos | Service::Moodle => return self.rebuild_todo_tree(),
             Service::Discord => {}
         }
         let sel_key = self.tree.get(self.tree_sel()).map(|t| (t.kind, t.id.clone()));
@@ -850,18 +863,18 @@ impl App {
     }
 
     fn tab(&self, s: Service) -> &TaskTab {
-        if s == Service::Twos {
-            &self.twos
-        } else {
-            &self.todo
+        match s {
+            Service::Twos => &self.twos,
+            Service::Moodle => &self.moodle,
+            _ => &self.todo,
         }
     }
 
     fn tab_mut(&mut self, s: Service) -> &mut TaskTab {
-        if s == Service::Twos {
-            &mut self.twos
-        } else {
-            &mut self.todo
+        match s {
+            Service::Twos => &mut self.twos,
+            Service::Moodle => &mut self.moodle,
+            _ => &mut self.todo,
         }
     }
 
@@ -877,22 +890,30 @@ impl App {
     /// Open tasks due today or earlier, in all task apps.
     pub fn due_tasks(&self) -> usize {
         let today = chrono::Local::now().date_naive();
-        self.todo.state.due_count(today) + self.twos.state.due_count(today)
+        self.todo.state.due_count(today) + self.twos.state.due_count(today) + self.moodle.state.due_count(today)
     }
 
     /// Shows the dated tasks of all task apps in the calendar.
     fn show_tasks_in_cal(&mut self) {
         let mut events = self.todo.state.as_events(TODO_CAL);
         events.extend(self.twos.state.as_events(TWOS_CAL));
-        self.cal.set_tasks(events, &[(TODO_CAL, "Microsoft To Do", [37, 100, 207]), (TWOS_CAL, "Twos", [235, 140, 50])]);
+        events.extend(self.moodle.state.as_events(MOODLE_CAL));
+        let moodle = match &self.moodle.api {
+            Some(Backend::Moodle(m)) => m.site_name().to_string(),
+            _ => "Moodle".into(),
+        };
+        self.cal.set_tasks(
+            events,
+            &[(TODO_CAL, "Microsoft To Do", [37, 100, 207]), (TWOS_CAL, "Twos", [235, 140, 50]), (MOODLE_CAL, &moodle, [249, 128, 18])],
+        );
     }
 
     /// The task tab a task shown in the calendar comes from.
     fn task_service(cal: &str) -> Service {
-        if cal == TWOS_CAL {
-            Service::Twos
-        } else {
-            Service::Tasks
+        match cal {
+            TWOS_CAL => Service::Twos,
+            MOODLE_CAL => Service::Moodle,
+            _ => Service::Tasks,
         }
     }
 
@@ -1122,7 +1143,7 @@ impl App {
         if self.cal.next_poll.is_some_and(|t| t <= std::time::Instant::now()) {
             self.cal_sync();
         }
-        for s in [Service::Tasks, Service::Twos] {
+        for s in [Service::Tasks, Service::Twos, Service::Moodle] {
             let tasks: Vec<String> = self.tab_mut(s).state.due_reminders(now).into_iter().map(|t| format!("☐ {}", t.title)).collect();
             if !tasks.is_empty() {
                 self.status = format!("⏰ {}: {}", s.name(), tasks.join(" · "));
@@ -1158,14 +1179,21 @@ impl App {
     }
 
     fn on_todo(&mut self, s: Service, msg: TodoMsg) {
+        let poll = self.tab(s).api.as_ref().map_or(todo::POLL, Backend::poll);
         match msg {
             TodoMsg::Synced(lists, tasks, pages) => {
                 let st = &mut self.tab_mut(s).state;
                 st.syncing = false;
-                st.next_poll = Some(std::time::Instant::now() + todo::POLL);
+                st.next_poll = Some(std::time::Instant::now() + poll);
                 st.apply(lists, tasks, pages);
                 self.done_refreshing();
             }
+            TodoMsg::File(Ok(path)) => match open_file(&path) {
+                Ok(true) => self.status = format!("opened {path}"),
+                Ok(false) => self.status = format!("saved {path}; not opened because this file type can run code"),
+                Err(e) => self.status = format!("could not open {path}: {e}"),
+            },
+            TodoMsg::File(Err(e)) => self.status = e,
             TodoMsg::Page(list, page) => match page {
                 Ok(p) => {
                     let st = &mut self.tab_mut(s).state;
@@ -1179,7 +1207,7 @@ impl App {
                 let st = &mut self.tab_mut(s).state;
                 st.syncing = false;
                 st.login = None;
-                st.next_poll = Some(std::time::Instant::now() + todo::POLL);
+                st.next_poll = Some(std::time::Instant::now() + poll);
                 st.status = "sync failed".into();
                 self.status = e;
             }
@@ -1256,6 +1284,21 @@ impl App {
             }
             "refresh" | "sync" | "" => self.todo_sync(Service::Tasks),
             _ => self.status = "usage: :todo setup <client id> · :todo login · :todo logout · :todo refresh".into(),
+        }
+    }
+
+    fn moodle_command(&mut self, arg: &str) {
+        match arg {
+            "logout" => {
+                moodle::Creds::remove();
+                self.moodle = TaskTab::default();
+                self.show_tasks_in_cal();
+                self.tree_dirty = true;
+                self.status = "Moodle disconnected".into();
+            }
+            "refresh" | "sync" | "" => self.todo_sync(Service::Moodle),
+            "login" => self.status = "sign in from a terminal: discommand --moodle-login (the password is typed hidden)".into(),
+            _ => self.status = "usage: :moodle refresh · :moodle logout (log in: discommand --moodle-login)".into(),
         }
     }
 
@@ -1472,10 +1515,19 @@ impl App {
                 self.focus = Focus::Tree;
                 return;
             }
-            // A sub-list opens in place (h goes back to the sidebar's list); a link in the browser.
+            // A sub-list opens in place (h goes back to the sidebar's list), a
+            // file downloads and opens, a link goes to the browser; o always
+            // goes to the browser when there's a link.
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('o') => {
                 let Some(t) = self.page_task() else { return };
-                if let Some(sub) = t.sublist.clone() {
+                let browser = k.code == KeyCode::Char('o') && !t.url.is_empty();
+                let file = t.sublist.as_deref().and_then(|s| s.strip_prefix(moodle::FILE)).map(String::from);
+                if let (Some(url), false) = (file, browser) {
+                    let s = self.service;
+                    let Some(api) = self.tab(s).api.clone() else { return };
+                    self.status = format!("downloading {}…", t.title);
+                    self.spawn(async move { Some(AppEvent::Todo(s, TodoMsg::File(api.download(&url).await))) });
+                } else if let (Some(sub), false) = (t.sublist.clone(), browser) {
                     let tab = self.tab_mut(self.service);
                     tab.page = Some(sub);
                     tab.page_sel = Some(0);
@@ -1527,6 +1579,13 @@ impl App {
     }
 
     fn todo_key(&mut self, k: KeyEvent, pending: Option<char>) -> bool {
+        // Read-only backends (Moodle): no adding, editing or deleting.
+        let editable = self.tab(self.service).api.as_ref().is_none_or(Backend::editable);
+        let edit_key = matches!(k.code, KeyCode::Char('n' | 'i' | 'a' | 'e' | 'c')) || (k.code == KeyCode::Char('d') && !is_ctrl(&k));
+        if !editable && edit_key {
+            self.status = todo::READ_ONLY.into();
+            return true;
+        }
         match k.code {
             KeyCode::Char('n') | KeyCode::Char('i') | KeyCode::Char('a') => {
                 if !self.tasks_connected() {
@@ -1989,7 +2048,7 @@ impl App {
                 }
                 self.cal_sync();
             }
-            Service::Tasks | Service::Twos => {
+            Service::Tasks | Service::Twos | Service::Moodle => {
                 if !self.tasks_connected() {
                     self.status = format!("{} isn't connected (see the right pane)", self.service.name());
                     return;
@@ -2080,7 +2139,7 @@ impl App {
     }
 
     fn fetch_older(&mut self) {
-        if matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos) {
+        if matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle) {
             return;
         }
         if self.service.is_wa_like() {
@@ -2260,7 +2319,7 @@ impl App {
                 self.cal_select(&id);
                 self.focus = Focus::Tree;
             }
-            Service::Tasks | Service::Twos => self.focus = Focus::Tree,
+            Service::Tasks | Service::Twos | Service::Moodle => self.focus = Focus::Tree,
         }
     }
 
@@ -2302,7 +2361,7 @@ impl App {
                     self.mark_read(&ch);
                 }
             }
-            Service::Calendar | Service::Tasks | Service::Twos => {}
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => {}
         }
         if self.current_chat().is_none() && self.focus != Focus::Tree {
             self.focus = Focus::Tree;
@@ -2469,7 +2528,7 @@ impl App {
                 .wa_messages()
                 .get(idx)
                 .map(|m| (m.from_me && m.kind == "text" && !m.deleted, m.id.clone(), m.text.clone())),
-            Service::Calendar | Service::Tasks | Service::Twos => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
         };
         let Some((own, id, content)) = found else { return };
         if !own {
@@ -2550,7 +2609,7 @@ impl App {
                     }
                 }
             }
-            "wa" | "mx" | "matrix" | "cal" | "calendar" | "todo" | "tasks" | "twos" if !Self::command_service(name).built() => {
+            "wa" | "mx" | "matrix" | "cal" | "calendar" | "todo" | "tasks" | "twos" | "moodle" if !Self::command_service(name).built() => {
                 self.status = format!("{} isn't part of this build", Self::command_service(name).name());
             }
             "wa" | "mx" | "matrix" => {
@@ -2569,6 +2628,7 @@ impl App {
             "cal" | "calendar" => self.cal_command(arg),
             "todo" | "tasks" => self.todo_command(arg),
             "twos" => self.twos_command(arg),
+            "moodle" => self.moodle_command(arg),
             "images" | "img" => {
                 self.pics.enabled = match arg {
                     "on" => true,
@@ -2649,6 +2709,7 @@ impl App {
             "mx" | "matrix" => Service::Matrix,
             "cal" | "calendar" => Service::Calendar,
             "twos" => Service::Twos,
+            "moodle" => Service::Moodle,
             _ => Service::Tasks,
         }
     }
@@ -2874,7 +2935,7 @@ impl App {
                 self.read_all(&[self.service]);
                 return;
             }
-            KeyCode::Char('i') | KeyCode::Char('a') if !matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos) => {
+            KeyCode::Char('i') | KeyCode::Char('a') if !matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle) => {
                 if self.current_chat().is_some() {
                     self.enter_insert();
                 } else {
@@ -3113,7 +3174,7 @@ impl App {
                 let cmd = json!({"c": "react", "chat": m.chat, "id": m.id, "text": emoji});
                 wa::send(self.cmd_of(self.service), cmd);
             }
-            Service::Calendar | Service::Tasks | Service::Twos => {}
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => {}
         }
     }
 
@@ -3130,7 +3191,7 @@ impl App {
                 let cmd = json!({"c": "delete", "chat": m.chat, "id": m.id});
                 wa::send(self.cmd_of(self.service), cmd);
             }
-            Service::Calendar | Service::Tasks | Service::Twos => {}
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => {}
         }
     }
 

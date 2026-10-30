@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 
 use crate::cal::{self, local_midnight};
 use crate::secret;
+use crate::moodle::Moodle;
 use crate::twos::Twos;
 
 const AUTH: &str = "https://login.microsoftonline.com/common/oauth2/v2.0";
@@ -459,11 +460,15 @@ impl Todo {
 
 // ---- backends ------------------------------------------------------------------
 
+pub const READ_ONLY: &str = "Moodle is read-only here: x ticks a deadline off, Enter opens it in the browser";
+
 /// The service behind a task tab. A new task app is another variant here.
 #[derive(Clone)]
 pub enum Backend {
     Microsoft(Arc<Todo>),
     Twos(Arc<Twos>),
+    /// Read-only: courses and deadlines (deadlines can be ticked off).
+    Moodle(Arc<Moodle>),
 }
 
 impl Backend {
@@ -472,18 +477,41 @@ impl Backend {
         match self {
             Backend::Microsoft(t) => t.sync().await.map(|(lists, tasks)| (lists, tasks, Vec::new())),
             Backend::Twos(t) => t.sync().await,
+            Backend::Moodle(m) => m.sync().await,
         }
+    }
+
+    /// How often it's synced while the app runs.
+    pub fn poll(&self) -> Duration {
+        match self {
+            Backend::Moodle(m) => m.poll(),
+            _ => POLL,
+        }
+    }
+
+    /// Whether tasks can be added, edited and deleted (not just ticked off).
+    pub fn editable(&self) -> bool {
+        !matches!(self, Backend::Moodle(_))
     }
 
     /// Whether the main pane shows whole lists (`page`) rather than task details.
     pub fn has_pages(&self) -> bool {
-        matches!(self, Backend::Twos(_))
+        matches!(self, Backend::Twos(_) | Backend::Moodle(_))
     }
 
     pub async fn page(&self, list: &str) -> Result<Page, String> {
         match self {
             Backend::Microsoft(_) => Err("To Do lists have no pages".into()),
             Backend::Twos(t) => t.page(list).await,
+            Backend::Moodle(m) => m.page(list).await,
+        }
+    }
+
+    /// Downloads a file linked from a page; returns where it was saved.
+    pub async fn download(&self, url: &str) -> Result<String, String> {
+        match self {
+            Backend::Moodle(m) => m.download(url).await,
+            _ => Err("nothing to download".into()),
         }
     }
 
@@ -492,6 +520,7 @@ impl Backend {
         match self {
             Backend::Microsoft(t) => t.create(list, text).await,
             Backend::Twos(t) => t.create(list, text).await,
+            Backend::Moodle(_) => Err(READ_ONLY.into()),
         }
     }
 
@@ -499,6 +528,7 @@ impl Backend {
         match self {
             Backend::Microsoft(t) => t.update(list, id, text).await,
             Backend::Twos(t) => t.update(id, text).await,
+            Backend::Moodle(_) => Err(READ_ONLY.into()),
         }
     }
 
@@ -506,6 +536,7 @@ impl Backend {
         match self {
             Backend::Microsoft(t) => t.set_done(list, id, done).await,
             Backend::Twos(t) => t.set_done(id, done).await,
+            Backend::Moodle(m) => m.set_done(id, done).await,
         }
     }
 
@@ -513,6 +544,7 @@ impl Backend {
         match self {
             Backend::Microsoft(t) => t.delete(list, id).await,
             Backend::Twos(t) => t.delete(id).await,
+            Backend::Moodle(_) => Err(READ_ONLY.into()),
         }
     }
 }

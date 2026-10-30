@@ -170,6 +170,7 @@ sh install.sh --with discord,calendar          # Linux, macOS
 | `calendar` | Google Calendar |
 | `todo` | Microsoft To Do |
 | `twos` | Twos |
+| `moodle` | Moodle (any university or school site) |
 
 Integrations that aren't built in are left out of the program completely: no tab, no
 login at startup, no background activity. `--with all` (or `-With all`) builds
@@ -446,6 +447,50 @@ In the sidebar, a to-do outside Today whose reminder has passed shows without a 
 1000 API requests an hour: the first sync reads all your lists (a few seconds), later
 ones take a few requests every 10 minutes, and each list shown is read once per sync.
 
+## Moodle
+
+Moodle is the last mode and works with any Moodle site. Connect it once from a
+terminal:
+
+```sh
+discommand --moodle-login
+```
+
+It asks for the site (e.g. `elearning.uni-regensburg.de`), your user name and your
+password (hidden).
+
+- **Sidebar:** **Deadlines** first (assignments, quizzes and the like from the last
+  two weeks on, overdue ones in red), then your current courses.
+- **Main pane:** a course opens as a page of its sections and activities.
+- **Enter on an activity opens it here,** as a page of its content. Forums, folders,
+  assignments and pages show their text and links. A link to another Moodle page
+  (e.g. a forum discussion) opens the next page, a file (PDF, slides …) downloads and
+  opens, and an outside link goes to the browser. `o` always opens the selected thing
+  in the browser (e.g. to take a quiz or hand something in), and `h` goes back.
+- **Calendar:** deadlines also show there, with a bell a day ahead.
+- **Read-only:** `x` ticks off activities that are completed by hand. Handing in and
+  the like stays in Moodle.
+
+**How it signs in** depends on the site:
+
+- **The site allows the official Moodle app:** discommand uses the same access. The
+  password is used once and only a key is kept.
+- **Moodle has its own login form:** discommand signs in like a browser and uses the
+  same interface Moodle's pages use. The password is stored encrypted, to sign in
+  again when the session ends.
+- **The university's own login page (single sign-on, as on GRIPS in Regensburg):**
+  discommand goes through that login like a browser. It passes the forwarding
+  pages, puts your user name and password into the university's login form, and
+  follows the redirects back to Moodle. The password is stored encrypted, and
+  discommand signs in again by itself whenever Moodle's session ends. If a site
+  asks for a one-time code (two-factor) or has an unusual login page,
+  `--moodle-login` falls back to logging in in the browser: you copy its
+  `MoodleSession` cookie once (F12 → Application/Storage → Cookies), and
+  discommand keeps that session alive while it runs.
+
+`:moodle logout` removes the login, and `:moodle refresh` (or `r`)
+syncs now; otherwise it syncs every 30 minutes.
+
 ## Publishing a release
 
 To let other people sign in to Google and Microsoft with nothing but their account,
@@ -507,5 +552,7 @@ Remember that both services' terms forbid unofficial clients, and say so to your
 ## Troubleshooting
 
 - `DISCOMMAND_WA_LOG=path` makes the WhatsApp helper write a debug log.
+- `DISCOMMAND_MOODLE_LOG=path` logs each step of a university (single sign-on) Moodle
+  login: addresses and form field names, never values or passwords.
 - "client version rejected": update whatsmeow (`cd wa && go get go.mau.fi/whatsmeow@latest`)
   and re-run the install script.

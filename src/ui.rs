@@ -227,6 +227,7 @@ fn draw_input(f: &mut Frame, app: &App, input: Rect) {
             Service::Calendar => "› press n to add an event",
             Service::Twos => "› n new · x done · e edit · dd delete · ⇥ list pane · ⏎ open sub-list",
             Service::Tasks => "› n new task · x done · e edit · dd delete",
+            Service::Moodle => "› ⏎ open here (files download) · o browser · h back · x tick off · r refresh",
             _ => "› press i to type",
         };
         f.render_widget(Paragraph::new(Line::from(Span::styled(hint, DIM))), inner);
@@ -284,6 +285,7 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
     } else if !app.tasks_connected() && app.tasks().status.is_empty() {
         let steps: &[&str] = match app.service {
             Service::Twos => TWOS_SETUP,
+            Service::Moodle => MOODLE_SETUP,
             _ if crate::todo::builtin_client_id().is_some() => TODO_SIGN_IN,
             _ => TODO_SETUP,
         };
@@ -424,6 +426,19 @@ fn draw_page(f: &mut Frame, app: &App, area: Rect) {
     let top = if sel_rows.end + 2 > h { (sel_rows.end + 2 - h).min(sel_rows.start) } else { 0 };
     f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), col);
 }
+
+const MOODLE_SETUP: &[&str] = &[
+    "Connect Moodle (any university or school):",
+    "",
+    "Quit, then run in a terminal:   discommand --moodle-login",
+    "It asks for the site (e.g. elearning.uni-regensburg.de), your user",
+    "name and password. Where the site allows the Moodle app, only a",
+    "key is kept; otherwise the password is stored encrypted, to sign in",
+    "again when Moodle's session ends.",
+    "",
+    "Then: your current courses and upcoming deadlines (also in the",
+    "calendar, with a reminder a day ahead). :moodle logout removes it.",
+];
 
 const TWOS_SETUP: &[&str] = &[
     "Connect Twos:",
@@ -865,6 +880,7 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
         Service::Calendar => (" CALENDAR ", Color::Yellow),
         Service::Tasks => (" TASKS ", Color::LightBlue),
         Service::Twos => (" TWOS ", Color::Indexed(209)),
+        Service::Moodle => (" MOODLE ", Color::Indexed(208)),
     };
     // What's waiting in the other chat services.
     let mut waiting = Vec::new();
@@ -907,8 +923,8 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
         }
         Service::Calendar if app.cal.status.is_empty() => ("Google Calendar".to_string(), "not connected"),
         Service::Calendar => (app.cal.account.clone(), app.cal.status.as_str()),
-        Service::Tasks | Service::Twos if app.tasks().status.is_empty() => (app.service.name().to_string(), "not connected"),
-        Service::Tasks | Service::Twos => (app.service.name().to_string(), app.tasks().status.as_str()),
+        Service::Tasks | Service::Twos | Service::Moodle if app.tasks().status.is_empty() => (app.service.name().to_string(), "not connected"),
+        Service::Tasks | Service::Twos | Service::Moodle => (app.service.name().to_string(), app.tasks().status.as_str()),
     };
     let right = format!(" {name} · {conn} ");
     let mut spans = vec![

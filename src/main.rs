@@ -4,6 +4,7 @@ mod cal;
 mod gateway;
 #[cfg(feature = "matrix")]
 mod matrix;
+mod moodle;
 mod model;
 mod pics;
 mod qr;
@@ -36,15 +37,16 @@ use crate::app::{App, AppEvent, Service};
     feature = "matrix",
     feature = "calendar",
     feature = "todo",
-    feature = "twos"
+    feature = "twos",
+    feature = "moodle"
 )))]
-compile_error!("build with at least one integration: discord, whatsapp, matrix, calendar, todo, twos");
+compile_error!("build with at least one integration: discord, whatsapp, matrix, calendar, todo, twos, moodle");
 
 const USAGE: &str = "discommand — lightweight terminal client for Discord, WhatsApp, Matrix,
 Google Calendar, Microsoft To Do and Twos (whichever are built in, see --version)
 
 usage: discommand [--wa-phone NUMBER] [--discord-token] [--logout] [--logout-a]
-                  [--check-update] [--help] [--version]
+                  [--moodle-login] [--check-update] [--help] [--version]
 
 The accounts of the chat services built in are required. The Discord token is read from $DISCORD_TOKEN,
 then from the saved token (encrypted with DPAPI on Windows), otherwise you
@@ -56,6 +58,8 @@ WhatsApp is linked once by scanning a QR code (Linked devices).
                      (international format, e.g. +491701234567)
   --logout           delete the saved Discord token and exit
                      (unlink WhatsApp with :wa logout inside the app)
+  --moodle-login     connect a Moodle site (any university or school): asks for
+                     its address, your user name and password (hidden)
   --check-update     check now whether a newer version is on GitHub (it's
                      also checked at startup and daily; off with
                      DISCOMMAND_NO_UPDATE_CHECK=1)
@@ -140,6 +144,10 @@ async fn logout_all() {
         todo::Creds::remove();
         println!("Microsoft To Do: sign-in removed (the app's access can be revoked at account.microsoft.com → Privacy)");
     }
+    if moodle::Creds::load().is_some() {
+        moodle::Creds::remove();
+        println!("Moodle: login removed");
+    }
     if twos::load_key().is_some() {
         twos::remove_key();
         println!("Twos: API key removed (revoke it in Twos → Settings → API Keys)");
@@ -176,6 +184,7 @@ fn main() {
     let mut paste_token = false;
     let mut logout_everything = false;
     let mut check_update = false;
+    let mut moodle_login = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return println!("{USAGE}"),
@@ -189,6 +198,7 @@ fn main() {
             }
             "--logout-a" | "--logout-all" => logout_everything = true,
             "--check-update" => check_update = true,
+            "--moodle-login" => moodle_login = true,
             "--discord-token" => paste_token = true,
             "--wa-phone" => match args.next() {
                 Some(n) => wa_phone = Some(n),
@@ -208,6 +218,13 @@ fn main() {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     if logout_everything {
         return rt.block_on(logout_all());
+    }
+    if moodle_login {
+        if let Err(e) = rt.block_on(moodle::login_interactive()) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
     }
     if check_update {
         return println!("{}", rt.block_on(update::check_now()));
@@ -269,6 +286,7 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
     app.cal_sync();
     app.todo_sync(Service::Tasks);
     app.todo_sync(Service::Twos);
+    app.todo_sync(Service::Moodle);
     for ev in replay {
         app.on_event(AppEvent::Wa(Service::WhatsApp, ev));
     }

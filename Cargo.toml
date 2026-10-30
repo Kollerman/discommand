@@ -4,9 +4,9 @@ version = "0.1.1"
 edition = "2021"
 description = "Lightweight, battery-friendly terminal Discord client"
 license = "MIT"
-
+x
 [features]
-default = ["native-tls", "discord", "whatsapp", "matrix", "calendar", "todo", "twos"]
+default = ["native-tls", "discord", "whatsapp", "matrix", "calendar", "todo", "twos", "moodle"]
 
 # Integrations: build with any subset, e.g.
 #   cargo build --release --no-default-features --features native-tls,discord,calendar
@@ -19,6 +19,8 @@ matrix = ["dep:matrix-sdk", "dep:rustls"]
 calendar = []
 todo = []
 twos = []
+# Any Moodle site: courses, their contents and deadlines.
+moodle = []
 
 # OS TLS stack: SChannel on Windows, Security.framework on macOS, OpenSSL on Linux.
 native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
@@ -30,7 +32,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "process", "io-util"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# Cookies: Moodle sites without the app interface are used like a browser.
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
