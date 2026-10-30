@@ -156,6 +156,38 @@ impl Api {
             .await
     }
 
+    /// Sends a file (with `content` as its text), like dropping it into the chat.
+    pub async fn send_file(&self, channel: &str, path: std::path::PathBuf, content: &str, reply: Option<(&str, bool)>) -> Result<Message, String> {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+        let data = tokio::task::spawn_blocking(move || std::fs::read(&path)).await.map_err(|e| e.to_string())?.map_err(|e| format!("can't read {name}: {e}"))?;
+        let mut payload = json!({ "content": content, "nonce": nonce(), "attachments": [{ "id": 0, "filename": name }] });
+        if let Some((id, ping)) = reply {
+            payload["message_reference"] = json!({ "message_id": id, "channel_id": channel });
+            payload["allowed_mentions"] = json!({ "parse": ["users", "roles", "everyone"], "replied_user": ping });
+        }
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", payload.to_string())
+            .part("files[0]", reqwest::multipart::Part::bytes(data).file_name(name));
+        let resp = self
+            .http
+            .post(format!("{BASE}/channels/{channel}/messages"))
+            .multipart(form)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        if status.as_u16() == 413 {
+            return Err("the file is too large for Discord (10 MB without Nitro)".into());
+        }
+        if !status.is_success() {
+            let msg = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["message"].as_str().map(String::from)).unwrap_or(text);
+            return Err(format!("{}: {msg}", status.as_u16()));
+        }
+        serde_json::from_str(&text).map_err(|e| e.to_string())
+    }
+
     pub async fn edit(&self, channel: &str, id: &str, content: &str) -> Result<Message, String> {
         let body = json!({ "content": content });
         self.request_json(Method::PATCH, &format!("/channels/{channel}/messages/{id}"), Some(&body))

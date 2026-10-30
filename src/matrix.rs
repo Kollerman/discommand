@@ -36,6 +36,8 @@ use matrix_sdk::ruma::presence::PresenceState;
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{uint, EventId, OwnedEventId, RoomId, UserId};
 use matrix_sdk::utils::UrlOrQuery;
+use matrix_sdk::attachment::AttachmentConfig;
+use matrix_sdk::ruma::events::room::message::TextMessageEventContent;
 use matrix_sdk::{Client, Room, SessionChange};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -431,7 +433,7 @@ impl Mx {
                         let Some(room) = self.client.get_room(room_id) else { continue };
                         for ev in &update.timeline.events {
                             let Ok(ev) = ev.raw().deserialize() else { continue };
-                            // Messages of the first sync are old news: no bell, no live update.
+                            // Messages of the first sync are old news: no live update.
                             self.on_event(&room, ev, !first).await;
                         }
                         if !first {
@@ -475,7 +477,8 @@ impl Mx {
         // Rooms never seen active still show, at the bottom.
         let last_ts = self.state.lock().unwrap().recent.last_ts.get(&id).copied().unwrap_or(1);
         let unread = room.unread_notification_counts().notification_count as u32;
-        Some(WaChat { jid: id, name, is_group: !direct, last_ts, unread })
+        let pinned = i64::from(room.is_favourite());
+        Some(WaChat { jid: id, name, is_group: !direct, last_ts, unread, pinned })
     }
 
     async fn sender_name(&self, room: &Room, user: &UserId) -> String {
@@ -730,6 +733,18 @@ impl Mx {
                     room.send(content).await.map_err(|e| e.to_string())?;
                     Ok(())
                 }
+                "file" => {
+                    let room = self.room(&chat).ok_or("unknown room")?;
+                    let path = std::path::PathBuf::from(s("path"));
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+                    let data = std::fs::read(&path).map_err(|e| format!("can't read {name}: {e}"))?;
+                    let kind: mime::Mime = file_type(&name).parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+                    let caption = Some(s("text")).filter(|t| !t.is_empty()).map(TextMessageEventContent::plain);
+                    self.emit(WaEvent::Status { status: format!("sending {name}…") });
+                    let sent = room.send_attachment(&name, &kind, data, AttachmentConfig::new().caption(caption)).await;
+                    self.emit(WaEvent::Status { status: "connected".into() });
+                    sent.map(|_| ()).map_err(|e| format!("sending {name} failed: {e}"))
+                }
                 "edit" => {
                     let room = self.room(&chat).ok_or("unknown room")?;
                     let target = event_id(&id).ok_or("bad message id")?;
@@ -910,6 +925,28 @@ impl Mx {
         let path = dir.join(format!("{short}-{}", safe_name(&name)));
         std::fs::write(&path, data).map_err(|e| e.to_string())?;
         Ok(path.to_string_lossy().into_owned())
+    }
+}
+
+/// A file's type from its extension (Matrix clients show pictures,
+/// videos and audio by it).
+fn file_type(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
     }
 }
 

@@ -104,10 +104,54 @@ fn http() -> reqwest::Client {
 fn client(jar: Arc<Jar>) -> reqwest::Client {
     reqwest::Client::builder()
         .cookie_provider(jar)
-        .timeout(Duration::from_secs(30))
+        // Some sites close idle connections quickly; reusing one fails.
+        .pool_idle_timeout(Duration::from_secs(10))
+        // Course lists of large sites can take a while.
+        .timeout(Duration::from_secs(60))
         .user_agent(concat!("Mozilla/5.0 (compatible; discommand/", env!("CARGO_PKG_VERSION"), ")"))
         .build()
         .unwrap_or_default()
+}
+
+/// A request error with its causes ("error sending request" alone says little).
+fn net_error(e: reqwest::Error) -> String {
+    let host = e.url().and_then(|u| u.host_str()).unwrap_or("the Moodle site").to_string();
+    // No connection at all: a short message (the long one is the system's).
+    if e.is_connect() {
+        return format!("{OFFLINE} {host} (no connection?)");
+    }
+    if e.is_timeout() {
+        return format!("{OFFLINE} {host} (no answer in time)");
+    }
+    let mut text = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        text.push_str(": ");
+        text.push_str(&s.to_string());
+        source = s.source();
+    }
+    text
+}
+
+/// The start of errors that mean the site can't be reached (the app tries
+/// again soon then, instead of at the next regular sync).
+pub const OFFLINE: &str = "can't reach";
+
+/// Sends a request; if the connection fails or times out (a closed
+/// keep-alive connection, Wi-Fi coming back after sleep), tries twice more
+/// after a short pause.
+async fn send(make: impl Fn() -> reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
+    let mut wait = Duration::from_secs(1);
+    for _ in 0..2 {
+        match make().send().await {
+            Err(e) if e.is_connect() || e.is_request() || e.is_timeout() => {
+                tokio::time::sleep(wait).await;
+                wait *= 4;
+            }
+            r => return r.map_err(net_error),
+        }
+    }
+    make().send().await.map_err(net_error)
 }
 
 /// Whether the login page has Moodle's own user name and password form (not
@@ -568,6 +612,8 @@ pub struct Moodle {
     http: reqwest::Client,
     /// The browser-style session's key (login-form access only).
     sesskey: tokio::sync::Mutex<Option<String>>,
+    /// The signed-in user's id (read from a page, or the site info).
+    userid: std::sync::Mutex<Option<i64>>,
     /// Course module of each deadline (to tick it off) and course names.
     cms: std::sync::Mutex<HashMap<String, i64>>,
     courses: std::sync::Mutex<HashMap<String, String>>,
@@ -583,6 +629,7 @@ impl Moodle {
             creds,
             http: client(jar),
             sesskey: tokio::sync::Mutex::new(None),
+            userid: std::sync::Mutex::new(None),
             cms: Default::default(),
             courses: Default::default(),
         }
@@ -606,7 +653,7 @@ impl Moodle {
     async fn sign_in(&self) -> Result<String, String> {
         if self.creds.cookie.is_some() {
             let ended = "the browser's Moodle session has ended: run discommand --moodle-login to log in again";
-            let resp = self.http.get(format!("{}/my/", self.creds.site)).send().await.map_err(|e| e.to_string())?;
+            let resp = self.http.get(format!("{}/my/", self.creds.site)).send().await.map_err(net_error)?;
             // Logged out, Moodle sends you to the login page (which has a key too).
             if resp.url().path().ends_with("/login/index.php") {
                 return Err(ended.into());
@@ -618,7 +665,7 @@ impl Moodle {
             return self.sign_in_sso().await;
         }
         let url = format!("{}/login/index.php", self.creds.site);
-        let page = self.http.get(&url).send().await.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
+        let page = self.http.get(&url).send().await.map_err(net_error)?.text().await.map_err(|e| e.to_string())?;
         if !has_password_form(&page) {
             return Err("this site signs in through its own login page: run discommand --moodle-login to log in in the browser".into());
         }
@@ -626,7 +673,7 @@ impl Moodle {
             return Err("found no login token on the Moodle login page".into());
         };
         let form = [("username", self.creds.username.as_str()), ("password", self.creds.password.as_str()), ("logintoken", token), ("anchor", "")];
-        let resp = self.http.post(&url).form(&form).send().await.map_err(|e| e.to_string())?;
+        let resp = self.http.post(&url).form(&form).send().await.map_err(net_error)?;
         let landed = resp.url().path().to_string();
         let page = resp.text().await.map_err(|e| e.to_string())?;
         if landed.ends_with("/login/index.php") {
@@ -648,7 +695,7 @@ impl Moodle {
 
     async fn walk_sso(&self, log: &LoginLog) -> Result<String, String> {
         let site = Url::parse(&self.creds.site).map_err(|e| e.to_string())?;
-        let mut resp = self.http.get(&self.creds.sso).send().await.map_err(|e| e.to_string())?;
+        let mut resp = self.http.get(&self.creds.sso).send().await.map_err(net_error)?;
         let mut sent_password = false;
         for step in 1..=25 {
             let url = resp.url().clone();
@@ -670,7 +717,7 @@ impl Moodle {
             if form.is_none() {
                 if let Some(next) = page_redirect(&page).and_then(|to| url.join(&to).ok()) {
                     log.note(&format!("follows a script/refresh redirect to {}{}", next.host_str().unwrap_or(""), next.path()));
-                    resp = self.http.get(next).send().await.map_err(|e| e.to_string())?;
+                    resp = self.http.get(next).send().await.map_err(net_error)?;
                     continue;
                 }
             }
@@ -695,7 +742,7 @@ impl Moodle {
             let fields = form.filled(&self.creds.username, &self.creds.password);
             let action = if form.action.is_empty() { url.clone() } else { url.join(&form.action).map_err(|e| e.to_string())? };
             let req = if form.method == "post" { self.http.post(action).form(&fields) } else { self.http.get(action).query(&fields) };
-            resp = req.send().await.map_err(|e| e.to_string())?;
+            resp = req.send().await.map_err(net_error)?;
         }
         Err("the university login took too many steps".into())
     }
@@ -715,13 +762,8 @@ impl Moodle {
             };
             let body = json!([{ "index": 0, "methodname": function, "args": args }]);
             let url = format!("{}/lib/ajax/service.php?sesskey={key}&info={function}", self.creds.site);
-            let resp: Value = self
-                .http
-                .post(url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| e.to_string())?
+            let resp: Value = send(|| self.http.post(&url).json(&body))
+                .await?
                 .json()
                 .await
                 .map_err(|e| format!("Moodle: unexpected answer to {function}: {e}"))?;
@@ -755,13 +797,9 @@ impl Moodle {
             };
             form.push((k.clone(), v));
         }
-        let v: Value = self
-            .http
-            .post(format!("{}/webservice/rest/server.php", self.creds.site))
-            .form(&form)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?
+        let url = format!("{}/webservice/rest/server.php", self.creds.site);
+        let v: Value = send(|| self.http.post(&url).form(&form))
+            .await?
             .json()
             .await
             .map_err(|e| e.to_string())?;
@@ -782,7 +820,7 @@ impl Moodle {
     }
 
     async fn courses(&self) -> Result<Vec<Value>, String> {
-        let args = json!({ "offset": 0, "limit": 0, "classification": "inprogress" });
+        let args = json!({ "offset": 0, "limit": 0, "classification": "all" });
         let data = self.call("core_course_get_enrolled_courses_by_timeline_classification", args).await?;
         Ok(data["courses"].as_array().cloned().unwrap_or_default())
     }
@@ -796,11 +834,57 @@ impl Moodle {
 
         let mut lists = vec![TaskList { id: DEADLINES.into(), name: "Deadlines".into(), default: true, emoji: "⏰".into(), ..TaskList::default() }];
         let mut names = HashMap::new();
-        for (i, c) in courses.iter().enumerate() {
-            let id = format!("c{}", c["id"].as_i64().unwrap_or(0));
-            let name = c["fullname"].as_str().unwrap_or("Course").to_string();
+        // Newest first; courses that are running keep their folder open.
+        let now = Local::now().timestamp();
+        let running = |c: &Value| {
+            let (start, end) = (c["startdate"].as_i64().unwrap_or(0), c["enddate"].as_i64().unwrap_or(0));
+            start <= now && (end == 0 || end > now)
+        };
+        let mut courses = courses;
+        courses.sort_by_key(|c| (!running(c), std::cmp::Reverse(c["startdate"].as_i64().unwrap_or(0))));
+        // (folder, course id, name, running), in the order shown.
+        let mut entries: Vec<(String, i64, String, bool)> = Vec::new();
+        let by_id: HashMap<i64, &Value> = courses.iter().map(|c| (c["id"].as_i64().unwrap_or(0), c)).collect();
+        match self.course_folders().await {
+            // The site's own course folders (GRIPS' "Meine Kurse"), as the user sorted them.
+            Some(folders) => {
+                for (folder, id, name) in &folders {
+                    let c = by_id.get(id);
+                    let name = c.and_then(|c| c["fullname"].as_str()).map(String::from).unwrap_or_else(|| name.clone());
+                    entries.push((folder.clone(), *id, name, c.is_some_and(|c| running(c))));
+                }
+                // Courses not sorted into a folder: running ones on top, the rest in one more folder.
+                for c in &courses {
+                    let id = c["id"].as_i64().unwrap_or(0);
+                    if !folders.iter().any(|(_, f, _)| *f == id) {
+                        let run = running(c);
+                        let folder = if run { String::new() } else { "Weitere Kurse".into() };
+                        entries.push((folder, id, c["fullname"].as_str().unwrap_or("Course").into(), run));
+                    }
+                }
+            }
+            // Otherwise by course category (e.g. the semester).
+            None => {
+                for c in &courses {
+                    let (folder, id) = (plain(c["coursecategory"].as_str().unwrap_or("")), c["id"].as_i64().unwrap_or(0));
+                    entries.push((folder, id, c["fullname"].as_str().unwrap_or("Course").into(), running(c)));
+                }
+            }
+        }
+        // Folders with a running course start open.
+        let open_groups: std::collections::HashSet<&str> = entries.iter().filter(|e| e.3).map(|e| e.0.as_str()).collect();
+        for (i, (folder, id, name, _)) in entries.iter().enumerate() {
+            let id = format!("c{id}");
             names.insert(id.clone(), name.clone());
-            lists.push(TaskList { id, name: plain(&name), pos: 1 + i as u32, emoji: "🎓".into(), ..TaskList::default() });
+            lists.push(TaskList {
+                id,
+                name: plain(name),
+                pos: 10 + i as u32,
+                emoji: "🎓".into(),
+                folded: !open_groups.contains(folder.as_str()),
+                group: folder.clone(),
+                ..TaskList::default()
+            });
         }
         *self.courses.lock().unwrap() = names;
 
@@ -821,7 +905,7 @@ impl Moodle {
                 title: plain(title),
                 note: format!("{} · {}", plain(course), plain(e["name"].as_str().unwrap_or(""))),
                 due: Some(at.date_naive()),
-                // A day ahead, so there's time left when the bell rings.
+                // A day ahead, so there's time left when the reminder shows.
                 reminder: Some(at - chrono::Duration::days(1)).filter(|r| *r > Local::now()),
                 check: true,
                 marker: module_icon(e["modulename"].as_str().unwrap_or("")).into(),
@@ -833,7 +917,154 @@ impl Moodle {
         }
         *self.cms.lock().unwrap() = cms;
         let page = Page { list: DEADLINES.into(), title: "Deadlines".into(), emoji: "⏰".into(), lines: tasks.clone() };
-        Ok((lists, tasks, vec![page]))
+        let mut pages = vec![page];
+        // The bell and the messages, with their unread counts; and the grades.
+        let count = |name: &str, n: usize| if n > 0 { format!("{name} ({n} new)") } else { name.to_string() };
+        if let Some((p, n)) = self.notifications_page().await {
+            lists.push(TaskList { id: NOTIFICATIONS.into(), name: count("Notifications", n), emoji: "🔔".into(), pos: 1, ..TaskList::default() });
+            pages.push(p);
+        }
+        if let Some((p, n)) = self.messages_page().await {
+            lists.push(TaskList { id: MESSAGES.into(), name: count("Messages", n), emoji: "✉".into(), pos: 2, ..TaskList::default() });
+            pages.push(p);
+        }
+        if self.creds.token.is_empty() {
+            lists.push(TaskList { id: GRADES.into(), name: "Grades".into(), emoji: "📊".into(), pos: 3, ..TaskList::default() });
+        }
+        Ok((lists, tasks, pages))
+    }
+
+    /// The signed-in user's id.
+    async fn user_id(&self) -> Option<i64> {
+        if let Some(id) = *self.userid.lock().unwrap() {
+            return Some(id);
+        }
+        let id = if self.creds.token.is_empty() {
+            let (html, _) = self.fetch(&format!("{}/my/courses.php", self.creds.site)).await.ok()?;
+            page_user_id(&html)
+        } else {
+            self.call("core_webservice_get_site_info", json!({})).await.ok()?["userid"].as_i64()
+        };
+        *self.userid.lock().unwrap() = id;
+        id
+    }
+
+    /// The notifications (the bell), newest first: (page, unread count).
+    async fn notifications_page(&self) -> Option<(Page, usize)> {
+        let uid = self.user_id().await?;
+        let args = json!({ "useridto": uid, "limit": 50, "offset": 0, "newestfirst": true });
+        let data = self.call("message_popup_get_popup_notifications", args).await.ok()?;
+        let base = Url::parse(&self.creds.site).ok()?;
+        let mut lines = Vec::new();
+        let mut unread = 0;
+        for n in data["notifications"].as_array().into_iter().flatten() {
+            let read = n["read"].as_bool().unwrap_or(true);
+            unread += usize::from(!read);
+            let title = format!("{}  · {}", plain(n["subject"].as_str().unwrap_or("")), day(n["timecreated"].as_i64()));
+            let url = n["contexturl"].as_str().unwrap_or("");
+            let mut line = link_line(url, &title, &base).unwrap_or(Task { title, ..Task::default() });
+            line.depth = 0;
+            line.important = !read;
+            lines.push(line);
+        }
+        if lines.is_empty() {
+            lines.push(Task { title: "No notifications.".into(), ..Task::default() });
+        }
+        Some((numbered(NOTIFICATIONS, "Notifications", "🔔", lines), unread))
+    }
+
+    /// The conversations (messages), most recent first: (page, unread count).
+    async fn messages_page(&self) -> Option<(Page, usize)> {
+        let uid = self.user_id().await?;
+        let data = self.call("core_message_get_conversations", json!({ "userid": uid, "limitfrom": 0, "limitnum": 50 })).await.ok()?;
+        let mut lines = Vec::new();
+        let mut unread = 0;
+        for c in data["conversations"].as_array().into_iter().flatten() {
+            let n = c["unreadcount"].as_u64().unwrap_or(0) as usize;
+            unread += n;
+            let names: Vec<String> = c["members"].as_array().into_iter().flatten().filter_map(|m| m["fullname"].as_str()).map(plain).collect();
+            let name = c["name"].as_str().map(plain).filter(|n| !n.is_empty()).unwrap_or_else(|| names.join(", "));
+            let last = &c["messages"][0];
+            let text = plain(last["text"].as_str().unwrap_or(""));
+            let preview: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(50).collect();
+            let mut title = format!("{name}  · {}", day(last["timecreated"].as_i64()));
+            if n > 0 {
+                title.push_str(&format!(" · {n} new"));
+            }
+            if !preview.is_empty() {
+                title.push_str(&format!(" — {preview}"));
+            }
+            lines.push(Task {
+                title,
+                important: n > 0,
+                sublist: Some(format!("{CONVERSATION}{}", c["id"].as_i64().unwrap_or(0))),
+                url: format!("{}/message/index.php?convid={}", self.creds.site, c["id"].as_i64().unwrap_or(0)),
+                ..Task::default()
+            });
+        }
+        if lines.is_empty() {
+            lines.push(Task { title: "No messages.".into(), ..Task::default() });
+        }
+        Some((numbered(MESSAGES, "Messages", "✉", lines), unread))
+    }
+
+    /// One conversation, oldest message first (reading only).
+    async fn conversation_page(&self, list: &str, id: &str) -> Result<Page, String> {
+        let uid = self.user_id().await.ok_or("couldn't find out who is signed in")?;
+        let convid = id.parse::<i64>().unwrap_or(0);
+        let mut data = Value::Null;
+        let mut all: Vec<Value> = Vec::new();
+        for from in (0..CHAT_MAX).step_by(CHAT_PAGE) {
+            let args = json!({ "currentuserid": uid, "convid": convid, "newest": true, "limitfrom": from, "limitnum": CHAT_PAGE });
+            let page = self.call("core_message_get_conversation_messages", args).await?;
+            let got = page["messages"].as_array().cloned().unwrap_or_default();
+            let more = got.len() == CHAT_PAGE;
+            all.extend(got);
+            if data.is_null() {
+                data = page;
+            }
+            if !more {
+                break;
+            }
+        }
+        data["messages"] = Value::Array(all);
+        let names: HashMap<i64, String> = data["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| (m["id"].as_i64().unwrap_or(0), plain(m["fullname"].as_str().unwrap_or(""))))
+            .collect();
+        let base = Url::parse(&self.creds.site).map_err(|e| e.to_string())?;
+        let mut lines = Vec::new();
+        let mut messages: Vec<&Value> = data["messages"].as_array().into_iter().flatten().collect();
+        messages.reverse();
+        for m in messages {
+            let from = m["useridfrom"].as_i64().unwrap_or(0);
+            let who = if from == uid { "you".to_string() } else { names.get(&from).cloned().unwrap_or_default() };
+            let when = m["timecreated"].as_i64().and_then(|t| Local.timestamp_opt(t, 0).single()).map(|t| t.format("%a %d %b %Y, %H:%M").to_string());
+            lines.push(Task { title: format!("{who}{}", when.map(|w| format!(" · {w}")).unwrap_or_default()), heading: true, subheading: true, ..Task::default() });
+            lines.extend(html_lines(list, m["text"].as_str().unwrap_or(""), &base).1);
+        }
+        let others: Vec<&String> = names.iter().filter(|(id, _)| **id != uid).map(|(_, n)| n).collect();
+        let title = others.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
+        let mut page = numbered(list, &title, "✉", lines);
+        page.list = list.into();
+        Ok(page)
+    }
+
+    /// The course folders some sites offer in a dashboard block (the
+    /// "course quick access" block at GRIPS, Regensburg): (folder, course
+    /// id, name). None if the site has no such block.
+    async fn course_folders(&self) -> Option<Vec<(String, i64, String)>> {
+        if !self.creds.token.is_empty() {
+            return None;
+        }
+        let (html, _) = self.fetch(&format!("{}/my/courses.php", self.creds.site)).await.ok()?;
+        if let Some(id) = page_user_id(&html) {
+            *self.userid.lock().unwrap() = Some(id);
+        }
+        let folders = quick_access(&html);
+        (!folders.is_empty()).then_some(folders)
     }
 
     /// A Moodle page (an activity, a forum discussion, …) as lines: its main
@@ -863,7 +1094,7 @@ impl Moodle {
                     *key = Some(self.sign_in().await?);
                 }
             }
-            let resp = self.http.get(url).send().await.map_err(|e| e.to_string())?;
+            let resp = send(|| self.http.get(url)).await?;
             if attempt == 0 && resp.url().path().ends_with("/login/index.php") {
                 *self.sesskey.lock().await = None;
                 continue;
@@ -900,10 +1131,128 @@ impl Moodle {
         Ok(path.to_string_lossy().into_owned())
     }
 
+    /// A forum's discussions, newest first; the forum's web page if the
+    /// site doesn't offer the forum functions.
+    async fn forum_page(&self, list: &str, cmid: &str) -> Result<Page, String> {
+        let web = || format!("{}/mod/forum/view.php?id={cmid}", self.creds.site);
+        let cm = match self.call("core_course_get_course_module", json!({ "cmid": cmid.parse::<i64>().unwrap_or(0) })).await {
+            Ok(cm) => cm,
+            Err(_) => return self.forum_web_page(list, &web()).await,
+        };
+        let forum = cm["cm"]["instance"].as_i64().unwrap_or(0);
+        let args = json!({ "forumid": forum, "sortorder": -1, "page": 0, "perpage": 100 });
+        let Ok(data) = self.call("mod_forum_get_forum_discussions", args).await else {
+            return self.forum_web_page(list, &web()).await;
+        };
+        let mut lines = Vec::new();
+        for d in data["discussions"].as_array().into_iter().flatten() {
+            let replies = d["numreplies"].as_i64().unwrap_or(0);
+            let when = d["timemodified"].as_i64().and_then(|t| Local.timestamp_opt(t, 0).single()).map(|t| t.format("%d %b %Y").to_string());
+            let mut title = plain(d["name"].as_str().unwrap_or("(no subject)"));
+            title.push_str(&format!("  · {}", plain(d["userfullname"].as_str().unwrap_or(""))));
+            if let Some(w) = when {
+                title.push_str(&format!(", {w}"));
+            }
+            if replies > 0 {
+                title.push_str(&format!(" · {replies} {}", if replies == 1 { "reply" } else { "replies" }));
+            }
+            let id = d["discussion"].as_i64().unwrap_or(0);
+            let n = lines.len() as u32;
+            lines.push(Task {
+                id: format!("d{id}"),
+                list: list.into(),
+                title,
+                url: format!("{}/mod/forum/discuss.php?d={id}", self.creds.site),
+                sublist: Some(format!("{DISCUSSION}{id}")),
+                important: d["pinned"].as_bool().unwrap_or(false),
+                pos: n,
+                ..Task::default()
+            });
+        }
+        if lines.is_empty() {
+            lines.push(Task { id: "none".into(), list: list.into(), title: "No discussions yet.".into(), ..Task::default() });
+        }
+        Ok(Page { list: list.into(), title: plain(cm["cm"]["name"].as_str().unwrap_or("Forum")), emoji: "💬".into(), lines })
+    }
+
+    /// A forum's discussions read from its web page (its table of discussions).
+    async fn forum_web_page(&self, list: &str, url: &str) -> Result<Page, String> {
+        let (html, at) = self.fetch(url).await?;
+        let rows = forum_rows(list, &html, &at);
+        if rows.is_empty() {
+            let (title, lines) = html_lines(list, &html, &at);
+            return Ok(Page { list: list.into(), title, emoji: "💬".into(), lines });
+        }
+        Ok(Page { list: list.into(), title: page_title(&html), emoji: "💬".into(), lines: rows })
+    }
+
+    /// A discussion's posts, oldest first, with their attachments.
+    async fn discussion_page(&self, list: &str, id: &str) -> Result<Page, String> {
+        let web = format!("{}/mod/forum/discuss.php?d={id}", self.creds.site);
+        let args = json!({ "discussionid": id.parse::<i64>().unwrap_or(0), "sortby": "created", "sortdirection": "ASC" });
+        let Ok(data) = self.call("mod_forum_get_discussion_posts", args).await else {
+            return self.web_page(list, &web).await;
+        };
+        let base = Url::parse(&web).map_err(|e| e.to_string())?;
+        let mut title = String::new();
+        let mut lines: Vec<Task> = Vec::new();
+        for p in data["posts"].as_array().into_iter().flatten() {
+            if title.is_empty() {
+                title = plain(p["subject"].as_str().unwrap_or(""));
+            }
+            let when = p["timecreated"].as_i64().and_then(|t| Local.timestamp_opt(t, 0).single()).map(|t| t.format("%a %d %b %Y, %H:%M").to_string());
+            let author = plain(p["author"]["fullname"].as_str().unwrap_or(""));
+            lines.push(Task {
+                title: format!("{author}{}", when.map(|w| format!(" · {w}")).unwrap_or_default()),
+                heading: true,
+                subheading: true,
+                ..Task::default()
+            });
+            let (_, body) = html_lines(list, p["message"].as_str().unwrap_or(""), &base);
+            lines.extend(body);
+            for a in p["attachments"].as_array().into_iter().flatten() {
+                let url = a["url"].as_str().unwrap_or("").to_string();
+                lines.push(Task {
+                    title: a["filename"].as_str().unwrap_or("attachment").to_string(),
+                    marker: "📎 ".into(),
+                    sublist: Some(format!("{FILE}{url}")),
+                    url,
+                    ..Task::default()
+                });
+            }
+        }
+        for (i, l) in lines.iter_mut().enumerate() {
+            l.id = format!("p{i}");
+            l.list = list.into();
+            l.pos = i as u32;
+        }
+        Ok(Page { list: list.into(), title, emoji: "💬".into(), lines })
+    }
+
     /// A course's sections and activities, or a page or file of the site.
     pub async fn page(&self, list: &str) -> Result<Page, String> {
         if let Some(url) = list.strip_prefix(WEB) {
             return self.web_page(list, url).await;
+        }
+        if let Some(cmid) = list.strip_prefix(FORUM) {
+            return self.forum_page(list, cmid).await;
+        }
+        if let Some(id) = list.strip_prefix(CONVERSATION) {
+            return self.conversation_page(list, id).await;
+        }
+        match list {
+            NOTIFICATIONS => return self.notifications_page().await.map(|(p, _)| p).ok_or_else(|| "couldn't load the notifications".into()),
+            MESSAGES => return self.messages_page().await.map(|(p, _)| p).ok_or_else(|| "couldn't load the messages".into()),
+            GRADES => {
+                let mut page = self.web_page(list, &format!("{}/grade/report/overview/index.php", self.creds.site)).await?;
+                page.title = "Grades".into();
+                page.emoji = "📊".into();
+                return Ok(page);
+            }
+            _ => {}
+        }
+        if let Some(id) = list.strip_prefix(DISCUSSION) {
+            return self.discussion_page(list, id).await;
         }
         let Some(course) = list.strip_prefix('c').and_then(|id| id.parse::<i64>().ok()) else {
             return Err("not a course".into());
@@ -911,9 +1260,10 @@ impl Moodle {
         let title = self.courses.lock().unwrap().get(list).map(|n| plain(n)).unwrap_or_default();
         // Moodle 4 pages read the course from this; older ones (and the app
         // interface) have the course contents call.
+        let site = &self.creds.site;
         let lines = match self.call("core_courseformat_get_state", json!({ "courseid": course })).await {
-            Ok(state) => state_lines(list, &state)?,
-            Err(_) => contents_lines(list, &self.call("core_course_get_contents", json!({ "courseid": course })).await?),
+            Ok(state) => state_lines(list, &state, site)?,
+            Err(_) => contents_lines(list, &self.call("core_course_get_contents", json!({ "courseid": course })).await?, site),
         };
         Ok(Page { list: list.into(), title, emoji: "🎓".into(), lines })
     }
@@ -977,18 +1327,26 @@ fn section_line(list: &str, id: String, name: &str, pos: u32) -> Task {
     Task { id, list: list.into(), title: plain(name), heading: true, pos, ..Task::default() }
 }
 
-fn activity_line(list: &str, id: String, name: &str, module: &str, url: &str, pos: u32) -> Task {
+/// An activity of a course page. `cmid` gives it an address when the course
+/// data has none (e.g. a folder shown on the course page itself).
+fn activity_line(list: &str, cmid: &str, name: &str, module: &str, url: &str, site: &str, depth: u8, pos: u32) -> Task {
+    let url = if url.is_empty() && !cmid.is_empty() { format!("{site}/mod/{module}/view.php?id={cmid}") } else { url.to_string() };
     Task {
-        id,
+        id: format!("cm{cmid}"),
         list: list.into(),
         title: plain(name),
         marker: module_icon(module).into(),
-        url: url.to_string(),
-        sublist: activity_target(module, url),
-        depth: 1,
+        sublist: activity_target(module, &url),
+        url,
+        depth,
         pos,
         ..Task::default()
     }
+}
+
+/// The heading of a subsection (a section inside a section, Moodle 4.5+).
+fn subsection_line(list: &str, id: String, name: &str, pos: u32) -> Task {
+    Task { id, list: list.into(), title: plain(name), heading: true, subheading: true, depth: 1, pos, ..Task::default() }
 }
 
 /// Where Enter on an activity leads: a file downloads and opens, a web link
@@ -1000,69 +1358,119 @@ fn activity_target(module: &str, url: &str) -> Option<String> {
     match module {
         "url" => None,
         "resource" => Some(format!("{FILE}{url}{}redirect=1", if url.contains('?') { '&' } else { '?' })),
+        "forum" => cm_id(url).map(|cm| format!("{FORUM}{cm}")).or_else(|| Some(format!("{WEB}{url}"))),
         _ => Some(format!("{WEB}{url}")),
     }
 }
 
-/// Page ids of Moodle web pages shown in the app, and of files to download.
+/// Page ids of Moodle web pages shown in the app, of files to download, of
+/// forums (by course module) and of forum discussions.
 pub const WEB: &str = "url:";
 pub const FILE: &str = "file:";
+pub const FORUM: &str = "forum:";
+pub const DISCUSSION: &str = "discussion:";
 
 /// Lines from `core_courseformat_get_state` (a JSON string).
-fn state_lines(list: &str, state: &Value) -> Result<Vec<Task>, String> {
+fn state_lines(list: &str, state: &Value, site: &str) -> Result<Vec<Task>, String> {
     let state: Value = match state.as_str() {
         Some(s) => serde_json::from_str(s).map_err(|e| e.to_string())?,
         None => state.clone(),
     };
     let cms: HashMap<String, &Value> = state["cm"].as_array().into_iter().flatten().map(|c| (id_of(&c["id"]), c)).collect();
     let sections: HashMap<String, &Value> = state["section"].as_array().into_iter().flatten().map(|s| (id_of(&s["id"]), s)).collect();
+    // A subsection is an activity whose content is a section of its own.
+    let delegated = |s: &Value| s["component"].as_str() == Some("mod_subsection");
+    let by_cm: HashMap<String, &Value> =
+        state["section"].as_array().into_iter().flatten().filter(|s| delegated(s)).map(|s| (id_of(&s["itemid"]), s)).collect();
+    let activities = |s: &Value| -> Vec<&Value> {
+        s["cmlist"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|id| cms.get(&id_of(id)).copied())
+            .filter(|c| c["uservisible"].as_bool() != Some(false) && c["module"].as_str() != Some("label"))
+            .collect()
+    };
     let mut lines = Vec::new();
     let order: Vec<String> = match state["course"]["sectionlist"].as_array() {
         Some(ids) => ids.iter().map(id_of).collect(),
         None => state["section"].as_array().into_iter().flatten().map(|s| id_of(&s["id"])).collect(),
     };
     for sid in order {
-        let Some(s) = sections.get(&sid) else { continue };
-        let activities: Vec<&Value> = s["cmlist"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|id| cms.get(&id_of(id)).copied())
-            .filter(|c| c["uservisible"].as_bool() != Some(false) && c["module"].as_str() != Some("label"))
-            .collect();
-        if activities.is_empty() {
+        let Some(s) = sections.get(&sid).filter(|s| !delegated(s)) else { continue };
+        let acts = activities(s);
+        if acts.is_empty() {
             continue;
         }
         let n = lines.len() as u32;
         lines.push(section_line(list, format!("s{sid}"), s["title"].as_str().unwrap_or(""), n));
-        for c in activities {
+        for c in acts {
+            let cmid = id_of(&c["id"]);
+            let module = c["module"].as_str().unwrap_or("");
+            if module == "subsection" {
+                let Some(sub) = by_cm.get(&cmid) else { continue };
+                let inner = activities(sub);
+                if inner.is_empty() {
+                    continue;
+                }
+                let n = lines.len() as u32;
+                lines.push(subsection_line(list, format!("s{}", id_of(&sub["id"])), c["name"].as_str().unwrap_or(""), n));
+                for c in inner {
+                    let n = lines.len() as u32;
+                    let (url, name, m) = (c["url"].as_str().unwrap_or(""), c["name"].as_str().unwrap_or(""), c["module"].as_str().unwrap_or(""));
+                    lines.push(activity_line(list, &id_of(&c["id"]), name, m, url, site, 2, n));
+                }
+                continue;
+            }
             let n = lines.len() as u32;
-            let url = c["url"].as_str().unwrap_or("");
-            lines.push(activity_line(list, format!("cm{}", id_of(&c["id"])), c["name"].as_str().unwrap_or(""), c["module"].as_str().unwrap_or(""), url, n));
+            lines.push(activity_line(list, &cmid, c["name"].as_str().unwrap_or(""), module, c["url"].as_str().unwrap_or(""), site, 1, n));
         }
     }
     Ok(lines)
 }
 
 /// Lines from `core_course_get_contents`.
-fn contents_lines(list: &str, contents: &Value) -> Vec<Task> {
-    let mut lines = Vec::new();
-    for s in contents.as_array().into_iter().flatten() {
-        let activities: Vec<&Value> = s["modules"]
+fn contents_lines(list: &str, contents: &Value, site: &str) -> Vec<Task> {
+    let delegated = |s: &Value| s["component"].as_str() == Some("mod_subsection");
+    let by_cm: HashMap<String, &Value> =
+        contents.as_array().into_iter().flatten().filter(|s| delegated(s)).map(|s| (id_of(&s["itemid"]), s)).collect();
+    let activities = |s: &Value| -> Vec<Value> {
+        s["modules"]
             .as_array()
             .into_iter()
             .flatten()
             .filter(|m| m["uservisible"].as_bool() != Some(false) && m["modname"].as_str() != Some("label"))
-            .collect();
-        if activities.is_empty() {
+            .cloned()
+            .collect()
+    };
+    let mut lines = Vec::new();
+    for s in contents.as_array().into_iter().flatten().filter(|s| !delegated(s)) {
+        let acts = activities(s);
+        if acts.is_empty() {
             continue;
         }
         let n = lines.len() as u32;
         lines.push(section_line(list, format!("s{}", id_of(&s["id"])), s["name"].as_str().unwrap_or(""), n));
-        for m in activities {
+        for m in acts {
+            let cmid = id_of(&m["id"]);
+            let module = m["modname"].as_str().unwrap_or("");
+            if module == "subsection" {
+                let Some(sub) = by_cm.get(&cmid) else { continue };
+                let inner = activities(sub);
+                if inner.is_empty() {
+                    continue;
+                }
+                let n = lines.len() as u32;
+                lines.push(subsection_line(list, format!("s{}", id_of(&sub["id"])), m["name"].as_str().unwrap_or(""), n));
+                for m in inner {
+                    let n = lines.len() as u32;
+                    let (url, name, kind) = (m["url"].as_str().unwrap_or(""), m["name"].as_str().unwrap_or(""), m["modname"].as_str().unwrap_or(""));
+                    lines.push(activity_line(list, &id_of(&m["id"]), name, kind, url, site, 2, n));
+                }
+                continue;
+            }
             let n = lines.len() as u32;
-            let url = m["url"].as_str().unwrap_or("");
-            lines.push(activity_line(list, format!("cm{}", id_of(&m["id"])), m["name"].as_str().unwrap_or(""), m["modname"].as_str().unwrap_or(""), url, n));
+            lines.push(activity_line(list, &cmid, m["name"].as_str().unwrap_or(""), module, m["url"].as_str().unwrap_or(""), site, 1, n));
         }
     }
     lines
@@ -1157,6 +1565,9 @@ fn html_lines(list: &str, html: &str, base: &Url) -> (String, Vec<Task>) {
     let mut text = String::new();
     let mut bullet = false;
     let mut heading = false;
+    // A table row being read: its cells (header cell?, text) and links.
+    let mut row: Option<(Vec<(bool, String)>, Vec<Task>)> = None;
+    let mut cell_th = false;
     let mut push = |lines: &mut Vec<Task>, mut t: Task| {
         if lines.len() >= 800 {
             return;
@@ -1201,7 +1612,12 @@ fn html_lines(list: &str, html: &str, base: &Url) -> (String, Vec<Task>) {
                 let inner_end = lbody[close..].find("</a").map_or(body.len(), |e| close + e);
                 let label: String = plain(&body[close + 1..inner_end]).split_whitespace().collect::<Vec<_>>().join(" ");
                 i = lbody[inner_end..].find('>').map_or(body.len(), |e| inner_end + e + 1);
-                if let Some(line) = link_line(&href, &label, base) {
+                if let (Some(line), Some((_, links))) = (link_line(&href, &label, base), row.as_mut()) {
+                    links.push(line);
+                    text.push(' ');
+                    text.push_str(&label);
+                    text.push(' ');
+                } else if let Some(line) = link_line(&href, &label, base) {
                     flush(&mut lines, &mut text, &mut bullet, heading, &mut push);
                     push(&mut lines, line);
                 } else {
@@ -1211,6 +1627,8 @@ fn html_lines(list: &str, html: &str, base: &Url) -> (String, Vec<Task>) {
                 }
                 continue;
             }
+            // Inside a table row everything stays on the row's line.
+            "br" | "p" | "/p" | "div" | "/div" | "ul" | "/ul" | "ol" | "/ol" | "li" | "/li" | "dt" | "dd" | "/dt" | "/dd" if row.is_some() => text.push(' '),
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 flush(&mut lines, &mut text, &mut bullet, heading, &mut push);
                 heading = true;
@@ -1223,8 +1641,29 @@ fn html_lines(list: &str, html: &str, base: &Url) -> (String, Vec<Task>) {
                 flush(&mut lines, &mut text, &mut bullet, heading, &mut push);
                 bullet = true;
             }
+            "tr" => {
+                flush(&mut lines, &mut text, &mut bullet, heading, &mut push);
+                row = Some((Vec::new(), Vec::new()));
+            }
+            "td" | "th" if row.is_some() => {
+                text.clear();
+                cell_th = name == "th";
+            }
+            "/td" | "/th" if row.is_some() => {
+                let t: String = unescape(&text).split_whitespace().collect::<Vec<_>>().join(" ");
+                text.clear();
+                if let Some((cells, _)) = row.as_mut() {
+                    cells.push((cell_th, t));
+                }
+            }
+            "/tr" | "/table" if row.is_some() => {
+                let (cells, links) = row.take().unwrap_or_default();
+                for line in row_lines(&cells, links) {
+                    push(&mut lines, line);
+                }
+            }
             "td" | "th" | "/td" | "/th" | "span" | "/span" => text.push(' '),
-            "br" | "p" | "/p" | "div" | "/div" | "tr" | "/tr" | "ul" | "/ul" | "ol" | "/ol" | "/li" | "table" | "/table" | "section"
+            "br" | "p" | "/p" | "div" | "/div" | "/tr" | "ul" | "/ul" | "ol" | "/ol" | "/li" | "table" | "/table" | "section"
             | "/section" | "dt" | "dd" | "/dt" | "/dd" | "blockquote" | "/blockquote" | "article" | "/article" | "header" | "/header" => {
                 flush(&mut lines, &mut text, &mut bullet, heading, &mut push)
             }
@@ -1234,6 +1673,41 @@ fn html_lines(list: &str, html: &str, base: &Url) -> (String, Vec<Task>) {
     }
     flush(&mut lines, &mut text, &mut bullet, heading, &mut push);
     (title, lines)
+}
+
+/// A table row as lines: "Header: value" for a header cell beside its value
+/// (assignment status), otherwise the cells joined with " · ". A row with one
+/// link opens it; a row with several (submitted files) lists them below.
+fn row_lines(cells: &[(bool, String)], mut links: Vec<Task>) -> Vec<Task> {
+    let filled: Vec<&(bool, String)> = cells.iter().filter(|(_, t)| !t.is_empty()).collect();
+    if filled.is_empty() && links.is_empty() {
+        return Vec::new();
+    }
+    let title = match filled.as_slice() {
+        [(true, h), (false, v)] => format!("{h}: {v}"),
+        cells => cells.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" · "),
+    };
+    match links.len() {
+        0 => vec![Task { title, ..Task::default() }],
+        1 => {
+            let mut line = links.remove(0);
+            line.title = title;
+            line.depth = 0;
+            vec![line]
+        }
+        _ => {
+            let head = match filled.first() {
+                Some((true, h)) => h.clone(),
+                _ => String::new(),
+            };
+            let mut out = Vec::new();
+            if !head.is_empty() {
+                out.push(Task { title: format!("{head}:"), ..Task::default() });
+            }
+            out.extend(links);
+            out
+        }
+    }
 }
 
 /// A link as a line: Moodle pages open here, files download, the rest goes
@@ -1246,6 +1720,11 @@ fn link_line(href: &str, label: &str, base: &Url) -> Option<Task> {
     let url = base.join(href).ok()?;
     let same_site = url.host_str() == base.host_str();
     let path = url.path();
+    // Links carrying the session key are actions (subscribe, mark, delete,
+    // log out …): never followed, shown as text.
+    if url.query().is_some_and(|q| q.contains("sesskey=")) || path.contains("/login/logout.php") {
+        return None;
+    }
     let (marker, sublist) = if !matches!(url.scheme(), "http" | "https") {
         ("🔗 ", None)
     } else if same_site && (path.contains("/pluginfile.php/") || path.contains("/mod/resource/view.php")) {
@@ -1255,12 +1734,147 @@ fn link_line(href: &str, label: &str, base: &Url) -> Option<Task> {
             url.to_string()
         };
         ("📄 ", Some(format!("{FILE}{target}")))
+    } else if same_site && path.ends_with("/mod/forum/discuss.php") {
+        let d = url.query_pairs().find(|(k, _)| k == "d").map(|(_, v)| v.into_owned());
+        ("💬 ", Some(d.map(|d| format!("{DISCUSSION}{d}")).unwrap_or_else(|| format!("{WEB}{url}"))))
+    } else if same_site && path.ends_with("/mod/forum/view.php") {
+        ("💬 ", Some(cm_id(url.as_str()).map(|c| format!("{FORUM}{c}")).unwrap_or_else(|| format!("{WEB}{url}"))))
     } else if same_site && !path.contains("/login/logout.php") {
         ("› ", Some(format!("{WEB}{url}")))
     } else {
         ("🔗 ", None)
     };
     Some(Task { title: label.to_string(), marker: marker.into(), url: url.to_string(), sublist, depth: 1, ..Task::default() })
+}
+
+/// The folders of the "course quick access" block: each `qa-usercategory`
+/// entry names a folder; the course links up to its list's end are in it.
+/// Courses outside a folder have none ("").
+fn quick_access(html: &str) -> Vec<(String, i64, String)> {
+    let Some(start) = html.find("id=\"qa-blocklist\"") else { return Vec::new() };
+    let end = html[start..].find("</section>").map_or(html.len(), |e| start + e);
+    let block = &html[start..end];
+    let mut out = Vec::new();
+    let mut folder = String::new();
+    let mut folder_end = 0;
+    let mut pos = 0;
+    while let Some(i) = block[pos..].find("<li ").map(|i| pos + i) {
+        let tag_end = block[i..].find('>').map_or(block.len(), |e| i + e);
+        let tag = &block[i..tag_end];
+        if i > folder_end {
+            folder.clear();
+        }
+        if tag.contains("qa-usercategory") {
+            // The name: the toggle's text, after its folder icons.
+            let name_start = block[tag_end..].find("qa-toggle").map_or(tag_end, |t| tag_end + t);
+            let name_end = block[name_start..].find("</div>").map_or(block.len(), |e| name_start + e);
+            let div = &block[name_start..name_end];
+            folder = plain(&div[div.find('>').map_or(0, |g| g + 1)..]);
+            folder_end = block[name_end..].find("</ul>").map_or(block.len(), |e| name_end + e);
+        } else if tag.contains("qa-course") {
+            let a_end = block[tag_end..].find("</a>").map_or(block.len(), |e| tag_end + e);
+            let a = &block[tag_end..a_end];
+            let href = between(a, "href=\"").unwrap_or("");
+            let id = href.split("id=").nth(1).and_then(|v| v.split(['&', '"']).next()).and_then(|v| v.parse().ok());
+            let name = plain(&a[a.find('>').map_or(0, |g| g + 1)..]);
+            if let (Some(id), true) = (id, href.contains("/course/view.php")) {
+                out.push((folder.clone(), id, name));
+            }
+        }
+        pos = tag_end;
+    }
+    out
+}
+
+/// Ids of the lists beside the courses, and the page ids of conversations.
+pub const NOTIFICATIONS: &str = "notifications";
+pub const MESSAGES: &str = "messages";
+pub const GRADES: &str = "grades";
+pub const CONVERSATION: &str = "conversation:";
+/// Messages read per request, and at most per chat.
+const CHAT_PAGE: usize = 100;
+const CHAT_MAX: usize = 2000;
+
+/// "12 Oct" (this year) or "12 Oct 2025".
+fn day(t: Option<i64>) -> String {
+    let Some(t) = t.and_then(|t| Local.timestamp_opt(t, 0).single()) else { return String::new() };
+    if t.format("%Y").to_string() == Local::now().format("%Y").to_string() {
+        t.format("%d %b").to_string()
+    } else {
+        t.format("%d %b %Y").to_string()
+    }
+}
+
+/// A page from lines, with ids and positions filled in.
+fn numbered(list: &str, title: &str, emoji: &str, mut lines: Vec<Task>) -> Page {
+    for (i, l) in lines.iter_mut().enumerate() {
+        l.id = format!("l{i}");
+        l.list = list.into();
+        l.pos = i as u32;
+    }
+    Page { list: list.into(), title: title.into(), emoji: emoji.into(), lines }
+}
+
+/// A page's `<title>`, without the site name.
+fn page_title(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    lower
+        .find("<title>")
+        .and_then(|i| lower[i..].find("</title>").map(|e| plain(&html[i + 7..i + e])))
+        .map(|t| t.split(" | ").next().unwrap_or("").to_string())
+        .unwrap_or_default()
+}
+
+/// The signed-in user's id from a page's settings (`"userId":123`).
+fn page_user_id(html: &str) -> Option<i64> {
+    let i = html.find("\"userId\":")? + 9;
+    html[i..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok().filter(|id| *id > 1)
+}
+
+/// The discussions of a forum's web page: each row of its discussion table
+/// (`data-region="discussion-list-item"`) with subject, author, date and replies.
+fn forum_rows(list: &str, html: &str, base: &Url) -> Vec<Task> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(i) = html[pos..].find("data-region=\"discussion-list-item\"").map(|i| pos + i) {
+        let tag_start = html[..i].rfind("<tr").unwrap_or(i);
+        let tag_end = html[i..].find('>').map_or(html.len(), |e| i + e);
+        let end = html[tag_end..].find("</tr>").map_or(html.len(), |e| tag_end + e);
+        pos = end;
+        let attrs = attributes(&html[tag_start + 1..tag_end]);
+        let row = &html[tag_end + 1..end];
+        let cells: Vec<String> = row
+            .split("<td")
+            .flat_map(|c| c.split("<th"))
+            .skip(1)
+            // Blocks inside a cell (name, date) are separate words.
+            .map(|c| plain(&c[c.find('>').map_or(0, |g| g + 1)..].replace('<', " <")).split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        // [star, subject, started by + date, last post, replies, menu]
+        let subject = cells.get(1).cloned().unwrap_or_default();
+        let subject = subject.trim_end_matches("Gesperrt").trim_end_matches("Locked").trim().to_string();
+        let mut title = subject;
+        if let Some(author) = cells.get(2).filter(|a| !a.is_empty()) {
+            title.push_str(&format!("  · {author}"));
+        }
+        if let Some(n) = cells.get(4).and_then(|r| r.parse::<u32>().ok()).filter(|n| *n > 0) {
+            title.push_str(&format!(" · {n} {}", if n == 1 { "reply" } else { "replies" }));
+        }
+        let Some(d) = attrs.get("data-discussionid").filter(|d| !d.is_empty()) else { continue };
+        let n = out.len();
+        out.push(Task {
+            id: format!("l{n}"),
+            list: list.into(),
+            title,
+            marker: "💬 ".into(),
+            url: base.join(&format!("/mod/forum/discuss.php?d={d}")).map(|u| u.to_string()).unwrap_or_default(),
+            sublist: Some(format!("{DISCUSSION}{d}")),
+            important: attrs.get("class").is_some_and(|c| c.contains("pinned")),
+            pos: n as u32,
+            ..Task::default()
+        });
+    }
+    out
 }
 
 /// When the deadline list is due for a look again.
@@ -1291,7 +1905,7 @@ mod tests {
                 { "id": "3", "name": "Slides &amp; notes", "module": "resource", "url": "https://m/mod/resource/view.php?id=3", "uservisible": true }
             ]
         });
-        let lines = state_lines("c5", &Value::String(state.to_string())).unwrap();
+        let lines = state_lines("c5", &Value::String(state.to_string()), "https://m").unwrap();
         let shown: Vec<(&str, &str)> = lines.iter().map(|l| (l.marker.as_str(), l.title.as_str())).collect();
         assert_eq!(shown, [("", "General"), ("💬 ", "Announcements"), ("", "Week 1"), ("📄 ", "Slides & notes")]);
         assert!(lines[0].heading && lines[3].url.ends_with("id=3"));
@@ -1411,21 +2025,98 @@ mod tests {
         let shown: Vec<(&str, &str)> = lines.iter().map(|l| (l.marker.as_str(), l.title.as_str())).collect();
         assert_eq!(
             shown,
-            [("", "Übungsmaterial"), ("", "Alle Dateien für die Übung & mehr."), ("📄 ", "gimp.zip"), ("› ", "Fragen zur Übung"), ("🔗 ", "GIMP website"), ("• ", "nach oben")]
+            [("", "Übungsmaterial"), ("", "Alle Dateien für die Übung & mehr."), ("📄 ", "gimp.zip"), ("💬 ", "Fragen zur Übung"), ("🔗 ", "GIMP website"), ("• ", "nach oben")]
         );
         assert!(lines[0].heading);
         assert!(lines[2].sublist.as_deref().unwrap().starts_with("file:https://m.x/pluginfile.php/"));
-        assert_eq!(lines[3].sublist.as_deref(), Some("url:https://m.x/mod/forum/discuss.php?d=9"));
+        assert_eq!(lines[3].sublist.as_deref(), Some("discussion:9"));
         assert!(lines[4].sublist.is_none() && lines[4].url == "https://www.gimp.org/");
     }
 
     #[test]
     fn activities_open_the_right_way() {
-        assert_eq!(activity_target("forum", "https://m/mod/forum/view.php?id=1").as_deref(), Some("url:https://m/mod/forum/view.php?id=1"));
+        assert_eq!(activity_target("forum", "https://m/mod/forum/view.php?id=1").as_deref(), Some("forum:1"));
         assert_eq!(activity_target("resource", "https://m/mod/resource/view.php?id=2").as_deref(), Some("file:https://m/mod/resource/view.php?id=2&redirect=1"));
         assert_eq!(activity_target("url", "https://m/mod/url/view.php?id=3"), None);
         assert_eq!(percent_decode("Folien%20VL%2001.pdf"), "Folien VL 01.pdf");
         assert_eq!(safe_name("../../x.exe"), "x.exe");
+    }
+
+    #[test]
+    fn reads_grips_course_folders() {
+        let html = r#"<ul id="qa-blocklist" class="qa-blocklist unlist"><li id="allgemein" class="qa-listentry qa-usercategory"><div id="qa-toggle-243777" class="qa-toggle qa-toggle-closed"><img src="x/user_folder_opened.png" class="icon"/><img src="y.png" class="icon"/>Allgemein</div><ul id="qa-courselist" class="qa-courselist unlist qa-hidden" style=""><li id="fidsforum" class="qa-listentry qa-course"><a title="FIDS@UR" href="https://m/course/view.php?id=63622" class="aalink"> <i class="fa fa-graduation-cap"></i>FIDS-Forum</a></li></ul></li><li id="fs1" class="qa-listentry qa-usercategory"><div id="qa-toggle-243775" class="qa-toggle qa-toggle-closed">FS 1</div><ul id="qa-courselist" class="qa-courselist"><li id="a" class="qa-listentry qa-course"><a href="https://m/course/view.php?id=62586" class="aalink">Theoretische Grundlagen &amp; mehr</a></li><li id="b" class="qa-listentry qa-course"><a href="https://m/course/view.php?id=62585">VL TGI</a></li></ul></li><li id="c" class="qa-listentry qa-course"><a href="https://m/course/view.php?id=7">Loose course</a></li></ul></div></section>"#;
+        assert_eq!(
+            quick_access(html),
+            [
+                ("Allgemein".to_string(), 63622, "FIDS-Forum".to_string()),
+                ("FS 1".to_string(), 62586, "Theoretische Grundlagen & mehr".to_string()),
+                ("FS 1".to_string(), 62585, "VL TGI".to_string()),
+                (String::new(), 7, "Loose course".to_string()),
+            ]
+        );
+        assert!(quick_access("<html>no block</html>").is_empty());
+    }
+
+    #[test]
+    fn reads_forum_tables_and_rows() {
+        let base = Url::parse("https://m/mod/forum/view.php?id=5").unwrap();
+        let html = r#"<table><tbody><tr class="discussion subscribed pinned" data-region="discussion-list-item" data-discussionid="545789" data-forumid="">
+            <td class="p-0"><a href="https://m/mod/forum/subscribe.php?id=5&amp;sesskey=abc">x</a></td>
+            <th class="topic"><div><a href="https://m/mod/forum/discuss.php?d=545789">Klausur MMT: Ergebnisse</a></div><div><span hidden="">Gesperrt</span></div></th>
+            <td class="author"><div>Raphael Wimmer</div><div><time datetime="2025-02-27">27. Feb. 2025</time></div></td>
+            <td>Raphael Wimmer 27. Feb. 2025</td><td>2</td><td>Dieses Thema markieren</td></tr></tbody></table>"#;
+        let rows = forum_rows("f", html, &base);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Klausur MMT: Ergebnisse  · Raphael Wimmer 27. Feb. 2025 · 2 replies");
+        assert_eq!(rows[0].sublist.as_deref(), Some("discussion:545789"));
+        assert!(rows[0].important);
+
+        // Assignment status: one line per row; submitted files listed below their header.
+        let html = r#"<div role="main"><table><tr><th>Abgabestatus</th><td>Zur Bewertung abgegeben</td></tr>
+            <tr><th>Dateiabgabe</th><td><div><a href="https://m/pluginfile.php/1/a.blend">a.blend</a></div><div><a href="https://m/pluginfile.php/1/a.mp4">a.mp4</a></div></td></tr>
+            <tr><td><a href="https://m/course/user.php?id=3">Multimedia Technology</a></td><td>-</td></tr></table></div>"#;
+        let (_, lines) = html_lines("x", html, &base);
+        let shown: Vec<&str> = lines.iter().map(|l| l.title.as_str()).collect();
+        assert_eq!(shown, ["Abgabestatus: Zur Bewertung abgegeben", "Dateiabgabe:", "a.blend", "a.mp4", "Multimedia Technology · -"]);
+        assert!(lines[2].sublist.as_deref().unwrap().starts_with("file:"));
+        assert!(lines[4].sublist.as_deref().unwrap().starts_with("url:"));
+
+        // Action links (with the session key) are never followed.
+        assert!(link_line("https://m/mod/forum/subscribe.php?id=5&sesskey=abc", "Abonnieren", &base).is_none());
+        assert_eq!(page_user_id(r#"M.cfg = {"sesskey":"x","userId":189149,"x":1}"#), Some(189149));
+    }
+
+    #[test]
+    fn nests_subsections() {
+        // Moodle 4.5: "Studienleistungen" holds subsections, each with its activities.
+        let state = json!({
+            "course": { "sectionlist": ["1"] },
+            "section": [
+                { "id": "1", "title": "Studienleistungen", "cmlist": ["10"] },
+                { "id": "2", "title": "Assignment 1", "cmlist": ["11", "12"], "component": "mod_subsection", "itemid": 10 }
+            ],
+            "cm": [
+                { "id": "10", "name": "Assignment 1 - Introduction", "module": "subsection", "uservisible": true },
+                { "id": "11", "name": "Abgabe 1", "module": "assign", "url": "https://m/mod/assign/view.php?id=11", "uservisible": true },
+                { "id": "12", "name": "Material", "module": "folder", "uservisible": true }
+            ]
+        });
+        let lines = state_lines("c5", &state, "https://m").unwrap();
+        let shown: Vec<(u8, &str)> = lines.iter().map(|l| (l.depth, l.title.as_str())).collect();
+        assert_eq!(shown, [(0, "Studienleistungen"), (1, "Assignment 1 - Introduction"), (2, "Abgabe 1"), (2, "Material")]);
+        assert!(lines[1].heading && lines[1].subheading);
+        // The folder had no address in the course data; it gets its own.
+        assert_eq!(lines[3].sublist.as_deref(), Some("url:https://m/mod/folder/view.php?id=12"));
+    }
+
+    #[test]
+    fn status_tables_read_as_pairs() {
+        let base = Url::parse("https://m/mod/assign/view.php?id=1").unwrap();
+        let html = r#"<div role="main"><table><tr><th scope="row">Abgabestatus</th><td>Zur Bewertung abgegeben</td></tr></table></div>"#;
+        let (_, lines) = html_lines("x", html, &base);
+        assert_eq!(lines[0].title, "Abgabestatus: Zur Bewertung abgegeben");
+        let link = link_line("/mod/forum/discuss.php?d=42", "Frage", &base).unwrap();
+        assert_eq!(link.sublist.as_deref(), Some("discussion:42"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod matrix;
 mod moodle;
 mod model;
 mod pics;
+mod pick;
 mod qr;
 #[cfg(feature = "discord")]
 mod ra;

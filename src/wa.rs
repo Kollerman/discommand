@@ -28,6 +28,8 @@ pub struct WaChat {
     pub is_group: bool,
     pub last_ts: i64,
     pub unread: u32,
+    /// When it was pinned (0: not pinned); pinned chats come first.
+    pub pinned: i64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -120,8 +122,11 @@ impl WaState {
     }
 
     fn sort(&mut self) {
-        let mut chats: Vec<&WaChat> = self.chats.values().filter(|c| c.last_ts > 0).collect();
-        chats.sort_by(|a, b| b.last_ts.cmp(&a.last_ts).then_with(|| a.name.cmp(&b.name)));
+        let mut chats: Vec<&WaChat> = self.chats.values().filter(|c| c.last_ts > 0 || c.pinned > 0).collect();
+        // Pinned chats on top (as on the phone: the latest pin first), then by activity.
+        chats.sort_by(|a, b| {
+            (b.pinned > 0).cmp(&(a.pinned > 0)).then(b.pinned.cmp(&a.pinned)).then(b.last_ts.cmp(&a.last_ts)).then_with(|| a.name.cmp(&b.name))
+        });
         self.order = chats.into_iter().map(|c| c.jid.clone()).collect();
     }
 
@@ -422,6 +427,14 @@ pub async fn login(sc: &mut Sidecar, phone: Option<&str>) -> Result<Vec<WaEvent>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_chats_come_first() {
+        let chat = |jid: &str, last_ts: i64, pinned: i64| WaChat { jid: jid.into(), last_ts, pinned, ..WaChat::default() };
+        let mut st = WaState::default();
+        st.set_chats(vec![chat("new", 300, 0), chat("old-pin", 100, 50), chat("new-pin", 50, 90), chat("silent-pin", 0, 10), chat("empty", 0, 0)]);
+        assert_eq!(st.order, ["new-pin", "old-pin", "silent-pin", "new"]);
+    }
 
     #[test]
     fn parses_events() {

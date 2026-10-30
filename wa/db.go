@@ -82,6 +82,7 @@ type Chat struct {
 	IsGroup bool   `json:"is_group"`
 	LastTS  int64  `json:"last_ts"`
 	Unread  int    `json:"unread"`
+	Pinned  int64  `json:"pinned"`
 }
 
 type DB struct {
@@ -94,6 +95,8 @@ func (db DB) init(ctx context.Context) error {
 	}
 	// Added after the first release; fails harmlessly when the column exists.
 	_, _ = db.ExecContext(ctx, `ALTER TABLE dc_messages ADD COLUMN reply_sender TEXT NOT NULL DEFAULT ''`)
+	// When the chat was pinned (0: not pinned).
+	_, _ = db.ExecContext(ctx, `ALTER TABLE dc_chats ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`)
 	return nil
 }
 
@@ -248,6 +251,14 @@ func (db DB) touchChat(ctx context.Context, jid string, isGroup bool, ts int64, 
 	return err
 }
 
+// setPinned records when a chat was pinned (0: unpinned).
+func (db DB) setPinned(ctx context.Context, jid string, isGroup bool, pinned int64) error {
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO dc_chats (jid, is_group, pinned) VALUES (?, ?, ?)
+		ON CONFLICT (jid) DO UPDATE SET pinned = excluded.pinned`, jid, isGroup, pinned)
+	return err
+}
+
 func (db DB) setChatName(ctx context.Context, jid, name string) error {
 	_, err := db.ExecContext(ctx, `UPDATE dc_chats SET name = ? WHERE jid = ?`, name, jid)
 	return err
@@ -307,12 +318,13 @@ func (db DB) unreadIncoming(ctx context.Context, jid string, ts int64) (map[stri
 
 const chatQuery = `
 	SELECT c.jid, c.name, c.is_group, c.last_ts,
-		(SELECT COUNT(*) FROM dc_messages m WHERE m.chat = c.jid AND m.from_me = 0 AND m.ts > c.read_ts)
+		(SELECT COUNT(*) FROM dc_messages m WHERE m.chat = c.jid AND m.from_me = 0 AND m.ts > c.read_ts),
+		c.pinned
 	FROM dc_chats c`
 
 func scanChat(row interface{ Scan(...any) error }) (*Chat, error) {
 	var c Chat
-	if err := row.Scan(&c.JID, &c.Name, &c.IsGroup, &c.LastTS, &c.Unread); err != nil {
+	if err := row.Scan(&c.JID, &c.Name, &c.IsGroup, &c.LastTS, &c.Unread, &c.Pinned); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -323,7 +335,7 @@ func (db DB) chat(ctx context.Context, jid string) (*Chat, error) {
 }
 
 func (db DB) chats(ctx context.Context) ([]*Chat, error) {
-	rows, err := db.QueryContext(ctx, chatQuery+` WHERE c.last_ts > 0 ORDER BY c.last_ts DESC`)
+	rows, err := db.QueryContext(ctx, chatQuery+` WHERE c.last_ts > 0 OR c.pinned > 0 ORDER BY c.last_ts DESC`)
 	if err != nil {
 		return nil, err
 	}

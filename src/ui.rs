@@ -207,6 +207,11 @@ fn draw_input(f: &mut Frame, app: &App, input: Rect) {
             format!(" replying to {who}{} ", if *ping { "" } else { " (no ping)" })
         }
     };
+    // A file waiting to be sent goes first in the label.
+    let label = match app.pending_file().and_then(|p| p.file_name()) {
+        Some(name) => format!(" 📎 {} — caption optional, Enter sends, Esc removes {label}", name.to_string_lossy()),
+        None => label,
+    };
     let block = Block::new()
         .borders(Borders::TOP)
         .border_style(if focused { Style::new().fg(Color::Green) } else { DIM })
@@ -338,7 +343,7 @@ fn draw_page(f: &mut Frame, app: &App, area: Rect) {
             let (mark, mark_style) = if t.check {
                 (if t.done { "☑ " } else { "☐ " }.to_string(), if t.done { DIM } else { Style::new().fg(Color::Gray) })
             } else if t.sublist.is_some() {
-                ("→ ".to_string(), Style::new().fg(Color::Cyan))
+                (if t.marker.is_empty() { "→ ".to_string() } else { t.marker.clone() }, Style::new().fg(Color::Cyan))
             } else if t.quote {
                 ("│ ".to_string(), DIM)
             } else {
@@ -1042,6 +1047,7 @@ const HELP: &[(&str, &str)] = &[
     (":b name", "open first matching channel"),
     (":r", "reload chat / sync calendar"),
     ("A", "mark all chats of this service read"),
+    ("F  :attach PATH", "send a file (F: pick it in the file dialog)"),
     (":mute [1h]  :unmute", "mute the selected server/channel/DM"),
     (":read  :read all", "the same / in every chat service"),
     (":images on|off", "show pictures in chats (on)"),

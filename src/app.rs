@@ -1,7 +1,6 @@
 //! Application state and vim-style key handling.
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::sync::Arc;
 
 use base64::Engine;
@@ -269,6 +268,8 @@ const TWOS_CAL: &str = "twos";
 const MOODLE_CAL: &str = "moodle";
 /// The sidebar section holding the lists without open to-dos.
 const MORE_LISTS: &str = "\u{1}more";
+/// Sidebar folders of lists (`TaskList::group`) have ids with this prefix.
+const GROUP: &str = "\u{1}group:";
 
 /// A task tab: one task app's lists and tasks.
 #[derive(Default)]
@@ -283,6 +284,8 @@ pub struct TaskTab {
     /// The list shown whole in the main pane (Twos), and its selected line.
     page: Option<String>,
     page_sel: Option<usize>,
+    /// Pages opened from other pages (Enter on a sub-list), to go back to with h.
+    back: Vec<(String, Option<usize>)>,
 }
 
 impl TaskTab {
@@ -377,6 +380,8 @@ pub struct App {
     pub logout: bool,
     /// A newer release, shown in the status bar.
     pub update: Option<String>,
+    /// A file to send with the next message: (service, chat, path).
+    pub attachment: Option<(Service, String, std::path::PathBuf)>,
 }
 
 impl App {
@@ -464,6 +469,7 @@ impl App {
             quit: false,
             logout: false,
             update: None,
+            attachment: None,
         }
     }
 
@@ -771,7 +777,7 @@ impl App {
                 kind: ItemKind::WaChat,
                 id: c.jid.clone(),
                 depth: 0,
-                label: chats.label(&c.jid),
+                label: if c.pinned > 0 { format!("📌 {}", chats.label(&c.jid)) } else { chats.label(&c.jid) },
                 unread: c.unread > 0,
                 mentions: c.unread,
                 expanded: false,
@@ -1138,7 +1144,6 @@ impl App {
             .collect();
         if !due.is_empty() {
             self.status = due.join(" · ");
-            bell();
         }
         if self.cal.next_poll.is_some_and(|t| t <= std::time::Instant::now()) {
             self.cal_sync();
@@ -1147,7 +1152,6 @@ impl App {
             let tasks: Vec<String> = self.tab_mut(s).state.due_reminders(now).into_iter().map(|t| format!("☐ {}", t.title)).collect();
             if !tasks.is_empty() {
                 self.status = format!("⏰ {}: {}", s.name(), tasks.join(" · "));
-                bell();
             }
             if self.tab(s).state.next_poll.is_some_and(|t| t <= std::time::Instant::now()) {
                 self.todo_sync(s);
@@ -1196,7 +1200,11 @@ impl App {
             TodoMsg::File(Err(e)) => self.status = e,
             TodoMsg::Page(list, page) => match page {
                 Ok(p) => {
-                    let st = &mut self.tab_mut(s).state;
+                    let tab = self.tab_mut(s);
+                    if list.starts_with(moodle::CONVERSATION) && tab.page.as_deref() == Some(list.as_str()) {
+                        tab.page_sel = Some(p.lines.len().saturating_sub(1));
+                    }
+                    let st = &mut tab.state;
                     st.loading.remove(&list);
                     st.pages.insert(list, p);
                 }
@@ -1207,9 +1215,11 @@ impl App {
                 let st = &mut self.tab_mut(s).state;
                 st.syncing = false;
                 st.login = None;
-                st.next_poll = Some(std::time::Instant::now() + poll);
-                st.status = "sync failed".into();
-                self.status = e;
+                // Offline: try again in a minute (other errors at the next regular sync).
+                let offline = e.contains(moodle::OFFLINE);
+                st.next_poll = Some(std::time::Instant::now() + if offline { std::time::Duration::from_secs(60) } else { poll });
+                st.status = if offline { "offline, retrying".into() } else { "sync failed".into() };
+                self.status = if offline { format!("{} {e}: trying again in a minute", s.name()) } else { e };
             }
             TodoMsg::DeviceCode(uri, code) => {
                 self.status = format!("Microsoft sign-in: open {uri} and enter {code}");
@@ -1351,14 +1361,42 @@ impl App {
         };
         let name = |l: &TaskList| if l.emoji.is_empty() { l.name.clone() } else { format!("{} {}", l.emoji, l.name) };
         let (top, more): (Vec<&TaskList>, Vec<&TaskList>) = tab.state.lists.iter().partition(|l| !l.more);
-        for l in top {
+        // Lists in a folder appear under it, where its first list would be.
+        let mut seen_groups: Vec<&str> = Vec::new();
+        let mut entries: Vec<(&TaskList, u16)> = Vec::new();
+        for l in &top {
+            if l.group.is_empty() {
+                entries.push((l, 0));
+                continue;
+            }
+            if seen_groups.contains(&l.group.as_str()) {
+                continue;
+            }
+            seen_groups.push(&l.group);
+            let members: Vec<&TaskList> = top.iter().copied().filter(|m| m.group == l.group).collect();
+            let id = format!("{GROUP}{}", l.group);
+            let folded = members.iter().all(|m| m.folded);
+            let shut = folded != tab.toggled.contains(&id);
+            items.push(list_item(&id, 0, format!("📁 {} ({})", l.group, members.len()), !shut));
+            if !shut {
+                for m in members {
+                    items.push(list_item(&m.id, 1, name(m), false));
+                }
+            }
+        }
+        for (l, depth) in entries {
+            let pos = items.len();
             let tasks: Vec<&Task> = tab.state.tasks.iter().filter(|t| t.list == l.id).collect();
             let open = tasks.iter().filter(|t| t.check && !t.done).count();
             let shut = l.folded != tab.toggled.contains(&l.id);
-            items.push(list_item(&l.id, 0, if open > 0 { format!("{} ({open})", name(l)) } else { name(l) }, !shut));
+            let item = list_item(&l.id, depth, if open > 0 { format!("{} ({open})", name(l)) } else { name(l) }, !shut);
+            // Top-level lists (Deadlines) come before the folders.
+            let at = items.iter().position(|t| t.id.starts_with(GROUP)).unwrap_or(pos);
+            items.insert(at, item);
             if shut {
                 continue;
             }
+            let mut at = at + 1;
             for t in tasks {
                 let due = t.due.map(|d| match (d - today).num_days() {
                     0 => "today".to_string(),
@@ -1378,18 +1416,22 @@ impl App {
                 if let Some(from) = t.from {
                     label.push_str(&format!("  ↪ {}", from.format("%a %d %b")));
                 }
-                items.push(TreeItem {
-                    kind: if t.check { ItemKind::TodoTask } else { ItemKind::TodoNote },
-                    id: t.key(),
-                    depth: 1 + t.depth as u16,
-                    label,
-                    unread: (t.important || t.heading) && !t.done,
-                    mentions: 0,
-                    expanded: false,
-                    group: false,
-                    color,
-                    dim: t.done,
-                });
+                items.insert(
+                    at,
+                    TreeItem {
+                        kind: if t.check { ItemKind::TodoTask } else { ItemKind::TodoNote },
+                        id: t.key(),
+                        depth: depth + 1 + t.depth as u16,
+                        label,
+                        unread: (t.important || t.heading) && !t.done,
+                        mentions: 0,
+                        expanded: false,
+                        group: false,
+                        color,
+                        dim: t.done,
+                    },
+                );
+                at += 1;
             }
         }
         if !more.is_empty() {
@@ -1433,7 +1475,7 @@ impl App {
             Focus::Input | Focus::Command => self.last_pane,
             f => f,
         };
-        pane == Focus::Messages && self.page().is_some()
+        pane == Focus::Messages && self.tab(self.service).page.is_some()
     }
 
     /// The whole list in the main pane (Twos), once read.
@@ -1465,7 +1507,7 @@ impl App {
             let item = self.tree.get(self.tree_sel());
             let task = self.tree_task();
             let list = match item.map(|t| t.kind) {
-                Some(ItemKind::TodoList) => item.map(|t| t.id.clone()).filter(|id| id != MORE_LISTS),
+                Some(ItemKind::TodoList) => item.map(|t| t.id.clone()).filter(|id| id != MORE_LISTS && !id.starts_with(GROUP)),
                 _ => task.map(|t| t.list.clone()),
             };
             let list = list.or_else(|| self.tasks().default_list().map(String::from));
@@ -1473,6 +1515,7 @@ impl App {
             let tab = self.tab_mut(s);
             tab.page_sel = key.and_then(|k| tab.state.pages.get(list.as_ref()?)?.lines.iter().position(|t| t.key() == k));
             tab.page = list;
+            tab.back.clear();
         }
         let tab = self.tab_mut(s);
         let Some(list) = tab.page.clone() else { return };
@@ -1491,6 +1534,19 @@ impl App {
 
     /// Keys of the main pane while it shows a whole list.
     fn page_key(&mut self, k: KeyEvent, pending: Option<char>, n: usize, counted: bool) {
+        // Back: to the page this one was opened from, else to the sidebar
+        // (also while the page is still loading).
+        if matches!(k.code, KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace) {
+            let tab = self.tab_mut(self.service);
+            match tab.back.pop() {
+                Some((page, sel)) => {
+                    tab.page = Some(page);
+                    tab.page_sel = sel;
+                }
+                None => self.focus = Focus::Tree,
+            }
+            return;
+        }
         let Some(len) = self.page().map(|p| p.lines.len()) else { return };
         let last = len.saturating_sub(1);
         let sel = self.page_sel();
@@ -1511,10 +1567,6 @@ impl App {
             }
             KeyCode::Char('G') | KeyCode::End => if counted { (n - 1).min(last) } else { last },
             KeyCode::Home => 0,
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.focus = Focus::Tree;
-                return;
-            }
             // A sub-list opens in place (h goes back to the sidebar's list), a
             // file downloads and opens, a link goes to the browser; o always
             // goes to the browser when there's a link.
@@ -1529,8 +1581,14 @@ impl App {
                     self.spawn(async move { Some(AppEvent::Todo(s, TodoMsg::File(api.download(&url).await))) });
                 } else if let (Some(sub), false) = (t.sublist.clone(), browser) {
                     let tab = self.tab_mut(self.service);
-                    tab.page = Some(sub);
-                    tab.page_sel = Some(0);
+                    if let Some(current) = tab.page.replace(sub.clone()) {
+                        tab.back.push((current, tab.page_sel));
+                    }
+                    // A chat opens at its newest message, everything else at the top.
+                    tab.page_sel = match tab.state.pages.get(&sub) {
+                        Some(p) if sub.starts_with(moodle::CONVERSATION) => Some(p.lines.len().saturating_sub(1)),
+                        _ => Some(0),
+                    };
                 } else if !t.url.is_empty() {
                     let url = t.url.clone();
                     if let Err(e) = open_url(&url) {
@@ -1820,7 +1878,6 @@ impl App {
                 // Edits and reactions also arrive as "msg"; only new incoming DMs ring.
                 let new = chat.map_or(true, |c| msg.ts >= c.last_ts) && !msg.edited && !msg.deleted;
                 if new && !msg.from_me && !viewing && !chat.is_some_and(|c| c.is_group) {
-                    bell();
                 }
                 self.chats_mut(s).upsert_msg(msg);
                 if viewing {
@@ -2008,7 +2065,6 @@ impl App {
             self.state.acked.insert(ch.clone(), id);
         } else if ping && !viewing {
             *self.state.mentions.entry(ch.clone()).or_default() += 1;
-            bell();
         }
         if self.state.channels.get(&ch).is_some_and(|c| c.is_dm()) {
             self.state.sort_dms();
@@ -2416,10 +2472,59 @@ impl App {
         self.focus = if self.last_pane == Focus::Tree { Focus::Tree } else { Focus::Messages };
     }
 
+    /// Picks a file (`path` typed, else the file dialog) to send with the next
+    /// message in the open chat; the input then takes its caption.
+    pub fn attach(&mut self, path: Option<&str>) {
+        if !self.service.is_messaging() {
+            self.status = "files can be sent in Discord, WhatsApp and Matrix chats".into();
+            return;
+        }
+        let Some(chat) = self.current_chat().map(String::from) else {
+            self.status = "open a chat first".into();
+            return;
+        };
+        let path = match path.map(|p| p.trim().trim_matches('"')).filter(|p| !p.is_empty()) {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                let picked = crate::pick::file("Send a file");
+                // The dialog was on top of the terminal: draw everything again.
+                self.dirty = true;
+                match picked {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return,
+                    Err(e) => {
+                        self.status = e;
+                        return;
+                    }
+                }
+            }
+        };
+        if !path.is_file() {
+            self.status = format!("{} isn't a file", path.display());
+            return;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.attachment = Some((self.service, chat, path));
+        self.status = format!("📎 {name}: type a caption (optional), Enter sends, Esc removes it");
+        self.enter_insert();
+    }
+
+    /// The file waiting to be sent in the chat shown, if any.
+    pub fn pending_file(&self) -> Option<&std::path::Path> {
+        let (s, chat, path) = self.attachment.as_ref()?;
+        (*s == self.service && self.current_chat() == Some(chat.as_str())).then_some(path.as_path())
+    }
+
     fn submit(&mut self) {
         let text = self.input.text();
         let content = text.trim_end().to_string();
         let mode = std::mem::replace(&mut self.mode, Mode::Normal);
+        if let (Some(path), false) = (self.pending_file().map(|p| p.to_path_buf()), matches!(mode, Mode::Edit(_))) {
+            self.attachment = None;
+            self.input.clear();
+            self.msg_sel = None;
+            return self.send_file(path, content, mode);
+        }
         if content.trim().is_empty() {
             self.input.clear();
             return;
@@ -2514,6 +2619,35 @@ impl App {
             Some(match result {
                 Ok(m) => AppEvent::Sent(m),
                 Err(e) => AppEvent::Error(format!("send failed: {e}")),
+            })
+        });
+    }
+
+    /// Sends a file to the open chat, `caption` as its text.
+    fn send_file(&mut self, path: std::path::PathBuf, caption: String, mode: Mode) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let reply = match &mode {
+            Mode::Reply { id, ping } => Some((id.clone(), *ping)),
+            _ => None,
+        };
+        if self.service.is_wa_like() {
+            let Some(chat) = self.open_of(self.service).clone() else { return };
+            let mut cmd = json!({"c": "file", "chat": chat, "path": path.to_string_lossy(), "text": caption});
+            if let Some((id, _)) = reply {
+                cmd["reply_to"] = json!(id);
+            }
+            wa::send(self.cmd_of(self.service), cmd);
+            self.status = format!("sending {name}…");
+            return;
+        }
+        let Some(ch) = self.current.clone() else { return };
+        let api = self.api.clone();
+        self.status = format!("sending {name}…");
+        self.spawn(async move {
+            let reply = reply.as_ref().map(|(id, ping)| (id.as_str(), *ping));
+            Some(match api.send_file(&ch, path, &caption, reply).await {
+                Ok(m) => AppEvent::Sent(m),
+                Err(e) => AppEvent::Error(format!("sending {name} failed: {e}")),
             })
         });
     }
@@ -2629,6 +2763,7 @@ impl App {
             "todo" | "tasks" => self.todo_command(arg),
             "twos" => self.twos_command(arg),
             "moodle" => self.moodle_command(arg),
+            "attach" | "file" | "send" => self.attach(Some(arg)),
             "images" | "img" => {
                 self.pics.enabled = match arg {
                     "on" => true,
@@ -2824,6 +2959,10 @@ impl App {
             }
             KeyCode::Enter => self.submit(),
             KeyCode::BackTab => self.cycle_service(),
+            KeyCode::Esc if self.pending_file().is_some() => {
+                self.attachment = None;
+                self.status = "file removed".into();
+            }
             KeyCode::Esc => {
                 if matches!(self.mode, Mode::Edit(_)) {
                     self.input.clear();
@@ -2928,6 +3067,11 @@ impl App {
             }
             KeyCode::Char('?' | 'ß') => {
                 self.help = true;
+                return;
+            }
+            // F: pick a file to send in the open chat.
+            KeyCode::Char('F') if self.service.is_messaging() => {
+                self.attach(None);
                 return;
             }
             // Read all: every chat of the messaging service shown.
@@ -3055,7 +3199,10 @@ impl App {
             }
             ItemKind::TodoList if id == MORE_LISTS => self.tab_mut(self.service).more_open = open,
             ItemKind::TodoList => {
-                let folded = self.tasks().lists.iter().any(|l| l.id == id && l.folded);
+                let folded = match id.strip_prefix(GROUP) {
+                    Some(group) => self.tasks().lists.iter().filter(|l| l.group == group).all(|l| l.folded),
+                    None => self.tasks().lists.iter().any(|l| l.id == id && l.folded),
+                };
                 let toggled = &mut self.tab_mut(self.service).toggled;
                 if open == folded {
                     toggled.insert(id);
@@ -3276,12 +3423,6 @@ async fn fetch_pic(http: &reqwest::Client, url: &str, key: String) -> Option<Pic
     }
     let bytes = resp.bytes().await.ok()?;
     tokio::task::spawn_blocking(move || pics::decode_for(&key, &bytes)).await.ok().flatten()
-}
-
-fn bell() {
-    let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x07");
-    let _ = out.flush();
 }
 
 /// File types that are opened directly after a download. Anything else

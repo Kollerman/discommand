@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2021"
 description = "Lightweight, battery-friendly terminal Discord client"
 license = "MIT"
-x
+
 [features]
 default = ["native-tls", "discord", "whatsapp", "matrix", "calendar", "todo", "twos", "moodle"]
 
@@ -15,7 +15,7 @@ discord = ["dep:rsa"]
 whatsapp = []
 # Matrix with end-to-end encryption (matrix-rust-sdk). Its HTTP client always uses
 # rustls; ring is its crypto backend (builds everywhere, unlike aws-lc).
-matrix = ["dep:matrix-sdk", "dep:rustls"]
+matrix = ["dep:matrix-sdk", "dep:rustls", "dep:mime"]
 calendar = []
 todo = []
 twos = []
@@ -33,7 +33,7 @@ crossterm = "0.28"
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "net", "process", "io-util"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 # Cookies: Moodle sites without the app interface are used like a browser.
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "multipart"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -55,6 +55,13 @@ getrandom = "0.4"
 # (SQLite is compiled in, so no system library is needed).
 matrix-sdk = { version = "0.19", default-features = false, features = ["e2e-encryption", "automatic-room-key-forwarding", "bundled-sqlite"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+# The type of a file sent to Matrix.
+mime = { version = "0.3", optional = true }
+
+# The system's file dialog (picking files to send); Linux uses the desktop's
+# portal, so no GTK is needed to build.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI token encryption, EFS folder encryption, and telling left from right Shift.

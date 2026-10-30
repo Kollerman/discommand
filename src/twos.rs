@@ -403,6 +403,7 @@ impl Twos {
                 more: more && !favorite,
                 folded: true,
                 default: false,
+                group: String::new(),
             }
         };
         for t in other {

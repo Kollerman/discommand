@@ -258,6 +258,7 @@ The app is modal like vim. Press `?` inside it for this list.
 | --- | --- |
 | anywhere (normal) | `i`/`a` insert · **`A` mark every chat of this service read** · `:` command · `/` or `Ctrl-k` find chat · `?` help · **`Shift-Tab` / `gt` next service, right `Shift-Tab` / `gT` previous, `2gt` the 2nd** (right Shift is detected on Windows only) · `Tab`, `Ctrl-w w`, `Ctrl-h`/`Ctrl-l` switch pane |
 | sidebar | `j k` · `gg G` · counts (`5j`) · `l`/`o`/`Enter` open/expand · `h` collapse/parent · `za zo zc zM` |
+| sending files | **`F`** opens the file dialog; the file waits above the input (`📎 name`), you can type a caption, `Enter` sends it, `Esc` removes it. `:attach <path>` does the same without the dialog (SSH, Termux). Discord, WhatsApp (photo/video/audio/document by file type, up to 100 MB) and Matrix (encrypted in encrypted rooms). |
 | messages | `j k Ctrl-u Ctrl-d` select · `gg` top + load history · `G`/`Esc` newest · `r`/`R` reply (ping/no ping) · `+` react (then `1`–`5`: ❤️ 👍 😂 💀 😅; the same again removes it) · `e` edit · `dd` delete · `o`/`gx` open link, attachment or WhatsApp media |
 | insert | `Enter` send · `Alt-Enter` newline · `↑` on empty input edits your last message · `Esc` normal · `Shift-Tab` switch service |
 | commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:mute [15m\|1h\|8h\|24h\|7d]` / `:unmute` the selected Discord server, category, channel or DM · `:images on\|off` · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
@@ -365,8 +366,8 @@ Dates can be `heute`/`today`, `morgen`/`tomorrow`, `übermorgen`, weekday names,
 date or time, the text goes to Google's own parser ("Lunch with Ana tomorrow 1pm").
 New events go to your primary calendar.
 
-**Reminders.** When an event's popup reminder from Google comes due, the terminal
-bell rings and the status line shows it. The next event within 12 hours is always in
+**Reminders.** When an event's popup reminder from Google comes due, the
+status line shows it. The next event within 12 hours is always in
 the status line. The calendar syncs every 10 minutes. Between syncs, the app sleeps
 until the next reminder or event change, with no polling.
 
@@ -407,7 +408,7 @@ The login is stored encrypted like the other tokens. `:todo logout` removes it, 
 
 New tasks use the calendar's one-line syntax: `morgen 14:00 Arzt anrufen` is due
 tomorrow with a reminder at 14:00; `28.10. Steuer` is due on that date; `Milch kaufen`
-has no date. Reminders ring the bell and show in the status line.
+has no date. Reminders show in the status line.
 
 ## Twos
 
@@ -431,7 +432,7 @@ The keys are the same as in Tasks, in either pane: `x` ticks a to-do off, and `n
 one to the selected list (Today if nothing else is selected). `e` edits any line and
 `dd` deletes it. A date or time typed with a to-do (`morgen 14:00 Arzt anrufen`) becomes
 its Twos reminder, since Twos has no separate due date. Reminders show in the calendar
-(in orange) and ring the bell.
+(in orange) and in the status line.
 
 Day lists are recognised by their title: today's title shows the date format your
 account uses.
@@ -460,14 +461,24 @@ It asks for the site (e.g. `elearning.uni-regensburg.de`), your user name and yo
 password (hidden).
 
 - **Sidebar:** **Deadlines** first (assignments, quizzes and the like from the last
-  two weeks on, overdue ones in red), then your current courses.
+  two weeks on, overdue ones in red), then **Notifications** (the bell) and
+  **Messages** with their unread counts, **Grades**, and your courses. GRIPS users get
+  their own "Meine Kurse" folders; other sites group courses by course category.
+  Folders with running courses start open.
 - **Main pane:** a course opens as a page of its sections and activities.
 - **Enter on an activity opens it here,** as a page of its content. Forums, folders,
   assignments and pages show their text and links. A link to another Moodle page
   (e.g. a forum discussion) opens the next page, a file (PDF, slides …) downloads and
-  opens, and an outside link goes to the browser. `o` always opens the selected thing
+  opens, and an outside link goes to the browser.
+  Subsections (groups inside a section) appear nested under their section.
+  Forums list their discussions (newest first, pinned ones bold); a discussion shows
+  its posts with author, date and attachments.
+  Assignments show their status, submitted files and feedback, and tables in general
+  read one row per line. Messages and notifications can be read, not answered.
+  Links that would change something on the site (subscribe, mark, log out …) are
+  shown as text and can't be followed. `o` always opens the selected thing
   in the browser (e.g. to take a quiz or hand something in), and `h` goes back.
-- **Calendar:** deadlines also show there, with a bell a day ahead.
+- **Calendar:** deadlines also show there, with a reminder a day ahead.
 - **Read-only:** `x` ticks off activities that are completed by hand. Handing in and
   the like stays in Moodle.
 

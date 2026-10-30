@@ -135,6 +135,8 @@ pub struct TaskList {
     pub more: bool,
     /// Starts folded in the sidebar.
     pub folded: bool,
+    /// The sidebar folder it's shown in (Moodle: the course category); none: top level.
+    pub group: String,
 }
 
 /// A whole list as the app shows it (Twos): every line, in order.

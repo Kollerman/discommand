@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -100,6 +102,8 @@ func run(dbPath, cacheDir, logPath string) error {
 
 	a := &App{db: db, cacheDir: cacheDir, out: json.NewEncoder(os.Stdout)}
 	a.cli = whatsmeow.NewClient(device, log.Sub("client"))
+	// Chat settings (pins) also arrive when the whole app state is synced.
+	a.cli.EmitAppStateEventsOnFullSync = true
 	a.cli.AddEventHandler(a.onEvent)
 
 	if a.cli.Store.ID == nil {
@@ -350,6 +354,15 @@ func (a *App) onEvent(raw any) {
 		a.emit(event{"t": "paired"})
 		a.emitLinked(ctx)
 	case *events.Connected:
+		// Pins weren't read before this version: fetch the chat settings once
+		// more (a download only; nothing changes on the phone).
+		if a.cli.Store.ID != nil && a.db.kv(ctx, "pins_synced") == "" {
+			go func() {
+				if err := a.cli.FetchAppState(ctx, appstate.WAPatchRegularLow, true, false); err == nil {
+					_ = a.db.setKV(ctx, "pins_synced", "1")
+				}
+			}()
+		}
 		if a.cli.Store.ID != nil {
 			a.emit(event{"t": "status", "status": "connected"})
 		}
@@ -383,6 +396,18 @@ func (a *App) onEvent(raw any) {
 		a.emitChat(ctx, jid)
 	case *events.AppStateSyncComplete, *events.Contact, *events.PushName, *events.BusinessName:
 		a.namesChanged()
+	case *events.Pin:
+		// Pinned or unpinned on the phone (or another device).
+		jid := a.canonical(ctx, evt.JID)
+		var at int64
+		if evt.Action.GetPinned() {
+			at = evt.Timestamp.Unix()
+			if at <= 0 {
+				at = 1
+			}
+		}
+		_ = a.db.setPinned(ctx, jid.String(), jid.Server == types.GroupServer, at)
+		a.emitChat(ctx, jid.String())
 	case *events.MarkChatAsRead:
 		// Read on another device (e.g. the phone).
 		jid := a.canonical(ctx, evt.JID).String()
@@ -517,6 +542,9 @@ func (a *App) onHistorySync(ctx context.Context, evt *events.HistorySync) {
 			a.ensureChatName(ctx, chatJID, "")
 		}
 		_ = a.db.setUnread(ctx, chat, int(conv.GetUnreadCount()))
+		if p := conv.GetPinned(); p > 0 {
+			_ = a.db.setPinned(ctx, chat, jid.Server == types.GroupServer, int64(p))
+		}
 	}
 	a.emitChats(ctx)
 }
@@ -534,6 +562,7 @@ type command struct {
 	Phone    string `json:"phone"`
 	On       bool   `json:"on"`
 	Key      string `json:"key"`
+	Path     string `json:"path"`
 	Full     bool   `json:"full"`
 }
 
@@ -568,6 +597,8 @@ func (a *App) handle(ctx context.Context, cmd command) {
 		a.emit(event{"t": "history", "chat": cmd.Chat, "older": cmd.BeforeTS > 0, "msgs": msgs, "complete": len(msgs) < 50})
 	case "send":
 		a.send(ctx, chat, cmd.Text, cmd.ReplyTo)
+	case "file":
+		a.sendFile(ctx, chat, cmd.Path, cmd.Text, cmd.ReplyTo)
 	case "edit":
 		edit := a.cli.BuildEdit(chat, cmd.ID, &waE2E.Message{Conversation: proto.String(cmd.Text)})
 		if _, err := a.cli.SendMessage(ctx, chat, edit); err != nil {
@@ -668,6 +699,129 @@ func (a *App) send(ctx context.Context, chat types.JID, text, replyTo string) {
 		Kind:       "text",
 		Text:       text,
 	}
+	if quoted != nil {
+		own.ReplyID, own.ReplyName, own.ReplyText = quoted.ID, quoted.SenderName, strings.ReplaceAll(quoted.Text, "\n", " ")
+		own.ReplySender = quoted.Sender
+	}
+	_, _ = a.db.insertMsg(ctx, own)
+	_ = a.db.touchChat(ctx, own.Chat, chat.Server == types.GroupServer, own.TS, true)
+	a.emit(event{"t": "msg", "msg": own})
+	a.emitChat(ctx, own.Chat)
+}
+
+// maxUpload is the largest file sent (WhatsApp allows more for documents,
+// but the whole file is held in memory here).
+const maxUpload = 100 << 20
+
+// sendFile uploads a file and sends it as a photo, video or audio message
+// by its type, anything else as a document; text is the caption.
+func (a *App) sendFile(ctx context.Context, chat types.JID, path, caption, replyTo string) {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		a.fail("can't read %s", filepath.Base(path))
+		return
+	}
+	if info.Size() > maxUpload {
+		a.fail("%s is too large to send from here (over 100 MB)", filepath.Base(path))
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		a.fail("can't read %s: %v", filepath.Base(path), err)
+		return
+	}
+	name := filepath.Base(path)
+	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
+	if mimeType == "" {
+		mimeType = http.DetectContentType(data)
+	}
+	mimeType, _, _ = strings.Cut(mimeType, ";")
+
+	var replyCtx *waE2E.ContextInfo
+	var quoted *Msg
+	if replyTo != "" {
+		if q, err := a.db.getMsg(ctx, chat.String(), replyTo); err == nil {
+			quoted = q
+			participant := q.Sender
+			if q.FromMe && a.cli.Store.ID != nil {
+				participant = a.cli.Store.ID.ToNonAD().String()
+			}
+			replyCtx = &waE2E.ContextInfo{
+				StanzaID:      proto.String(q.ID),
+				Participant:   proto.String(participant),
+				QuotedMessage: &waE2E.Message{Conversation: proto.String(q.Text)},
+			}
+		}
+	}
+
+	kind := whatsmeow.MediaDocument
+	switch {
+	case mimeType == "image/jpeg" || mimeType == "image/png":
+		kind = whatsmeow.MediaImage
+	case mimeType == "video/mp4" || mimeType == "video/3gpp":
+		kind = whatsmeow.MediaVideo
+	case strings.HasPrefix(mimeType, "audio/"):
+		kind = whatsmeow.MediaAudio
+	}
+	a.emit(event{"t": "status", "status": "sending " + name + "…"})
+	up, err := a.cli.Upload(ctx, data, kind)
+	if err != nil {
+		a.emit(event{"t": "status", "status": "connected"})
+		a.fail("upload failed: %v", err)
+		return
+	}
+	var caption2 *string
+	if caption != "" {
+		caption2 = proto.String(caption)
+	}
+	msg := &waE2E.Message{}
+	switch kind {
+	case whatsmeow.MediaImage:
+		msg.ImageMessage = &waE2E.ImageMessage{
+			URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath), MediaKey: up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			Mimetype: proto.String(mimeType), Caption: caption2, ContextInfo: replyCtx,
+		}
+	case whatsmeow.MediaVideo:
+		msg.VideoMessage = &waE2E.VideoMessage{
+			URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath), MediaKey: up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			Mimetype: proto.String(mimeType), Caption: caption2, ContextInfo: replyCtx,
+		}
+	case whatsmeow.MediaAudio:
+		msg.AudioMessage = &waE2E.AudioMessage{
+			URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath), MediaKey: up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			Mimetype: proto.String(mimeType), ContextInfo: replyCtx,
+		}
+	default:
+		msg.DocumentMessage = &waE2E.DocumentMessage{
+			URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath), MediaKey: up.MediaKey,
+			FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
+			Mimetype: proto.String(mimeType), FileName: proto.String(name), Title: proto.String(name),
+			Caption: caption2, ContextInfo: replyCtx,
+		}
+	}
+	resp, err := a.cli.SendMessage(ctx, chat, msg)
+	a.emit(event{"t": "status", "status": "connected"})
+	if err != nil {
+		a.fail("send failed: %v", err)
+		return
+	}
+	c := extract(msg)
+	own := &Msg{
+		ID:         resp.ID,
+		Chat:       chat.String(),
+		Sender:     a.cli.Store.ID.ToNonAD().String(),
+		SenderName: a.cli.Store.PushName,
+		FromMe:     true,
+		TS:         resp.Timestamp.Unix(),
+		Kind:       c.kind,
+		Text:       c.text,
+		File:       c.file,
+		Media:      true,
+	}
+	own.raw, _ = proto.Marshal(msg)
 	if quoted != nil {
 		own.ReplyID, own.ReplyName, own.ReplyText = quoted.ID, quoted.SenderName, strings.ReplaceAll(quoted.Text, "\n", " ")
 		own.ReplySender = quoted.Sender

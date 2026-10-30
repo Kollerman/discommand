@@ -150,3 +150,29 @@ func TestExtension(t *testing.T) {
 		t.Errorf("no type: got %q, want the .jpg fallback", got)
 	}
 }
+
+func TestPinnedChats(t *testing.T) {
+	ctx := context.Background()
+	db := testDB(t)
+	if err := db.touchChat(ctx, "1@s.whatsapp.net", false, 10, false); err != nil {
+		t.Fatal(err)
+	}
+	// Pinned before any message arrived: the chat is listed anyway.
+	if err := db.setPinned(ctx, "2@s.whatsapp.net", false, 99); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.setPinned(ctx, "1@s.whatsapp.net", false, 50); err != nil {
+		t.Fatal(err)
+	}
+	chats, err := db.chats(ctx)
+	if err != nil || len(chats) != 2 {
+		t.Fatalf("chats: %v %v", chats, err)
+	}
+	if err := db.setPinned(ctx, "1@s.whatsapp.net", false, 0); err != nil {
+		t.Fatal(err)
+	}
+	c, err := db.chat(ctx, "1@s.whatsapp.net")
+	if err != nil || c.Pinned != 0 || c.LastTS != 10 {
+		t.Fatalf("unpinned chat: %+v %v", c, err)
+	}
+}
