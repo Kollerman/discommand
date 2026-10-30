@@ -64,6 +64,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.cal_detail {
         draw_event_popup(f, app);
     }
+    if let Some(c) = &app.confirm {
+        draw_confirm(f, c);
+    }
     scrub(f);
 }
 
@@ -1060,6 +1063,34 @@ const HELP: &[(&str, &str)] = &[
     (":twos login KEY", "connect Twos"),
     (":q  :logout", "quit / quit and forget token"),
 ];
+
+/// A question before an action that changes something: y goes ahead.
+fn draw_confirm(f: &mut Frame, c: &crate::app::Confirm) {
+    let width = 76u16.min(f.area().width.saturating_sub(2));
+    let inner = width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for l in &c.lines {
+        if l.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let style = if l.starts_with('⚠') { Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::new() };
+        for w in wrap(l, inner) {
+            lines.push(Line::from(Span::styled(format!(" {w}"), style)));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(format!(" [y] {} ", c.yes), Style::new().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+        Span::styled("   any other key: cancel (nothing is sent)", DIM),
+    ]));
+    let area = centered(f.area(), width, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(format!(" {} ", c.title)).border_style(Style::new().fg(Color::Yellow))),
+        area,
+    );
+}
 
 fn draw_help(f: &mut Frame) {
     let area = centered(f.area(), 60, HELP.len() as u16 + 2);

@@ -1,6 +1,6 @@
 //! Application state and vim-style key handling.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use base64::Engine;
@@ -54,6 +54,25 @@ pub enum TodoMsg {
     Changed(String, bool),
     /// A file linked from a page was downloaded (its path), to be opened.
     File(Result<String, String>),
+    /// An action was prepared and checked: ask before doing it.
+    Confirm(Result<Box<Confirm>, String>),
+    /// An action on a page finished (the page to read again, and what happened).
+    Done(String, Result<String, String>),
+}
+
+/// A question before an action that changes something on a site (handing
+/// in an assignment): what will happen, and the action on yes.
+pub struct Confirm {
+    pub title: String,
+    pub lines: Vec<String>,
+    /// What y does ("upload", "hand in").
+    pub yes: String,
+    action: ConfirmAction,
+}
+
+enum ConfirmAction {
+    Upload(moodle::UploadPlan),
+    Submit(moodle::SubmitPlan),
 }
 
 pub enum CalMsg {
@@ -277,7 +296,7 @@ pub struct TaskTab {
     pub state: TodoState,
     api: Option<Backend>,
     /// Task lists folded or unfolded in the sidebar (the opposite of how they start).
-    toggled: HashSet<String>,
+    open: HashMap<String, bool>,
     /// "More lists" is unfolded.
     more_open: bool,
     positioned: bool,
@@ -382,6 +401,8 @@ pub struct App {
     pub update: Option<String>,
     /// A file to send with the next message: (service, chat, path).
     pub attachment: Option<(Service, String, std::path::PathBuf)>,
+    /// A question waiting for y (anything else cancels).
+    pub confirm: Option<Box<Confirm>>,
 }
 
 impl App {
@@ -470,6 +491,7 @@ impl App {
             logout: false,
             update: None,
             attachment: None,
+            confirm: None,
         }
     }
 
@@ -1198,6 +1220,22 @@ impl App {
                 Err(e) => self.status = format!("could not open {path}: {e}"),
             },
             TodoMsg::File(Err(e)) => self.status = e,
+            TodoMsg::Confirm(Ok(c)) => {
+                self.status.clear();
+                self.confirm = Some(c);
+            }
+            TodoMsg::Confirm(Err(e)) => self.status = e,
+            TodoMsg::Done(page, result) => {
+                self.status = match result {
+                    Ok(m) => format!("✔ {m}"),
+                    Err(e) => format!("✖ {e}"),
+                };
+                // Read the page (and the deadlines) again, to show what Moodle has now.
+                let st = &mut self.tab_mut(s).state;
+                st.pages.remove(&page);
+                st.loading.remove(&page);
+                self.todo_sync(s);
+            }
             TodoMsg::Page(list, page) => match page {
                 Ok(p) => {
                     let tab = self.tab_mut(s);
@@ -1376,7 +1414,7 @@ impl App {
             let members: Vec<&TaskList> = top.iter().copied().filter(|m| m.group == l.group).collect();
             let id = format!("{GROUP}{}", l.group);
             let folded = members.iter().all(|m| m.folded);
-            let shut = folded != tab.toggled.contains(&id);
+            let shut = !tab.open.get(&id).copied().unwrap_or(!folded);
             items.push(list_item(&id, 0, format!("📁 {} ({})", l.group, members.len()), !shut));
             if !shut {
                 for m in members {
@@ -1388,7 +1426,7 @@ impl App {
             let pos = items.len();
             let tasks: Vec<&Task> = tab.state.tasks.iter().filter(|t| t.list == l.id).collect();
             let open = tasks.iter().filter(|t| t.check && !t.done).count();
-            let shut = l.folded != tab.toggled.contains(&l.id);
+            let shut = !tab.open.get(&l.id).copied().unwrap_or(!l.folded);
             let item = list_item(&l.id, depth, if open > 0 { format!("{} ({open})", name(l)) } else { name(l) }, !shut);
             // Top-level lists (Deadlines) come before the folders.
             let at = items.iter().position(|t| t.id.starts_with(GROUP)).unwrap_or(pos);
@@ -1570,6 +1608,22 @@ impl App {
             // A sub-list opens in place (h goes back to the sidebar's list), a
             // file downloads and opens, a link goes to the browser; o always
             // goes to the browser when there's a link.
+            KeyCode::Char('F') if self.tab(self.service).page.as_deref().is_some_and(|p| p.starts_with(moodle::ASSIGN)) => {
+                let cmid = self.tab(self.service).page.as_deref().and_then(|p| p.strip_prefix(moodle::ASSIGN)).unwrap_or("").to_string();
+                self.assign_upload(cmid);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
+                if self.page_task().and_then(|t| t.sublist.as_deref()).is_some_and(|s| s.starts_with(moodle::ASSIGN_UPLOAD) || s.starts_with(moodle::ASSIGN_SUBMIT)) =>
+            {
+                let action = self.page_task().and_then(|t| t.sublist.clone()).unwrap_or_default();
+                if let Some(cmid) = action.strip_prefix(moodle::ASSIGN_UPLOAD) {
+                    self.assign_upload(cmid.to_string());
+                } else if let Some(cmid) = action.strip_prefix(moodle::ASSIGN_SUBMIT) {
+                    self.assign_submit(cmid.to_string());
+                }
+                return;
+            }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('o') => {
                 let Some(t) = self.page_task() else { return };
                 let browser = k.code == KeyCode::Char('o') && !t.url.is_empty();
@@ -2436,7 +2490,7 @@ impl App {
                 tab.more_open |= more;
                 // A task in a folded list: unfold it.
                 if let Some(list) = list.filter(|_| folded) {
-                    tab.toggled.insert(list);
+                    tab.open.insert(list, true);
                 }
             }
             self.rebuild_tree();
@@ -2470,6 +2524,103 @@ impl App {
 
     fn leave_insert(&mut self) {
         self.focus = if self.last_pane == Focus::Tree { Focus::Tree } else { Focus::Messages };
+    }
+
+    /// Which folders and lists of the task tabs (Moodle's course folders too)
+    /// were opened or closed, kept for the next start.
+    fn save_folds(&self) {
+        let Some(path) = folds_path() else { return };
+        let mut all = serde_json::Map::new();
+        for s in [Service::Tasks, Service::Twos, Service::Moodle] {
+            let tab = self.tab(s);
+            let mut open: serde_json::Map<String, serde_json::Value> = tab.open.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+            open.insert(MORE_LISTS.into(), json!(tab.more_open));
+            all.insert(s.name().into(), serde_json::Value::Object(open));
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, serde_json::Value::Object(all).to_string());
+    }
+
+    pub fn load_folds(&mut self) {
+        let Some(saved) = folds_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else {
+            return;
+        };
+        for s in [Service::Tasks, Service::Twos, Service::Moodle] {
+            let Some(map) = saved[s.name()].as_object() else { continue };
+            let tab = self.tab_mut(s);
+            for (k, v) in map {
+                match (k.as_str(), v.as_bool()) {
+                    (MORE_LISTS, Some(b)) => tab.more_open = b,
+                    (_, Some(b)) => {
+                        tab.open.insert(k.clone(), b);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn moodle_api(&self) -> Option<Arc<Moodle>> {
+        match &self.moodle.api {
+            Some(Backend::Moodle(m)) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
+    /// Upload to an assignment: pick the file, check it against the
+    /// assignment's rules, then ask (nothing is sent before the yes).
+    fn assign_upload(&mut self, cmid: String) {
+        let Some(m) = self.moodle_api() else { return };
+        let picked = crate::pick::file("Upload to your assignment submission");
+        self.dirty = true;
+        let path = match picked {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => {
+                self.status = format!("{e} (for assignments, uploading needs the file dialog)");
+                return;
+            }
+        };
+        self.status = "checking the file and the assignment…".into();
+        let s = self.service;
+        self.spawn(async move {
+            let plan = m.prepare_upload(&cmid, path).await;
+            Some(AppEvent::Todo(s, TodoMsg::Confirm(plan.map(|p| Box::new(upload_question(p))))))
+        });
+    }
+
+    /// Hand an assignment in: read the declaration, then ask.
+    fn assign_submit(&mut self, cmid: String) {
+        let Some(m) = self.moodle_api() else { return };
+        self.status = "reading the hand-in page…".into();
+        let s = self.service;
+        self.spawn(async move {
+            let plan = m.prepare_submit(&cmid).await;
+            Some(AppEvent::Todo(s, TodoMsg::Confirm(plan.map(|p| Box::new(submit_question(p))))))
+        });
+    }
+
+    fn run_confirmed(&mut self, c: Confirm) {
+        let Some(m) = self.moodle_api() else { return };
+        let s = Service::Moodle;
+        match c.action {
+            ConfirmAction::Upload(plan) => {
+                self.status = format!("uploading {} ({})…", plan.name, moodle::size(plan.size));
+                self.spawn(async move {
+                    let page = format!("{}{}", moodle::ASSIGN, plan.cmid);
+                    Some(AppEvent::Todo(s, TodoMsg::Done(page, m.upload(&plan).await)))
+                });
+            }
+            ConfirmAction::Submit(plan) => {
+                self.status = "handing in…".into();
+                self.spawn(async move {
+                    let page = format!("{}{}", moodle::ASSIGN, plan.cmid);
+                    Some(AppEvent::Todo(s, TodoMsg::Done(page, m.submit(&plan).await)))
+                });
+            }
+        }
     }
 
     /// Picks a file (`path` typed, else the file dialog) to send with the next
@@ -2885,6 +3036,15 @@ impl App {
             }
             return;
         }
+        // Only y (or j) goes ahead; any other key cancels, nothing is sent.
+        if let Some(c) = self.confirm.take() {
+            if matches!(k.code, KeyCode::Char('y' | 'Y' | 'j' | 'J')) {
+                self.run_confirmed(*c);
+            } else {
+                self.status = "cancelled: nothing was sent".into();
+            }
+            return;
+        }
         if self.react_picker {
             self.react_picker = false;
             if let KeyCode::Char(c @ '1'..='5') = k.code {
@@ -3197,18 +3357,14 @@ impl App {
                     self.collapsed.insert(id);
                 }
             }
-            ItemKind::TodoList if id == MORE_LISTS => self.tab_mut(self.service).more_open = open,
+            ItemKind::TodoList if id == MORE_LISTS => {
+                self.tab_mut(self.service).more_open = open;
+                self.save_folds();
+            }
             ItemKind::TodoList => {
-                let folded = match id.strip_prefix(GROUP) {
-                    Some(group) => self.tasks().lists.iter().filter(|l| l.group == group).all(|l| l.folded),
-                    None => self.tasks().lists.iter().any(|l| l.id == id && l.folded),
-                };
-                let toggled = &mut self.tab_mut(self.service).toggled;
-                if open == folded {
-                    toggled.insert(id);
-                } else {
-                    toggled.remove(&id);
-                }
+                // Remembered as open or closed, also for the next start.
+                self.tab_mut(self.service).open.insert(id, open);
+                self.save_folds();
             }
             _ => return,
         }
@@ -3389,6 +3545,77 @@ impl App {
 }
 
 const REFRESHING: &str = "refreshing…";
+
+fn folds_path() -> Option<std::path::PathBuf> {
+    crate::secret::data_dir().map(|d| d.join("folds.json"))
+}
+
+/// The question before an upload: everything that matters for an assignment.
+fn upload_question(p: moodle::UploadPlan) -> Confirm {
+    let mut lines = vec![format!("Assignment:  {}", p.info.title)];
+    lines.extend(p.info.dates.iter().map(|d| format!("             {d}")));
+    if let Some(left) = p.info.get("Verbleibende Zeit").or_else(|| p.info.get("Time remaining")) {
+        lines.push(format!("             {left}"));
+    }
+    if let Some(st) = p.info.get("Abgabestatus").or_else(|| p.info.get("Submission status")) {
+        lines.push(format!("Status now:  {st}"));
+    }
+    lines.push(String::new());
+    lines.push(format!("File:        {} ({})", p.name, moodle::size(p.size)));
+    lines.push(format!("From:        {}", p.path.display()));
+    if p.replaces() {
+        lines.push(format!("⚠ Replaces the file of the same name already in your submission: {}", p.name));
+    }
+    let others: Vec<&String> = p.existing.iter().filter(|f| **f != p.name).collect();
+    if !others.is_empty() {
+        lines.push(format!("Stays in your submission: {}", others.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    let mut rules = Vec::new();
+    if p.maxbytes > 0 {
+        rules.push(format!("at most {} per file", moodle::size(p.maxbytes as u64)));
+    }
+    if p.maxfiles > 0 {
+        rules.push(format!("up to {} files", p.maxfiles));
+    }
+    if !p.accepted.is_empty() {
+        rules.push(format!("types: {}", p.accepted.join(" ")));
+    }
+    if !rules.is_empty() {
+        lines.push(format!("Rules (checked, the file fits): {}", rules.join("; ")));
+    }
+    lines.push(String::new());
+    lines.push(if p.info.can_submit {
+        "Moodle saves your submission as a draft; hand it in afterwards with ✅ Hand in.".into()
+    } else {
+        "Moodle saves your submission. If the course asks for it, hand it in afterwards (✅ appears then).".into()
+    });
+    lines.push("Afterwards discommand checks on the assignment page that the file is there.".into());
+    Confirm { title: "Upload to your assignment?".into(), lines, yes: "upload".into(), action: ConfirmAction::Upload(p) }
+}
+
+/// The question before handing in: the files, and the declaration in full.
+fn submit_question(p: moodle::SubmitPlan) -> Confirm {
+    let mut lines = vec![format!("Assignment:  {}", p.info.title)];
+    lines.extend(p.info.dates.iter().map(|d| format!("             {d}")));
+    if let Some(left) = p.info.get("Verbleibende Zeit").or_else(|| p.info.get("Time remaining")) {
+        lines.push(format!("             {left}"));
+    }
+    lines.push(String::new());
+    if p.info.files.is_empty() {
+        lines.push("⚠ Your submission has no files.".into());
+    } else {
+        lines.push("These files are handed in:".into());
+        lines.extend(p.info.files.iter().map(|f| format!("  📄 {f}")));
+    }
+    lines.push(String::new());
+    if let Some(st) = &p.statement {
+        lines.push("By pressing y you agree to this declaration:".into());
+        lines.push(format!("  “{st}”"));
+        lines.push(String::new());
+    }
+    lines.push("⚠ After handing in you usually can't change your submission any more.".into());
+    Confirm { title: "Hand in for grading?".into(), lines, yes: "hand in".into(), action: ConfirmAction::Submit(p) }
+}
 
 /// The reactions offered by the picker (`+`, then 1–5).
 pub const REACTIONS: [&str; 5] = ["❤️", "👍", "😂", "💀", "😅"];

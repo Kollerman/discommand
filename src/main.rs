@@ -284,6 +284,7 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
     }
 
     let mut app = App::new(api, tx, gw_tx, cmds, mx_cmds);
+    app.load_folds();
     app.cal_sync();
     app.todo_sync(Service::Tasks);
     app.todo_sync(Service::Twos);

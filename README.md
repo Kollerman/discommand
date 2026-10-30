@@ -473,8 +473,27 @@ password (hidden).
   Subsections (groups inside a section) appear nested under their section.
   Forums list their discussions (newest first, pinned ones bold); a discussion shows
   its posts with author, date and attachments.
-  Assignments show their status, submitted files and feedback, and tables in general
-  read one row per line. Messages and notifications can be read, not answered.
+  Tables in general read one row per line.
+
+**Assignments** open in their own view: the dates (opened, due, last chance) and the
+time left on top, the description with its files, then what you can do, the
+submission status, your submitted files (Enter downloads them) and the feedback
+(grade, comments, files).
+
+- **Upload:** `F` (or Enter on 📤) opens the file dialog. discommand first checks the
+  file against the assignment's rules (size per file, number of files, allowed types)
+  and refuses it with the reason if it doesn't fit. Then a window shows the
+  assignment, its due date and time left, the file and its size, the files already
+  in your submission, whether a file of the same name gets replaced, and what
+  happens next. Only `y` uploads; any other key cancels. Afterwards discommand
+  reads the assignment again and checks that the file is listed, then shows the new
+  status.
+- **Hand in:** if the course wants submissions handed in separately, Enter on ✅
+  shows the files that will be handed in and the course's declaration in full;
+  `y` hands in (and agrees to it). discommand checks the result again.
+- Other parts of the submission form (e.g. online text) are sent back unchanged.
+  Removing a file, and assignments that need online text, still go through the
+  browser (`o`). Messages and notifications can be read, not answered.
   Links that would change something on the site (subscribe, mark, log out …) are
   shown as text and can't be followed. `o` always opens the selected thing
   in the browser (e.g. to take a quiz or hand something in), and `h` goes back.

@@ -398,6 +398,7 @@ fn unescape(s: &str) -> String {
             "gt" => Some('>'),
             "quot" => Some('"'),
             "apos" => Some('\''),
+            "nbsp" => Some(' '),
             e if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32),
             e if e.starts_with('#') => e[1..].parse().ok().and_then(char::from_u32),
             _ => None,
@@ -1186,6 +1187,275 @@ impl Moodle {
         Ok(Page { list: list.into(), title: page_title(&html), emoji: "💬".into(), lines: rows })
     }
 
+    // ---- assignments ----------------------------------------------------------------
+
+    /// The session key of the signed-in session (forms and uploads need it).
+    async fn session_key(&self) -> Result<String, String> {
+        if !self.creds.token.is_empty() {
+            return Err("handing in works only with the browser-style login, not the app login: press o".into());
+        }
+        let mut key = self.sesskey.lock().await;
+        if key.is_none() {
+            *key = Some(self.sign_in().await?);
+        }
+        Ok(key.clone().unwrap_or_default())
+    }
+
+    async fn assign_view(&self, cmid: &str) -> Result<(String, Url), String> {
+        let (html, at) = self.fetch(&format!("{}/mod/assign/view.php?id={cmid}", self.creds.site)).await?;
+        if !at.path().ends_with("/mod/assign/view.php") {
+            return Err("this assignment isn't open to you (yet)".into());
+        }
+        Ok((html, at))
+    }
+
+    /// An assignment: dates and time left first, the description, what you
+    /// can do (upload, hand in), then status, your files and the feedback.
+    async fn assign_page(&self, list: &str, cmid: &str) -> Result<Page, String> {
+        let (html, at) = self.assign_view(cmid).await?;
+        let info = assign_info(&html, &at);
+        let mut lines: Vec<Task> = Vec::new();
+        for d in &info.dates {
+            lines.push(Task { title: d.clone(), marker: "📅 ".into(), important: true, ..Task::default() });
+        }
+        if let Some(left) = info.get("Verbleibende Zeit").or_else(|| info.get("Time remaining")) {
+            let overdue = left.contains("überfällig") || left.to_ascii_lowercase().contains("overdue");
+            lines.push(Task { title: left.to_string(), marker: if overdue { "⚠ " } else { "⏳ " }.into(), important: true, ..Task::default() });
+        }
+        if let Some(intro) = element(&html, "id=\"intro\"") {
+            let (_, mut body) = html_lines(list, intro, &at);
+            if !body.is_empty() {
+                lines.push(Task { title: "Description".into(), heading: true, ..Task::default() });
+                body.iter_mut().for_each(|l| l.depth = 0);
+                lines.append(&mut body);
+            }
+        }
+        if info.can_edit || info.can_submit {
+            lines.push(Task { title: "What you can do".into(), heading: true, ..Task::default() });
+        }
+        if info.can_edit {
+            lines.push(Task {
+                title: "Upload a file to your submission (or F)".into(),
+                marker: "📤 ".into(),
+                sublist: Some(format!("{ASSIGN_UPLOAD}{cmid}")),
+                important: true,
+                ..Task::default()
+            });
+        }
+        if info.can_submit {
+            lines.push(Task {
+                title: "Hand in for grading: until then your submission is only a draft".into(),
+                marker: "✅ ".into(),
+                sublist: Some(format!("{ASSIGN_SUBMIT}{cmid}")),
+                important: true,
+                ..Task::default()
+            });
+        }
+        // The rest of the page: status, your files, feedback (without buttons and templates).
+        let (_, body) = html_lines(list, &html, &at);
+        let buttons = ["Aufgabenlösung hinzufügen", "Abgabe bearbeiten", "Aufgabe abgeben", "Add submission", "Edit submission", "Submit assignment", "Bewerten", "Grade"];
+        lines.extend(body.into_iter().filter(|l| !l.title.contains("___") && !buttons.contains(&l.title.as_str())));
+        let mut page = numbered(list, &info.title, "📝", lines);
+        page.list = list.into();
+        Ok(page)
+    }
+
+    /// Everything needed to upload `path` into an assignment, checked against
+    /// its rules; nothing is sent yet.
+    pub async fn prepare_upload(&self, cmid: &str, path: std::path::PathBuf) -> Result<UploadPlan, String> {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or("not a file")?;
+        let size = std::fs::metadata(&path).map_err(|e| format!("can't read {name}: {e}"))?.len();
+        let (view, at) = self.assign_view(cmid).await?;
+        let info = assign_info(&view, &at);
+        if !info.can_edit {
+            return Err("this assignment can't be changed any more (closed, handed in or locked)".into());
+        }
+        let sesskey = self.session_key().await?;
+        let (edit, _) = self.fetch(&format!("{}/mod/assign/view.php?id={cmid}&action=editsubmission", self.creds.site)).await?;
+        let fields = form_fields(&edit, "savesubmission").ok_or("found no submission form on the page")?;
+        let fm = filemanager(&edit).ok_or("this assignment takes no files (no file upload on its form)")?;
+        let s = |v: &Value| v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
+        let itemid = s(&fm["itemid"]);
+        if fields.iter().all(|(k, v)| !(k == "files_filemanager" && *v == itemid)) {
+            return Err("the submission form looks different than expected; upload in the browser instead (o)".into());
+        }
+        let repo = fm["filepicker"]["repositories"]
+            .as_object()
+            .and_then(|r| r.values().find(|r| r["type"] == "upload"))
+            .map(|r| s(&r["id"]))
+            .ok_or("this site doesn't allow uploading from your computer here")?;
+        let accepted_raw: Vec<String> = fm["accepted_types"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).map(String::from).collect();
+        let accepted = if accepted_raw.iter().any(|t| t == "*") || accepted_raw.is_empty() { Vec::new() } else { accepted_extensions(&edit, &accepted_raw) };
+        let mut plan = UploadPlan {
+            cmid: cmid.into(),
+            info,
+            fields,
+            sesskey,
+            itemid,
+            client_id: s(&fm["client_id"]),
+            ctx_id: s(&fm["context"]["id"]),
+            repo,
+            author: s(&fm["author"]),
+            license: fm["filepicker"]["defaultlicense"].as_str().or(fm["defaultlicense"].as_str()).unwrap_or("unknown").into(),
+            maxbytes: number(&fm["maxbytes"]),
+            areamaxbytes: number(&fm["areamaxbytes"]),
+            maxfiles: number(&fm["maxfiles"]),
+            accepted_raw,
+            accepted,
+            existing: Vec::new(),
+            path,
+            name,
+            size,
+        };
+        plan.existing = self.draft_files(&plan).await?;
+        plan.check()?;
+        Ok(plan)
+    }
+
+    /// The files in the submission's draft area (what is in the submission now).
+    async fn draft_files(&self, plan: &UploadPlan) -> Result<Vec<String>, String> {
+        let form = [("sesskey", plan.sesskey.as_str()), ("client_id", &plan.client_id), ("itemid", &plan.itemid), ("filepath", "/")];
+        let v: Value = self
+            .http
+            .post(format!("{}/repository/draftfiles_ajax.php?action=list", self.creds.site))
+            .form(&form)
+            .send()
+            .await
+            .map_err(net_error)?
+            .json()
+            .await
+            .map_err(|e| format!("couldn't read the files of your submission: {e}"))?;
+        if let Some(e) = v["error"].as_str() {
+            return Err(format!("Moodle: {e}"));
+        }
+        Ok(v["list"].as_array().into_iter().flatten().filter(|f| f["type"] != "folder").filter_map(|f| f["filename"].as_str()).map(String::from).collect())
+    }
+
+    /// Uploads the file into the draft area, saves the submission and checks
+    /// on the assignment page that the file is there. Returns the new status.
+    pub async fn upload(&self, plan: &UploadPlan) -> Result<String, String> {
+        let data = std::fs::read(&plan.path).map_err(|e| format!("can't read {}: {e}", plan.name))?;
+        let mut form = reqwest::multipart::Form::new()
+            .text("repo_id", plan.repo.clone())
+            .text("sesskey", plan.sesskey.clone())
+            .text("client_id", plan.client_id.clone())
+            .text("itemid", plan.itemid.clone())
+            .text("maxbytes", plan.maxbytes.to_string())
+            .text("areamaxbytes", plan.areamaxbytes.to_string())
+            .text("ctx_id", plan.ctx_id.clone())
+            .text("savepath", "/")
+            .text("title", plan.name.clone())
+            .text("author", plan.author.clone())
+            .text("license", plan.license.clone())
+            .text("env", "filemanager")
+            .text("p", "")
+            .text("page", "");
+        for t in &plan.accepted_raw {
+            form = form.text("accepted_types[]", t.clone());
+        }
+        form = form.part("repo_upload_file", reqwest::multipart::Part::bytes(data).file_name(plan.name.clone()));
+        let site = &self.creds.site;
+        let v: Value = self
+            .http
+            .post(format!("{site}/repository/repository_ajax.php?action=upload"))
+            .multipart(form)
+            .timeout(Duration::from_secs(600))
+            .send()
+            .await
+            .map_err(net_error)?
+            .json()
+            .await
+            .map_err(|e| format!("Moodle gave an unexpected answer to the upload: {e}"))?;
+        if let Some(e) = v["error"].as_str() {
+            return Err(format!("Moodle refused the file: {}", plain(e)));
+        }
+        // A file of that name was there: replace it (the confirmation said so).
+        if v["event"] == "fileexists" {
+            let s = |x: &Value| x.as_str().unwrap_or("").to_string();
+            let form = [
+                ("sesskey", plan.sesskey.clone()),
+                ("client_id", plan.client_id.clone()),
+                ("itemid", plan.itemid.clone()),
+                ("repo_id", plan.repo.clone()),
+                ("existingfilename", s(&v["existingfile"]["filename"])),
+                ("existingfilepath", s(&v["existingfile"]["filepath"])),
+                ("newfilename", s(&v["newfile"]["filename"])),
+                ("newfilepath", s(&v["newfile"]["filepath"])),
+            ];
+            let r: Value = self
+                .http
+                .post(format!("{site}/repository/repository_ajax.php?action=overwrite"))
+                .form(&form)
+                .send()
+                .await
+                .map_err(net_error)?
+                .json()
+                .await
+                .map_err(|e| format!("replacing the old file failed: {e}"))?;
+            if let Some(e) = r["error"].as_str() {
+                return Err(format!("replacing the old file failed: {}", plain(e)));
+            }
+        }
+        if !self.draft_files(plan).await?.contains(&plan.name) {
+            return Err(format!("{} didn't arrive in Moodle; nothing was saved", plan.name));
+        }
+        // Save the submission with the draft area (the form's other fields as they were).
+        let resp = self.http.post(format!("{site}/mod/assign/view.php")).form(&plan.fields).send().await.map_err(net_error)?;
+        let at = resp.url().clone();
+        let page = resp.text().await.map_err(|e| e.to_string())?;
+        if form_fields(&page, "savesubmission").is_some() {
+            let why = form_error(&page).unwrap_or_else(|| "Moodle didn't accept the submission".into());
+            return Err(format!("not saved: {why}"));
+        }
+        let (view, at2) = self.assign_view(&plan.cmid).await.unwrap_or((page, at));
+        let info = assign_info(&view, &at2);
+        if !info.files.iter().any(|f| *f == plan.name) {
+            return Err(format!("saved, but {} isn't listed in your submission: check it in the browser (o)", plan.name));
+        }
+        let status = info.get("Abgabestatus").or_else(|| info.get("Submission status")).unwrap_or("saved").to_string();
+        Ok(if info.can_submit {
+            format!("{} is in your submission ({status}); not handed in yet: use ✅ Hand in", plan.name)
+        } else {
+            format!("{} is in your submission ({status})", plan.name)
+        })
+    }
+
+    /// The hand-in step: the files that will be handed in and the declaration
+    /// to agree to; nothing is sent yet.
+    pub async fn prepare_submit(&self, cmid: &str) -> Result<SubmitPlan, String> {
+        let (view, at) = self.assign_view(cmid).await?;
+        let info = assign_info(&view, &at);
+        if !info.can_submit {
+            return Err("there's nothing to hand in here (already handed in, or not needed)".into());
+        }
+        self.session_key().await?;
+        let (page, _) = self.fetch(&format!("{}/mod/assign/view.php?id={cmid}&action=submit", self.creds.site)).await?;
+        let fields = form_fields(&page, "confirmsubmit").ok_or("found no hand-in form on the page")?;
+        let statement = statement_text(&page);
+        Ok(SubmitPlan { cmid: cmid.into(), info, fields, statement })
+    }
+
+    /// Hands the submission in and checks that it worked; returns the new status.
+    pub async fn submit(&self, plan: &SubmitPlan) -> Result<String, String> {
+        let mut fields = plan.fields.clone();
+        if plan.statement.is_some() {
+            fields.retain(|(k, _)| k != "submissionstatement");
+            fields.push(("submissionstatement".into(), "1".into()));
+        }
+        let resp = self.http.post(format!("{}/mod/assign/view.php", self.creds.site)).form(&fields).send().await.map_err(net_error)?;
+        let page = resp.text().await.map_err(|e| e.to_string())?;
+        if form_fields(&page, "confirmsubmit").is_some() {
+            let why = form_error(&page).unwrap_or_else(|| "Moodle didn't accept it".into());
+            return Err(format!("not handed in: {why}"));
+        }
+        let (view, at) = self.assign_view(&plan.cmid).await?;
+        let info = assign_info(&view, &at);
+        if info.can_submit {
+            return Err("Moodle still shows the hand-in button: check it in the browser (o)".into());
+        }
+        Ok(format!("handed in: {}", info.get("Abgabestatus").or_else(|| info.get("Submission status")).unwrap_or("done")))
+    }
+
     /// A discussion's posts, oldest first, with their attachments.
     async fn discussion_page(&self, list: &str, id: &str) -> Result<Page, String> {
         let web = format!("{}/mod/forum/discuss.php?d={id}", self.creds.site);
@@ -1239,6 +1509,9 @@ impl Moodle {
         }
         if let Some(id) = list.strip_prefix(CONVERSATION) {
             return self.conversation_page(list, id).await;
+        }
+        if let Some(cmid) = list.strip_prefix(ASSIGN) {
+            return self.assign_page(list, cmid).await;
         }
         match list {
             NOTIFICATIONS => return self.notifications_page().await.map(|(p, _)| p).ok_or_else(|| "couldn't load the notifications".into()),
@@ -1316,7 +1589,7 @@ fn plain(s: &str) -> String {
             _ => {}
         }
     }
-    out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#039;", "'").replace("&nbsp;", " ").trim().to_string()
+    unescape(&out).trim().to_string()
 }
 
 fn id_of(v: &Value) -> String {
@@ -1359,6 +1632,7 @@ fn activity_target(module: &str, url: &str) -> Option<String> {
         "url" => None,
         "resource" => Some(format!("{FILE}{url}{}redirect=1", if url.contains('?') { '&' } else { '?' })),
         "forum" => cm_id(url).map(|cm| format!("{FORUM}{cm}")).or_else(|| Some(format!("{WEB}{url}"))),
+        "assign" => cm_id(url).map(|cm| format!("{ASSIGN}{cm}")).or_else(|| Some(format!("{WEB}{url}"))),
         _ => Some(format!("{WEB}{url}")),
     }
 }
@@ -1737,6 +2011,8 @@ fn link_line(href: &str, label: &str, base: &Url) -> Option<Task> {
     } else if same_site && path.ends_with("/mod/forum/discuss.php") {
         let d = url.query_pairs().find(|(k, _)| k == "d").map(|(_, v)| v.into_owned());
         ("💬 ", Some(d.map(|d| format!("{DISCUSSION}{d}")).unwrap_or_else(|| format!("{WEB}{url}"))))
+    } else if same_site && path.ends_with("/mod/assign/view.php") && !url.query().is_some_and(|q| q.contains("action=")) {
+        ("📝 ", Some(cm_id(url.as_str()).map(|c| format!("{ASSIGN}{c}")).unwrap_or_else(|| format!("{WEB}{url}"))))
     } else if same_site && path.ends_with("/mod/forum/view.php") {
         ("💬 ", Some(cm_id(url.as_str()).map(|c| format!("{FORUM}{c}")).unwrap_or_else(|| format!("{WEB}{url}"))))
     } else if same_site && !path.contains("/login/logout.php") {
@@ -1784,6 +2060,286 @@ fn quick_access(html: &str) -> Vec<(String, i64, String)> {
         pos = tag_end;
     }
     out
+}
+
+// ---- assignments: reading the pages -----------------------------------------------
+
+/// Page ids of assignments, and of their actions (lines that start an upload
+/// or the hand-in, not pages).
+pub const ASSIGN: &str = "assign:";
+pub const ASSIGN_UPLOAD: &str = "assign-upload:";
+pub const ASSIGN_SUBMIT: &str = "assign-submit:";
+
+/// What an assignment's page says.
+#[derive(Clone, Debug, Default)]
+pub struct AssignInfo {
+    pub title: String,
+    /// "Geöffnet: …", "Fällig: …", "Letzte Abgabemöglichkeit: …"
+    pub dates: Vec<String>,
+    /// The page's "header: value" table rows (status, time left, grade …).
+    pub table: Vec<(String, String)>,
+    /// The files in the submission now.
+    pub files: Vec<String>,
+    pub can_edit: bool,
+    pub can_submit: bool,
+}
+
+impl AssignInfo {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.table.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+}
+
+/// A checked upload, waiting for the user's yes.
+#[derive(Clone, Debug)]
+pub struct UploadPlan {
+    pub cmid: String,
+    pub info: AssignInfo,
+    fields: Vec<(String, String)>,
+    sesskey: String,
+    itemid: String,
+    client_id: String,
+    ctx_id: String,
+    repo: String,
+    author: String,
+    license: String,
+    pub maxbytes: i64,
+    areamaxbytes: i64,
+    pub maxfiles: i64,
+    accepted_raw: Vec<String>,
+    /// Accepted extensions (".pdf"); empty: any file.
+    pub accepted: Vec<String>,
+    /// Files already in the submission.
+    pub existing: Vec<String>,
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub size: u64,
+}
+
+impl UploadPlan {
+    /// Whether the file fits the assignment's rules; why not, if it doesn't.
+    fn check(&self) -> Result<(), String> {
+        if self.size == 0 {
+            return Err(format!("{} is empty", self.name));
+        }
+        if self.maxbytes > 0 && self.size > self.maxbytes as u64 {
+            return Err(format!("{} is {}, but this assignment takes at most {} per file", self.name, size(self.size), size(self.maxbytes as u64)));
+        }
+        let ext = self.name.rsplit_once('.').map(|(_, e)| format!(".{}", e.to_lowercase())).unwrap_or_default();
+        if !self.accepted.is_empty() && !self.accepted.contains(&ext) {
+            return Err(format!("{} files aren't accepted here; accepted: {}", if ext.is_empty() { "files without an extension".into() } else { ext }, self.accepted.join(" ")));
+        }
+        if self.maxfiles > 0 && !self.replaces() && self.existing.len() as i64 >= self.maxfiles {
+            return Err(format!("your submission already has the most files allowed ({}); remove one in the browser first (o)", self.maxfiles));
+        }
+        Ok(())
+    }
+
+    /// The upload replaces a file of the same name.
+    pub fn replaces(&self) -> bool {
+        self.existing.contains(&self.name)
+    }
+}
+
+/// The hand-in step, waiting for the user's yes.
+#[derive(Clone, Debug)]
+pub struct SubmitPlan {
+    pub cmid: String,
+    pub info: AssignInfo,
+    fields: Vec<(String, String)>,
+    /// The declaration the course requires to agree to, if any.
+    pub statement: Option<String>,
+}
+
+/// "2.3 MB".
+pub fn size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{b} bytes"),
+    }
+}
+
+/// The element (its whole text) whose opening tag contains `marker`, by
+/// matching its `<div>`s.
+fn element<'a>(html: &'a str, marker: &str) -> Option<&'a str> {
+    let i = html.find(marker)?;
+    let start = html[..i].rfind('<')?;
+    let lower = html.to_ascii_lowercase();
+    let mut depth = 0i32;
+    let mut pos = start;
+    loop {
+        let open = lower[pos..].find("<div").map(|o| pos + o);
+        let close = lower[pos..].find("</div").map(|c| pos + c)?;
+        match open {
+            Some(o) if o < close => {
+                depth += 1;
+                pos = o + 4;
+            }
+            _ => {
+                depth -= 1;
+                pos = close + 5;
+                if depth <= 0 {
+                    return Some(&html[start..pos]);
+                }
+            }
+        }
+    }
+}
+
+/// Reads an assignment page: title, dates, table rows, files, actions.
+fn assign_info(html: &str, base: &Url) -> AssignInfo {
+    let title = page_title(html);
+    let title = title.split_once(": ").map_or(title.as_str(), |(_, t)| t).to_string();
+    let dates = element(html, "data-region=\"activity-dates\"")
+        .map(|d| d.split("<div").skip(2).map(|x| plain(&format!("<div{x}").replace('<', " <"))).map(|t| t.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|t| !t.is_empty()).collect())
+        .unwrap_or_default();
+    let mut table = Vec::new();
+    let mut pos = 0;
+    let lower = html.to_ascii_lowercase();
+    while let Some(i) = lower[pos..].find("<tr").map(|i| pos + i) {
+        let end = lower[i..].find("</tr>").map_or(html.len(), |e| i + e);
+        pos = end.max(i + 3);
+        let row = &html[i..end];
+        let (Some(th), Some(td)) = (row.find("<th"), row.find("<td")) else { continue };
+        if th > td {
+            continue;
+        }
+        let cell = |from: usize, close: &str| {
+            let open = row[from..].find('>').map_or(from, |g| from + g + 1);
+            let stop = row[open..].find(close).map_or(row.len(), |e| open + e);
+            plain(&row[open..stop].replace('<', " <")).split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        table.push((cell(th, "</th"), cell(td, "</td")));
+    }
+    let files = forms_free_links(html)
+        .into_iter()
+        .filter_map(|h| base.join(&h).ok())
+        .filter(|u| u.path().contains("/assignsubmission_file/submission_files/"))
+        .filter_map(|u| u.path_segments().and_then(|mut s| s.next_back()).map(percent_decode))
+        .fold(Vec::new(), |mut v, n| {
+            if !v.contains(&n) {
+                v.push(n);
+            }
+            v
+        });
+    let actions: Vec<String> = forms(html).iter().flat_map(|f| f.fields.iter().filter(|(_, n, _)| n == "action").map(|(_, _, v)| v.clone())).collect();
+    AssignInfo {
+        title,
+        dates,
+        table,
+        files,
+        can_edit: actions.iter().any(|a| a == "editsubmission"),
+        can_submit: actions.iter().any(|a| a == "submit"),
+    }
+}
+
+/// The fields of the form that sends `action` (hidden fields, text areas,
+/// selected options and its own submit button), as the browser would send them.
+fn form_fields(html: &str, action: &str) -> Option<Vec<(String, String)>> {
+    // The form with a hidden field action=`action` (attributes in any order).
+    let lower_html = html.to_ascii_lowercase();
+    let mut found = None;
+    let mut at = 0;
+    while let Some(start) = lower_html[at..].find("<form").map(|s| at + s) {
+        let end = lower_html[start..].find("</form>").map_or(html.len(), |e| start + e);
+        at = end.max(start + 5);
+        let block = &html[start..end];
+        let has = forms(&format!("{block}</form>")).iter().any(|f| f.fields.iter().any(|(_, n, v)| n == "action" && v == action));
+        if has {
+            found = Some(block);
+            break;
+        }
+    }
+    let form = found?;
+    let lower = form.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(t) = lower[pos..].find('<').map(|t| pos + t) {
+        let close = lower[t..].find('>').map_or(form.len(), |c| t + c);
+        let tag = &lower[t + 1..close];
+        pos = close.max(t + 1);
+        if tag.starts_with("input") {
+            let a = attributes(&form[t + 1..close]);
+            let kind = a.get("type").map(|k| k.to_ascii_lowercase()).unwrap_or_else(|| "text".into());
+            let Some(name) = a.get("name").cloned() else { continue };
+            let value = a.get("value").cloned().unwrap_or_default();
+            match kind.as_str() {
+                "hidden" | "text" | "number" | "email" | "url" | "date" => out.push((name, value)),
+                "checkbox" | "radio" if a.contains_key("checked") => out.push((name, if value.is_empty() { "1".into() } else { value })),
+                // The form's own button only (not "cancel").
+                "submit" if name == "submitbutton" => out.push((name, value)),
+                _ => {}
+            }
+        } else if tag.starts_with("textarea") {
+            let a = attributes(&form[t + 1..close]);
+            let stop = lower[close..].find("</textarea").map_or(form.len(), |e| close + e);
+            if let Some(name) = a.get("name").cloned() {
+                out.push((name, unescape(&form[close + 1..stop])));
+            }
+            pos = stop;
+        } else if tag.starts_with("select") {
+            let a = attributes(&form[t + 1..close]);
+            let stop = lower[close..].find("</select").map_or(form.len(), |e| close + e);
+            let options = &form[close..stop];
+            let lo = options.to_ascii_lowercase();
+            let pick = lo.find("selected").and_then(|s| lo[..s].rfind("<option")).or_else(|| lo.find("<option"));
+            if let (Some(name), Some(o)) = (a.get("name").cloned(), pick) {
+                let oc = options[o..].find('>').map_or(options.len(), |c| o + c);
+                let value = attributes(&options[o + 1..oc]).remove("value").unwrap_or_default();
+                out.push((name, value));
+            }
+            pos = stop;
+        }
+    }
+    Some(out)
+}
+
+/// A number the page may write as a number or as text ("104857600"); -1 if neither.
+fn number(v: &Value) -> i64 {
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).unwrap_or(-1)
+}
+
+/// The file manager's settings on a form page (`M.form_filemanager.init`).
+fn filemanager(html: &str) -> Option<Value> {
+    let i = html.find("M.form_filemanager.init(Y,")? + "M.form_filemanager.init(Y,".len();
+    serde_json::Deserializer::from_str(&html[i..]).into_iter::<Value>().next()?.ok()
+}
+
+/// The accepted file extensions, as the form lists them (".pdf", ".docx" …);
+/// the raw types if the list can't be read.
+fn accepted_extensions(html: &str, raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = raw.iter().filter(|t| t.starts_with('.')).map(|t| t.to_lowercase()).collect();
+    if let Some(block) = element(html, "form-filetypes-descriptions") {
+        for word in plain(&block.replace('<', " <")).split_whitespace() {
+            if word.starts_with('.') && word.len() > 1 && word[1..].chars().all(|c| c.is_ascii_alphanumeric()) && !out.contains(&word.to_lowercase()) {
+                out.push(word.to_lowercase());
+            }
+        }
+    }
+    out
+}
+
+/// The declaration on a hand-in page (the checkbox's label), if there is one.
+fn statement_text(html: &str) -> Option<String> {
+    let i = html.find("name=\"submissionstatement\"")?;
+    let start = html[..i].rfind("<div class=\"form-check").or_else(|| html[..i].rfind("<div"))?;
+    let block = element(&html[start..], "<div")?;
+    let t: String = plain(&block.replace('<', " <")).split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(t).filter(|t| !t.is_empty())
+}
+
+/// The error a form page shows after a rejected send, if any.
+fn form_error(html: &str) -> Option<String> {
+    for marker in ["class=\"error\"", "invalid-feedback", "alert-danger", "class=\"errormessage"] {
+        if let Some(e) = element(html, marker) {
+            let t: String = plain(&e.replace('<', " <")).split_whitespace().collect::<Vec<_>>().join(" ");
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
 }
 
 /// Ids of the lists beside the courses, and the page ids of conversations.
@@ -2055,6 +2611,72 @@ mod tests {
             ]
         );
         assert!(quick_access("<html>no block</html>").is_empty());
+    }
+
+    #[test]
+    fn reads_assignment_pages_and_forms() {
+        let base = Url::parse("https://m/mod/assign/view.php?id=7").unwrap();
+        let view = r#"<html><head><title>AI_Ethics: Submit slides | GRIPS</title></head><body>
+            <div data-region="activity-dates" class="activity-dates"><div><div><strong>Geöffnet:</strong> Montag, 2. November 2026</div><div><strong>Fällig:</strong> Montag, 14. Dezember 2026, 09:45</div></div></div>
+            <div role="main"><form method="get" action="https://m/mod/assign/view.php"><input type="hidden" name="id" value="7"><input type="hidden" name="action" value="editsubmission"><button type="submit">Aufgabenlösung hinzufügen</button></form>
+            <table><tr><th>Abgabestatus</th><td>Entwurf (nicht abgegeben)</td></tr><tr><th>Verbleibende Zeit</th><td>Verbleibend: 44 Tage</td></tr>
+            <tr><th>Dateiabgabe</th><td><a href="https://m/pluginfile.php/5/assignsubmission_file/submission_files/9/slides%20v2.pdf?forcedownload=1">slides v2.pdf</a></td></tr></table></div></body></html>"#;
+        let info = assign_info(view, &base);
+        assert_eq!(info.title, "Submit slides");
+        assert_eq!(info.dates, ["Geöffnet: Montag, 2. November 2026", "Fällig: Montag, 14. Dezember 2026, 09:45"]);
+        assert_eq!(info.get("Abgabestatus"), Some("Entwurf (nicht abgegeben)"));
+        assert_eq!(info.files, ["slides v2.pdf"]);
+        assert!(info.can_edit && !info.can_submit);
+
+        let edit = r#"<form autocomplete="off" action="https://m/mod/assign/view.php" method="post" class="mform">
+            <input name="lastmodified" type="hidden" value="1793385622" /><input name="id" type="hidden" value="7" />
+            <input name="action" type="hidden" value="savesubmission" /><input name="sesskey" type="hidden" value="KEY" />
+            <input name="files_filemanager" type="hidden" value="814182183" />
+            <textarea name="onlinetext_editor[text]">Mein &amp; Text</textarea>
+            <select name="onlinetext_editor[format]"><option value="0">a</option><option value="1" selected>b</option></select>
+            <input type="checkbox" name="unticked" value="1">
+            <input type="submit" name="submitbutton" value="Änderungen speichern" /><input type="submit" name="cancel" value="Abbrechen" /></form>
+            <script>M.form_filemanager.init(Y, {"itemid":814182183,"maxbytes":104857600,"maxfiles":20,"accepted_types":[".pdf","document"],"filepicker":{"repositories":{"3":{"id":"3","type":"upload"}}}});</script>
+            <div class="form-filetypes-descriptions"><ul><li>Dokumente <small>.doc .docx .odt .pdf</small></li></ul></div>"#;
+        let fields = form_fields(edit, "savesubmission").unwrap();
+        let names: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["lastmodified", "id", "action", "sesskey", "files_filemanager", "onlinetext_editor[text]", "onlinetext_editor[format]", "submitbutton"]);
+        assert_eq!(fields[5].1, "Mein & Text");
+        assert_eq!(fields[6].1, "1");
+        let fm = filemanager(edit).unwrap();
+        assert_eq!(fm["maxfiles"], 20);
+        assert_eq!(accepted_extensions(edit, &[".pdf".into(), "document".into()]), [".pdf", ".doc", ".docx", ".odt"]);
+
+        // The rules are checked before anything is sent.
+        let mut plan = UploadPlan {
+            cmid: "7".into(),
+            info,
+            fields,
+            sesskey: String::new(),
+            itemid: String::new(),
+            client_id: String::new(),
+            ctx_id: String::new(),
+            repo: "3".into(),
+            author: String::new(),
+            license: String::new(),
+            maxbytes: 100 << 20,
+            areamaxbytes: -1,
+            maxfiles: 2,
+            accepted_raw: Vec::new(),
+            accepted: vec![".pdf".into()],
+            existing: vec!["a.pdf".into(), "b.pdf".into()],
+            path: "x.pdf".into(),
+            name: "x.pdf".into(),
+            size: 1000,
+        };
+        assert!(plan.check().unwrap_err().contains("most files allowed"));
+        plan.name = "a.pdf".into();
+        assert!(plan.check().is_ok() && plan.replaces());
+        plan.name = "a.zip".into();
+        assert!(plan.check().unwrap_err().contains(".zip files aren't accepted"));
+        plan.name = "a.pdf".into();
+        plan.size = 200 << 20;
+        assert!(plan.check().unwrap_err().contains("at most 100.0 MB"));
     }
 
     #[test]
