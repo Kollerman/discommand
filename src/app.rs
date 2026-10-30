@@ -1897,7 +1897,7 @@ impl App {
             AppEvent::Cal(msg) => self.on_cal(msg),
             AppEvent::Todo(s, msg) => self.on_todo(s, msg),
             AppEvent::Update(tag) => {
-                self.status = format!("discommand {tag} is out: run git pull, then the install script again");
+                self.status = format!("discommand {tag} is out ({}): run git pull, then the install script again", crate::update::kind(&tag));
                 self.update = Some(tag);
             }
         }

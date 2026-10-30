@@ -43,7 +43,9 @@ pub async fn watch(found: impl Fn(String)) {
 pub async fn check_now() -> String {
     let current = env!("CARGO_PKG_VERSION");
     match latest().await {
-        Ok(Some(tag)) if newer(&tag, current) => format!("discommand {tag} is out (this is {current}): run git pull, then the install script again"),
+        Ok(Some(tag)) if newer(&tag, current) => {
+            format!("discommand {tag} is out ({}; this is {current}): run git pull, then the install script again", kind_of(&tag, current))
+        }
         Ok(Some(tag)) => format!("up to date: this is {current}, the newest on {} is {tag}", repo()),
         Ok(None) => format!("{} has no releases or version tags yet (this is {current})", repo()),
         Err(e) => format!("couldn't check {}: {e}", repo()),
@@ -86,7 +88,26 @@ fn highest<'a>(tags: impl Iterator<Item = &'a str>) -> Option<String> {
 }
 
 fn version(v: &str) -> Vec<u64> {
-    v.trim().trim_start_matches(['v', 'V']).split(['.', '-', '+']).map_while(|p| p.parse().ok()).collect()
+    // "v0.2.0", "0.2.0" and "v.0.2.0" all read as 0.2.0.
+    v.trim().trim_start_matches(['v', 'V', '.']).split(['.', '-', '+']).map_while(|p| p.parse().ok()).collect()
+}
+
+/// What kind of update `tag` is for this build, by the first number that
+/// went up: major.feature.fix ("0.3.0" after "0.2.4" brings new features).
+pub fn kind(tag: &str) -> &'static str {
+    kind_of(tag, env!("CARGO_PKG_VERSION"))
+}
+
+fn kind_of(new: &str, old: &str) -> &'static str {
+    let (new, old) = (version(new), version(old));
+    let part = |v: &[u64], i: usize| v.get(i).copied().unwrap_or(0);
+    if part(&new, 0) > part(&old, 0) {
+        "new full release"
+    } else if part(&new, 0) == part(&old, 0) && part(&new, 1) > part(&old, 1) {
+        "new features"
+    } else {
+        "bugfixes"
+    }
 }
 
 /// Whether version `a` ("v0.2.0") is newer than `b` ("0.1.0").
@@ -96,13 +117,22 @@ fn newer(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{highest, newer};
+    use super::{highest, kind_of, newer};
+
+    #[test]
+    fn names_the_kind_of_update() {
+        assert_eq!(kind_of("v0.2.1", "0.2.0"), "bugfixes");
+        assert_eq!(kind_of("v0.3.0", "0.2.4"), "new features");
+        assert_eq!(kind_of("v1.0.0", "0.3.2"), "new full release");
+        assert_eq!(kind_of("v.0.2.0", "0.1.1"), "new features");
+    }
 
     #[test]
     fn compares_versions() {
         assert!(newer("v0.2.0", "0.1.0"));
         assert!(newer("0.10.0", "0.9.3"));
         assert!(newer("v1.0", "0.9.9"));
+        assert!(newer("v.0.2.0", "0.1.1"));
         assert!(!newer("v0.1.0", "0.1.0"));
         assert!(!newer("v0.1.0", "0.2.0"));
         assert!(!newer("nightly", "0.1.0"));
@@ -112,6 +142,7 @@ mod tests {
     fn picks_the_highest_tag() {
         let tags = ["v0.1.1", "nightly", "v0.10.0", "v0.9.2"];
         assert_eq!(highest(tags.into_iter()).as_deref(), Some("v0.10.0"));
+        assert_eq!(highest(["v.0.2.0", "v.0.1.1", "v.0.1.0"].into_iter()).as_deref(), Some("v.0.2.0"));
         assert_eq!(highest(["latest"].into_iter()), None);
     }
 }

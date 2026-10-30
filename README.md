@@ -554,12 +554,24 @@ Discord and WhatsApp need nothing from the publisher: both log in by QR code.
 ### Announcing updates
 
 discommand checks GitHub at startup and then once a day for a newer **release**. If
-there is one, the status line says so and keeps a `⬆ v0.2.0` hint. The repository
+there is one, the status line says so, along with what kind of update it is (bugfixes, new
+features or a new full release, see below), and keeps a `⬆ v0.2.0` hint. The repository
 has to be public for this; while it's private, the check finds nothing and stays
-silent. To publish an update:
+silent.
 
-1. Raise `version` in `Cargo.toml` (e.g. `0.2.0`), commit and push.
-2. On GitHub: *Releases → Draft a new release*, tag `v0.2.0`, publish.
+Version numbers are `major.feature.fix`:
+
+| Raise | When | Example |
+| --- | --- | --- |
+| `0.0.x` | a bugfix | `0.2.0` → `0.2.1` |
+| `0.x.0` | a new feature (the last number goes back to 0) | `0.2.1` → `0.3.0` |
+| `x.0.0` | a new full release (both others go back to 0) | `0.3.0` → `1.0.0` |
+
+To publish an update:
+
+1. Raise `version` in `Cargo.toml` (e.g. `0.2.1`), commit and push.
+2. On GitHub: *Releases → Draft a new release*, tag `v0.2.1` (the same number, with
+   a `v` in front and no dot after it), publish.
 
 Plain pushes don't trigger the notice; only releases do. The check is one small
 request to `api.github.com` (which sees the user's IP address, like any visit to
