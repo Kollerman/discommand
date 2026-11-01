@@ -13,9 +13,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::pics::{PicRef, PicSrc};
-use crate::text::sanitize;
-use crate::view::{Reply, ViewMsg};
+use crate::ui::pics::{PicRef, PicSrc};
+use crate::ui::text::sanitize;
+use crate::ui::view::{Reply, ViewMsg};
 
 /// Messages kept in memory per chat; older ones are reloaded from the helper's database.
 const MAX_MESSAGES: usize = 1000;
@@ -77,7 +77,14 @@ pub enum WaEvent {
     History { chat: String, older: bool, msgs: Vec<WaMsg>, complete: bool },
     Status { status: String },
     Receipts { on: bool },
-    File { path: String },
+    /// A downloaded file: opened, or transcribed when asked `for` that (`id`: its message).
+    File {
+        path: String,
+        #[serde(default, rename = "for")]
+        purpose: String,
+        #[serde(default)]
+        id: String,
+    },
     /// Picture bytes for a `thumb` request (base64; empty when there is none).
     Thumb { key: String, #[serde(default)] data: String },
     Error { msg: String },
@@ -278,6 +285,15 @@ fn view(m: &WaMsg, matrix: bool) -> ViewMsg {
         } else {
             Vec::new()
         },
+        id: m.id.clone(),
+        transcript: None,
+    }
+}
+
+impl WaMsg {
+    /// A voice or audio message that can be transcribed (`t`).
+    pub fn is_voice(&self) -> bool {
+        self.media && !self.deleted && matches!(self.kind.as_str(), "voice" | "audio")
     }
 }
 
@@ -317,8 +333,8 @@ fn find_helper() -> Result<PathBuf, String> {
 
 pub fn spawn() -> Result<Sidecar, String> {
     let exe = find_helper()?;
-    let data = crate::secret::data_dir().ok_or("no config directory")?;
-    let cache = crate::secret::cache_dir().join("whatsapp");
+    let data = crate::system::secret::data_dir().ok_or("no config directory")?;
+    let cache = crate::system::secret::cache_dir().join("whatsapp");
     let mut cmd = Command::new(exe);
     cmd.arg("-db").arg(data.join("whatsapp.db")).arg("-cache").arg(cache);
     if let Some(log) = std::env::var_os("DISCOMMAND_WA_LOG") {
@@ -357,7 +373,7 @@ pub fn spawn() -> Result<Sidecar, String> {
 }
 
 fn print_qr(code: &str) {
-    crate::qr::show(
+    crate::ui::qr::show(
         &[
             "Link WhatsApp: on your phone open WhatsApp → Settings → Linked devices → Link a device,",
             "then scan this code. (Or start with --wa-phone +491701234567 for a pairing code.)",

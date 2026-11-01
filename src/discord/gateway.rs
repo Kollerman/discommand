@@ -12,8 +12,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{interval_at, Instant, Interval, MissedTickBehavior};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-use crate::api::super_properties;
+use crate::discord::api::super_properties;
 use crate::app::AppEvent;
 
 const GATEWAY: &str = "wss://gateway.discord.gg";
@@ -78,6 +80,8 @@ enum Exit {
     Fresh,
     Fatal(String),
     Error(String),
+    /// The app quit: the connection was closed properly.
+    Closed,
 }
 
 /// Accumulates zlib-stream frames and inflates each complete payload.
@@ -140,12 +144,15 @@ fn jitter(max_ms: u64) -> u64 {
 
 pub async fn run(token: String, tx: UnboundedSender<AppEvent>, mut cmds: UnboundedReceiver<String>) {
     let mut session: Option<Session> = None;
+    // The presence the app last set (away or not), set again on a new session.
+    let mut presence: Option<String> = None;
     let mut backoff = 1u64;
     loop {
         let status = if session.is_some() { "resuming…" } else { "connecting…" };
         let _ = tx.send(AppEvent::Gateway(GwEvent::Status(status.into())));
-        match connect_once(&token, &tx, &mut cmds, &mut session).await {
+        match connect_once(&token, &tx, &mut cmds, &mut session, &mut presence).await {
             Exit::Resume => backoff = 1,
+            Exit::Closed => return,
             Exit::Fresh => {
                 session = None;
                 backoff = 1;
@@ -171,6 +178,7 @@ async fn connect_once(
     tx: &UnboundedSender<AppEvent>,
     cmds: &mut UnboundedReceiver<String>,
     session: &mut Option<Session>,
+    presence: &mut Option<String>,
 ) -> Exit {
     let base = session.as_ref().map(|s| s.resume_url.as_str()).unwrap_or(GATEWAY);
     let url = format!("{}/?v=10&encoding=json&compress=zlib-stream", base.trim_end_matches('/'));
@@ -257,6 +265,12 @@ async fn connect_once(
                             if let Some(meta) = p.d.and_then(|d| serde_json::from_str::<ReadyMeta>(d.get()).ok()) {
                                 *session = Some(Session { id: meta.session_id, resume_url: meta.resume_gateway_url, seq });
                             }
+                            // A new session starts out online.
+                            if let Some(p) = presence.clone() {
+                                if let Err(e) = sink.send(WsMsg::Text(p)).await {
+                                    return Exit::Error(e.to_string());
+                                }
+                            }
                             let _ = tx.send(AppEvent::Gateway(GwEvent::Status("connected".into())));
                         } else if t == "RESUMED" {
                             let _ = tx.send(AppEvent::Gateway(GwEvent::Status("connected".into())));
@@ -287,7 +301,17 @@ async fn connect_once(
                     return Exit::Error(e.to_string());
                 }
             }
-            Some(cmd) = cmds.recv() => {
+            cmd = cmds.recv() => {
+                let Some(cmd) = cmd else {
+                    // The app quit. A proper close ends the session at once, so
+                    // Discord shows the account offline (unless another client is on).
+                    let _ = sink.send(WsMsg::Close(Some(CloseFrame { code: CloseCode::Normal, reason: "".into() }))).await;
+                    let _ = sink.flush().await;
+                    return Exit::Closed;
+                };
+                if serde_json::from_str::<serde_json::Value>(&cmd).is_ok_and(|v| v["op"] == 3) {
+                    *presence = Some(cmd.clone());
+                }
                 if let Err(e) = sink.send(WsMsg::Text(cmd)).await {
                     return Exit::Error(e.to_string());
                 }

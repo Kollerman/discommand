@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::secret;
+use crate::system::secret;
 
 const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 const API: &str = "https://www.googleapis.com/calendar/v3";
@@ -433,7 +433,7 @@ impl Google {
             }
             let resp = req.send().await.map_err(|e| e.to_string())?;
             let status = resp.status();
-            let wait = crate::cal::retry_after(&resp);
+            let wait = crate::planner::cal::retry_after(&resp);
             let text = resp.text().await.map_err(|e| e.to_string())?;
             // Throttled: wait as long as the server asks (or back off) and retry.
             if (matches!(status.as_u16(), 429 | 503) || status.as_u16() == 403 && text.contains("ateLimitExceeded")) && attempt < 3 {

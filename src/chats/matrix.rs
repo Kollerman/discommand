@@ -43,8 +43,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::secret;
-use crate::wa::{WaChat, WaEvent, WaMsg};
+use crate::system::secret;
+use crate::chats::wa::{WaChat, WaEvent, WaMsg};
 
 const SECRET_NAME: &str = "matrix";
 /// Shown on the server's sign-in page; must be an https URL.
@@ -202,8 +202,8 @@ async fn oauth_login(client: &Client, user: &UserId) -> Result<String, String> {
         .await
         .map_err(|e| format!("Matrix sign-in: {e}"))?;
     println!("Sign in in your browser. If it didn't open, visit:\n\n  {}\n", auth.url);
-    let _ = crate::app::open_url(auth.url.as_str());
-    let query = crate::cal::await_redirect(&listener, |q| q.contains_key("code") || q.contains_key("error")).await?;
+    let _ = crate::system::open::open_url(auth.url.as_str());
+    let query = crate::planner::cal::await_redirect(&listener, |q| q.contains_key("code") || q.contains_key("error")).await?;
     client.oauth().finish_login(UrlOrQuery::Query(query)).await.map_err(|e| format!("Matrix sign-in failed: {e}"))?;
     client.oauth().client_id().map(|id| id.as_str().to_string()).ok_or_else(|| "no OAuth client id".to_string())
 }
@@ -803,7 +803,7 @@ impl Mx {
                     self.emit(WaEvent::Status { status: "downloading…".into() });
                     let path = self.download(&id).await;
                     self.emit(WaEvent::Status { status: "connected".into() });
-                    self.emit(WaEvent::File { path: path? });
+                    self.emit(WaEvent::File { path: path?, purpose: s("for"), id: id.clone() });
                     Ok(())
                 }
                 "logout" => {

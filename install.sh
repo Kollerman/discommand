@@ -3,13 +3,13 @@
 # Works on Linux, macOS and Termux. Re-run after changes to update.
 #
 #   sh install.sh                          asks which integrations to build
-#   sh install.sh --with discord,calendar  only these: discord, whatsapp, matrix, calendar, todo, twos, moodle
+#   sh install.sh --with discord,calendar  only these: discord, whatsapp, matrix, calendar, todo, twos, moodle, transcribe, sound
 #   sh install.sh --with all               back to all of them
 set -e
 cd "$(dirname "$0")"
 
 # Every integration (the default features in Cargo.toml).
-all="discord,whatsapp,matrix,calendar,todo,twos,moodle"
+all="discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound"
 with=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,7 +35,7 @@ if [ -z "$with" ]; then
         with="$last"
     else
         while [ -z "$with" ]; do
-            for name in discord whatsapp matrix calendar todo twos moodle; do
+            for name in discord whatsapp matrix calendar todo twos moodle transcribe sound; do
                 case $name in
                     discord) label="Discord" ;;
                     whatsapp) label="WhatsApp (needs Go)" ;;
@@ -44,10 +44,16 @@ if [ -z "$with" ]; then
                     todo) label="Microsoft To Do" ;;
                     twos) label="Twos" ;;
                     moodle) label="Moodle (university / school)" ;;
+                    transcribe) label="Voice message transcription (on this computer; adds a few minutes to the build, downloads a 259 MB model on first use)" ;;
+                    sound) label="Sound (plays voice messages with p, and an alert for new messages while the window is in the background; Linux needs libasound2-dev)" ;;
                 esac
                 ask "  $label" && with="${with:+$with,}$name"
             done
-            [ -z "$with" ] && echo "Choose at least one."
+            # Transcription and sound aren't integrations of their own.
+            if [ -z "$(printf '%s' ",$with," | sed 's/,transcribe,/,/; s/,sound,/,/; s/^,*//; s/,*$//')" ]; then
+                echo "Choose at least one integration."
+                with=""
+            fi
         done
         [ "$with" = "$all" ] && with=all
     fi
@@ -57,6 +63,13 @@ if [ "$with" = all ]; then
     with=""
 fi
 case ",${with:-$all}," in *,whatsapp,*) whatsapp=1 ;; *) whatsapp="" ;; esac
+# Sound needs the ALSA headers on Linux, and isn't built on Termux.
+case ",${with:-$all}," in *,sound,*)
+    if [ "$(uname -o 2>/dev/null)" = Android ] || { [ "$(uname -s)" = Linux ] && ! pkg-config --exists alsa 2>/dev/null; }; then
+        echo "Leaving out sound: it needs the ALSA headers (Debian/Ubuntu: sudo apt install libasound2-dev pkg-config)." >&2
+        with=$(printf '%s' ",${with:-$all}," | sed 's/,sound,/,/; s/^,//; s/,$//')
+    fi ;;
+esac
 
 for tool in cargo ${whatsapp:+go}; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -69,7 +82,7 @@ bin="${CARGO_HOME:-$HOME/.cargo}/bin"
 if [ -n "$with" ]; then
     echo "Integrations: $with"
 else
-    echo "Integrations: all (choose with --with discord,whatsapp,matrix,calendar,todo,twos,moodle)"
+    echo "Integrations: all (choose with --with discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound)"
 fi
 if [ -f keys/keys.env ]; then
     echo "Building with keys/keys.env (one-step Google/Microsoft sign-in)."

@@ -14,6 +14,10 @@ What it does to save battery and memory:
 - Doesn't subscribe to typing, activities or member lists.
 - Never sends typing or online status to WhatsApp or Matrix, and sends no read receipts unless you turn them on
   (Matrix gets private receipts, which clear unread counts without telling anyone).
+- In Discord, shows you as away after 5 minutes without a key press (a single wake-up, not a
+  polling timer) and online again on the next one. Do Not Disturb and invisible are left alone.
+  Quitting closes the connection properly, so Discord shows you offline at once rather than
+  a minute later (unless Discord is open somewhere else).
 - Shows pictures as low-resolution half-block art (`▀`, two pixels per cell) inside the
   chat. Discord's media proxy is asked for an ~80 px copy, and WhatsApp uses the small
   thumbnail already inside each message, so a picture costs a few KB. Pictures only load
@@ -23,7 +27,8 @@ What it does to save battery and memory:
 
 Supported: Discord text channels and DMs; WhatsApp chats and groups; Matrix rooms
 and DMs, end-to-end encrypted ones included (text, replies, edits, deletes,
-reactions, media opened on demand). Voice, calls, forums,
+reactions, media opened on demand). Voice messages can be played (`p`) and transcribed
+on your own computer (`t`), see [Voice messages](#voice-messages). Voice and video calls, forums,
 threads and status updates aren't supported.
 
 > **Heads-up:** Discord and WhatsApp forbid unofficial clients in their terms (Matrix
@@ -171,6 +176,8 @@ sh install.sh --with discord,calendar          # Linux, macOS
 | `todo` | Microsoft To Do |
 | `twos` | Twos |
 | `moodle` | Moodle (any university or school site) |
+| `transcribe` | Voice message transcription (not an integration: `t` in WhatsApp, Discord and Matrix chats; about 3 minutes of extra build time) |
+| `sound` | Sound (not an integration: `p` plays voice messages, and an alert sounds for new messages while the window is in the background; on Linux it needs the ALSA headers, `libasound2-dev`, and the script leaves it out without them or on Termux) |
 
 Integrations that aren't built in are left out of the program completely: no tab, no
 login at startup, no background activity. `--with all` (or `-With all`) builds
@@ -259,9 +266,9 @@ The app is modal like vim. Press `?` inside it for this list.
 | anywhere (normal) | `i`/`a` insert · **`A` mark every chat of this service read** · `:` command · `/` or `Ctrl-k` find chat · `?` help · **`Shift-Tab` / `gt` next service, right `Shift-Tab` / `gT` previous, `2gt` the 2nd** (right Shift is detected on Windows only) · `Tab`, `Ctrl-w w`, `Ctrl-h`/`Ctrl-l` switch pane |
 | sidebar | `j k` · `gg G` · counts (`5j`) · `l`/`o`/`Enter` open/expand · `h` collapse/parent · `za zo zc zM` |
 | sending files | **`F`** opens the file dialog; the file waits above the input (`📎 name`), you can type a caption, `Enter` sends it, `Esc` removes it. `:attach <path>` does the same without the dialog (SSH, Termux). Discord, WhatsApp (photo/video/audio/document by file type, up to 100 MB) and Matrix (encrypted in encrypted rooms). |
-| messages | `j k Ctrl-u Ctrl-d` select · `gg` top + load history · `G`/`Esc` newest · `r`/`R` reply (ping/no ping) · `+` react (then `1`–`5`: ❤️ 👍 😂 💀 😅; the same again removes it) · `e` edit · `dd` delete · `o`/`gx` open link, attachment or WhatsApp media |
+| messages | `j k Ctrl-u Ctrl-d` select · `gg` top + load history · `G`/`Esc` newest · `r`/`R` reply (ping/no ping) · `+` react (then `1`–`5`: ❤️ 👍 😂 💀 😅; the same again removes it) · `e` edit · `dd` delete · `o`/`gx` open link, attachment or WhatsApp media · `t` transcribe a voice message · `p` play a voice message (again: stop) |
 | insert | `Enter` send · `Alt-Enter` newline · `↑` on empty input edits your last message · `Esc` normal · `Shift-Tab` switch service |
-| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:mute [15m\|1h\|8h\|24h\|7d]` / `:unmute` the selected Discord server, category, channel or DM · `:images on\|off` · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
+| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:mute [15m\|1h\|8h\|24h\|7d]` / `:unmute` the selected Discord server, category, channel or DM · `:images on\|off` · `:startup true\|false` the startup sound · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
 
 Each service keeps its own open chat, sidebar position and unsent draft. The
 statusline shows which service is active, and how many unread chats or mentions
@@ -300,6 +307,58 @@ secrets.
   be accepted in another app for now.
 - A message that can't be decrypted shows 🔒. Its key usually arrives from the key
   backup; `:r` reloads the room.
+
+## Voice messages
+
+Select a voice message (`k`) and press `p` to hear it, or `t` to read it: what it says
+appears under it, marked 📝, in the language spoken. Both work in WhatsApp, Discord
+and Matrix chats.
+
+### Playing (`p`)
+
+Voice messages play through the default sound device, crunched on purpose for a
+retro sound: evened out in loudness, then cut to 8 kHz and 8 bits, like an old
+answering machine. `p` again on the same message stops it; `p` on another one
+switches. The sound device is only open while something plays, so idle costs nothing.
+
+New messages sound an alert (one per burst, at most every 3 seconds) while the
+terminal window is in the background: DMs in Discord and WhatsApp, and Discord
+messages that mention you. Terminals that don't report focus get it for chats that
+aren't open instead. It plays quieter than voice messages.
+
+discommand also starts with a short 8-bit loop, a little faster or slower each time
+(by up to 15 %). `:startup false` turns it off, `:startup true` back on; the choice
+is kept in `<config dir>/discommand/sound.json`.
+
+All of this is the `sound` option of the install script.
+
+### Transcribing (`t`)
+
+
+- **On this computer.** The audio never leaves it. The speech model is OpenAI's
+  Whisper "small", quantized to 8 bits (259 MB). It's downloaded once from Hugging Face
+  on the first `t`, checked against fixed SHA-256 sums, and kept in
+  `<config dir>/discommand/whisper/small/`. It runs with
+  [candle](https://github.com/huggingface/candle), which is pure Rust, so no C++ tools
+  are needed to build it.
+- **Only on request.** Nothing is transcribed automatically. On a desktop CPU a short
+  message takes about 10 s and a 1½-minute one about 35 s; laptops are slower. The
+  model is loaded only while it works, then its memory (about 600 MB) is freed again.
+- **Accurate.** German and English come out nearly word for word. Noise without
+  speech may still turn into a stray phrase. Like OpenAI's own Whisper, it uses beam
+  search: five candidate transcripts are followed at once, and the most likely one
+  wins, which avoids many single wrong words.
+- **Knows the chat.** Whisper is given the names in the chat and the last few text
+  messages before the voice message (up to five, about 600 characters) as the text
+  that came before. Names, course names and slang are then spelled the way the chat
+  writes them. This context stays on the computer too.
+- **Kept.** Transcripts are saved in `<config dir>/discommand/transcripts.json`, so
+  each message is transcribed only once. `--logout-a` deletes them.
+- **Built in by choice.** It's the `transcribe` option of the install script. Without
+  it, `t` says how to add it.
+
+Ogg/Opus voice messages are supported, which is what WhatsApp, Discord and Element
+send. Other audio formats (mp3, m4a) can't be played or transcribed yet.
 
 ## Calendar
 
@@ -554,8 +613,8 @@ Discord and WhatsApp need nothing from the publisher: both log in by QR code.
 ### Announcing updates
 
 discommand checks GitHub at startup and then once a day for a newer **release**. If
-there is one, the status line says so, along with what kind of update it is (bugfixes, new
-features or a new full release, see below), and keeps a `⬆ v0.2.0` hint. The repository
+there is one, the status line says so, along with what kind of update it is (fixes and small
+features, big new features, or a new full release, see below), and keeps a `⬆ v0.2.0` hint. The repository
 has to be public for this; while it's private, the check finds nothing and stays
 silent.
 
@@ -563,8 +622,8 @@ Version numbers are `major.feature.fix`:
 
 | Raise | When | Example |
 | --- | --- | --- |
-| `0.0.x` | a bugfix | `0.2.0` → `0.2.1` |
-| `0.x.0` | a new feature (the last number goes back to 0) | `0.2.1` → `0.3.0` |
+| `0.0.x` | bugfixes and small features | `0.2.0` → `0.2.1` |
+| `0.x.0` | big features, mainly a completely new integration (like Moodle); the last number goes back to 0 | `0.2.1` → `0.3.0` |
 | `x.0.0` | a new full release (both others go back to 0) | `0.3.0` → `1.0.0` |
 
 To publish an update:
@@ -577,15 +636,33 @@ Plain pushes don't trigger the notice; only releases do. The check is one small
 request to `api.github.com` (which sees the user's IP address, like any visit to
 GitHub). Users can turn it off by setting `DISCOMMAND_NO_UPDATE_CHECK=1`.
 
+## Code layout
+
+| Where | What |
+| --- | --- |
+| `src/main.rs` | Start-up: command-line options, logins, then the event loop |
+| `src/app/` | All state and behavior. `mod.rs` has the types and `App`; each area has a file: `chat`, `calendar`, `tasks`, `voice_messages`, `tree` (sidebar), `keys`, `commands` |
+| `src/ui/` | Drawing the screen (`mod.rs`), the message model it draws (`view`), pictures (`pics`), text and the input line (`text`), QR codes (`qr`) |
+| `src/discord/` | Discord: REST API, gateway, data types (`model`), what's known about servers and channels (`state`), QR login (`remote_auth`) |
+| `src/chats/` | WhatsApp (`wa`, talking to the Go helper) and Matrix |
+| `src/planner/` | Google Calendar (`cal`), Microsoft To Do (`todo`, also the shared task types), Twos, Moodle |
+| `src/audio/` | Decoding audio, playing sounds (`sound`), transcripts (`voice`), Whisper (`transcribe`) |
+| `src/system/` | Data folders and secrets (`secret`), update check, file dialog (`pick`), opening links and files (`open`) |
+| `assets/` | The alert and startup sounds, built into the program |
+| `wa/` | The WhatsApp helper (Go, whatsmeow) |
+| `keys/` | The publisher's app IDs for Google and Microsoft sign-in (not in git) |
+
+Each folder's `mod.rs` starts with a short description of what's in it.
+
 ## Adding an integration
 
 Each integration is a Cargo feature and a tab:
 
 1. Add a feature to `[features]` in `Cargo.toml`, and to `default`.
-2. Add a variant to `Service` in `src/app.rs` and an entry to `Service::ALL`, marked
+2. Add a variant to `Service` in `src/app/mod.rs` and an entry to `Service::ALL`, marked
    `#[cfg(feature = "…")]`. Tab order, Shift+Tab and `gt` follow from that list.
 3. Only start or connect it when `Service::YourService.built()` is true.
-   A task app only needs a `todo::Backend` variant (see `src/twos.rs`); the task
+   A task app only needs a `todo::Backend` variant (see `src/planner/twos.rs`); the task
    tab, calendar entries and reminders come with it.
 4. Add the name to `all=` in `install.sh`, to the table above and to the
    integration loop in `.github/workflows/build.yml`.

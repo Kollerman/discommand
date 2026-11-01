@@ -3,14 +3,14 @@
 # Works on Windows x64 and ARM64.
 #
 #   .\install.ps1                          asks which integrations to build
-#   .\install.ps1 -With discord,calendar   only these: discord, whatsapp, matrix, calendar, todo, twos, moodle
+#   .\install.ps1 -With discord,calendar   only these: discord, whatsapp, matrix, calendar, todo, twos, moodle, transcribe, sound
 #   .\install.ps1 -With all                back to all of them
 param([string[]]$With)
 $ErrorActionPreference = 'Stop'
 Push-Location $PSScriptRoot
 try {
     # The choice is remembered in .integrations (not in git) for later updates.
-    $all = [ordered]@{ discord = 'Discord'; whatsapp = 'WhatsApp (needs Go)'; matrix = 'Matrix (adds a few minutes to the build)'; calendar = 'Google Calendar'; todo = 'Microsoft To Do'; twos = 'Twos'; moodle = 'Moodle (university / school)' }
+    $all = [ordered]@{ discord = 'Discord'; whatsapp = 'WhatsApp (needs Go)'; matrix = 'Matrix (adds a few minutes to the build)'; calendar = 'Google Calendar'; todo = 'Microsoft To Do'; twos = 'Twos'; moodle = 'Moodle (university / school)'; transcribe = 'Voice message transcription (on this computer; adds a few minutes to the build, downloads a 259 MB model on first use)'; sound = 'Sound (plays voice messages with p, and an alert for new messages while the window is in the background)' }
     $last = if (Test-Path .integrations) { (Get-Content .integrations -Raw).Trim() -split ',' }
     function Ask($question) {
         $a = (Read-Host "$question [Y/n]").Trim().ToLower()
@@ -22,7 +22,7 @@ try {
     else {
         do {
             $With = @($all.Keys | Where-Object { Ask "  $($all[$_])" })
-            if (-not $With) { Write-Host 'Choose at least one.' }
+            if (-not ($With | Where-Object { $_ -notin 'transcribe', 'sound' })) { Write-Host 'Choose at least one integration.'; $With = $null }
         } while (-not $With)
         if ($With.Count -eq $all.Count) { $With = @('all') }
     }
@@ -47,7 +47,7 @@ try {
         $cargoArgs += '--no-default-features', '--features', ((@('native-tls') + $With) -join ',')
         Write-Host "Integrations: $($With -join ', ')"
     } else {
-        Write-Host 'Integrations: all (choose with -With discord,whatsapp,matrix,calendar,todo,twos,moodle)'
+        Write-Host 'Integrations: all (choose with -With discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound)'
     }
 
     if (Test-Path 'keys\keys.env') { Write-Host 'Building with keys\keys.env (one-step Google/Microsoft sign-in).' }

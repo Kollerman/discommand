@@ -1,4 +1,11 @@
 //! Rendering. Vim-like: sidebar split, statusline and a command line.
+//! Its parts: the message model it draws (`view`), inline pictures (`pics`),
+//! text wrapping and the input line (`text`) and QR codes for logins (`qr`).
+
+pub mod pics;
+pub mod qr;
+pub mod text;
+pub mod view;
 
 use chrono::{Datelike, Days, Local, NaiveDate, Timelike};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -9,10 +16,10 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, CalView, Focus, ItemKind, Mode, MsgCache, Service};
-use crate::cal;
-use crate::pics::{cells, Pic, PicRef, Pics, HD_COLS, MAX_COLS, MAX_ROWS};
-use crate::text::{truncate, wrap};
-use crate::view::{Reply, ViewMsg};
+use crate::planner::cal;
+use crate::ui::pics::{cells, Pic, PicRef, Pics, HD_COLS, MAX_COLS, MAX_ROWS};
+use crate::ui::text::{truncate, wrap};
+use crate::ui::view::{Reply, ViewMsg};
 
 const ACCENT: Color = Color::Blue;
 const WA_GREEN: Color = Color::Green;
@@ -294,7 +301,7 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
         let steps: &[&str] = match app.service {
             Service::Twos => TWOS_SETUP,
             Service::Moodle => MOODLE_SETUP,
-            _ if crate::todo::builtin_client_id().is_some() => TODO_SIGN_IN,
+            _ if crate::planner::todo::builtin_client_id().is_some() => TODO_SIGN_IN,
             _ => TODO_SETUP,
         };
         for l in steps {
@@ -814,6 +821,13 @@ fn build_lines(
             }
             out.push((i, Line::from(spans)));
         }
+        if let Some(t) = &m.transcript {
+            let style = DIM.add_modifier(Modifier::ITALIC);
+            for (j, l) in wrap(t, width.saturating_sub(5)).into_iter().enumerate() {
+                let lead = if j == 0 { "  📝 " } else { "     " };
+                out.push((i, Line::from(vec![Span::styled(lead, DIM), Span::styled(l, style)])));
+            }
+        }
         if pics.enabled {
             let max_cols = width.saturating_sub(2) as u32;
             let hd_rows = hd.filter(|(sel, _)| *sel == i).map(|(_, rows)| rows);
@@ -1033,6 +1047,8 @@ const HELP: &[(&str, &str)] = &[
     ("e  dd", "edit / delete selected"),
     ("+  (or =)", "react: 1 ❤️ 2 👍 3 😂 4 💀 5 😅"),
     ("o gx", "open link / attachment / media"),
+    ("t", "transcribe a voice message (on this computer)"),
+    ("p", "play a voice message (again: stop)"),
     ("", "CALENDAR"),
     ("hjkl  w b", "move 30 min / day · next/prev event"),
     ("tab", "next event at the cursor (incl. all-day)"),
@@ -1054,6 +1070,7 @@ const HELP: &[(&str, &str)] = &[
     (":mute [1h]  :unmute", "mute the selected server/channel/DM"),
     (":read  :read all", "the same / in every chat service"),
     (":images on|off", "show pictures in chats (on)"),
+    (":startup true|false", "play the startup sound (true)"),
     (":wa receipts on", "send WhatsApp read receipts (off)"),
     (":wa logout", "unlink WhatsApp"),
     (":mx receipts on", "send Matrix read receipts (off)"),
@@ -1360,7 +1377,7 @@ mod tests {
 
     use super::*;
     use crate::app::{App, CalView, Service};
-    use crate::cal::{CalInfo, Event};
+    use crate::planner::cal::{CalInfo, Event};
 
     /// Renders the week grid with sample events; run with --ignored --nocapture to look at it.
     #[test]
@@ -1370,7 +1387,7 @@ mod tests {
         let (gw, _) = tokio::sync::mpsc::unbounded_channel();
         let (wa, _) = tokio::sync::mpsc::unbounded_channel();
         let (mx, _) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(crate::api::Api::new("x").unwrap(), tx, gw, wa, mx);
+        let mut app = App::new(crate::discord::api::Api::new("x").unwrap(), tx, gw, wa, mx);
         app.service = Service::Calendar;
         app.cal_view = CalView::Week;
         let monday = Local::now().date_naive() - Days::new(Local::now().weekday().num_days_from_monday() as u64);

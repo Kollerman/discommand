@@ -16,8 +16,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-use crate::api::user_agent;
-use crate::qr;
+use crate::discord::api::user_agent;
+use crate::ui::qr;
 
 const GATEWAY: &str = "wss://remote-auth-gateway.discord.gg/?v=2";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;

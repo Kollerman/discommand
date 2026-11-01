@@ -197,6 +197,14 @@ impl Attachment {
             None => self.width.is_some(),
         }
     }
+
+    /// Audio (Discord's voice messages are Ogg/Opus files).
+    pub fn is_audio(&self) -> bool {
+        match self.content_type.as_deref() {
+            Some(t) => t.starts_with("audio/"),
+            None => [".ogg", ".opus", ".oga"].iter().any(|e| self.filename.to_ascii_lowercase().ends_with(e)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -437,6 +445,9 @@ pub struct Folder {
 pub struct UserSettings {
     #[serde(default, deserialize_with = "nullable")]
     pub guild_folders: Vec<Folder>,
+    /// The status chosen in Discord: online, idle, dnd or invisible.
+    #[serde(default, deserialize_with = "nullable")]
+    pub status: String,
 }
 
 #[derive(Debug, Default, Deserialize)]

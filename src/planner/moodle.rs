@@ -27,8 +27,8 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::secret;
-use crate::todo::{Page, Task, TaskList};
+use crate::system::secret;
+use crate::planner::todo::{Page, Task, TaskList};
 
 const SECRET_NAME: &str = "moodle";
 const DEADLINES: &str = "deadlines";
@@ -249,7 +249,7 @@ async fn login_in_browser(site: String, site_name: String, cookie_name: String) 
     let url = format!("{site}/my/");
     println!("\n{site_name} signs in through its own login page, so log in in your browser:");
     println!("\n  {url}\n");
-    let _ = crate::app::open_url(&url);
+    let _ = crate::system::open::open_url(&url);
     println!("Once you're in, hand discommand the browser's Moodle session (one time):");
     println!("  1. Press F12 (developer tools).");
     println!("  2. Chrome/Edge: Application → Cookies → https://{host}");

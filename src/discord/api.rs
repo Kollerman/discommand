@@ -7,7 +7,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use reqwest::{Client, Method};
 use serde_json::{json, Value};
 
-use crate::model::{GuildSettings, Message, User};
+use crate::discord::model::{GuildSettings, Message, User};
 
 const BASE: &str = "https://discord.com/api/v10";
 const CHROME_VERSION: &str = "130.0.0.0";

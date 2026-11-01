@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 
-use crate::model::*;
-use crate::text::{sanitize, truncate};
-use crate::pics::{discord_url, PicRef, PicSrc, HD_COLS, MAX_COLS};
-use crate::view::{Reply, ViewMsg};
+use crate::discord::model::*;
+use crate::ui::text::{sanitize, truncate};
+use crate::ui::pics::{discord_url, PicRef, PicSrc, HD_COLS, MAX_COLS};
+use crate::ui::view::{Reply, ViewMsg};
 
 /// Messages kept per channel; older ones are dropped (and refetched on demand).
 pub const MAX_MESSAGES: usize = 1000;
@@ -562,6 +562,8 @@ impl State {
         for a in &m.attachments {
             if a.is_image() {
                 push(format!("[image] {}", a.filename));
+            } else if a.is_audio() {
+                push(format!("[audio] {}", a.filename));
             } else {
                 push(format!("[file] {} {}", a.filename, a.url));
             }
@@ -637,6 +639,7 @@ impl State {
             msgs.iter()
                 .map(|m| {
                     let base = ViewMsg {
+                        id: m.id.clone(),
                         author: m.author.name().to_string(),
                         author_key: m.author.id.clone(),
                         time: parse_time(&m.timestamp),

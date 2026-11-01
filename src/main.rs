@@ -1,36 +1,30 @@
-mod api;
 mod app;
-mod cal;
-mod gateway;
-#[cfg(feature = "matrix")]
-mod matrix;
-mod moodle;
-mod model;
-mod pics;
-mod pick;
-mod qr;
-#[cfg(feature = "discord")]
-mod ra;
-mod secret;
-mod state;
-mod text;
-mod todo;
-mod twos;
+mod audio;
+mod chats;
+mod discord;
+mod planner;
+mod system;
 mod ui;
-mod update;
-mod view;
-mod wa;
 
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use crossterm::event::{self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event, KeyEventKind};
 use crossterm::execute;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::api::Api;
 use crate::app::{App, AppEvent, Service};
+use crate::audio::{sound, voice};
+#[cfg(feature = "matrix")]
+use crate::chats::matrix;
+use crate::chats::wa;
+use crate::discord::api::Api;
+use crate::discord::gateway;
+#[cfg(feature = "discord")]
+use crate::discord::remote_auth;
+use crate::planner::{cal, moodle, todo, twos};
+use crate::system::{secret, update};
 
 #[cfg(not(any(
     feature = "discord",
@@ -66,7 +60,8 @@ WhatsApp is linked once by scanning a QR code (Linked devices).
                      DISCOMMAND_NO_UPDATE_CHECK=1)
   --logout-a         log out of everything: Discord, WhatsApp (unlinked),
                      Matrix, Google, Microsoft and Twos; also deletes the
-                     WhatsApp chat history, the Matrix store and cached media.
+                     WhatsApp chat history, the Matrix store, cached media
+                     and transcripts of voice messages.
                      Close discommand first.";
 
 fn clean(t: &str) -> String {
@@ -91,7 +86,7 @@ async fn obtain_token(paste: bool) -> Result<String, String> {
     let _ = paste;
     #[cfg(feature = "discord")]
     if !paste {
-        match ra::login().await {
+        match remote_auth::login().await {
             Ok(token) => return finish_login(clean(&token)).await,
             Err(e) => println!("\nQR login didn't work ({e}). You can paste a token instead.\n"),
         }
@@ -175,6 +170,9 @@ async fn logout_all() {
         }
         println!("WhatsApp: local session and chat history deleted");
     }
+    if voice::forget() {
+        println!("Transcripts of voice messages deleted");
+    }
     let _ = std::fs::remove_dir_all(secret::cache_dir());
     println!("Cached pictures and downloads deleted. Logged out of everything.");
 }
@@ -190,7 +188,13 @@ fn main() {
         match arg.as_str() {
             "-h" | "--help" => return println!("{USAGE}"),
             "-V" | "--version" => {
-                let built: Vec<_> = Service::ALL.iter().map(|s| s.name()).collect();
+                let mut built: Vec<_> = Service::ALL.iter().map(|s| s.name()).collect();
+                if voice::BUILT {
+                    built.push("voice transcription");
+                }
+                if sound::BUILT {
+                    built.push("sound");
+                }
                 return println!("discommand {} ({})", env!("CARGO_PKG_VERSION"), built.join(", "));
             }
             "--logout" => {
@@ -243,14 +247,13 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
     let (tx, mut rx) = unbounded_channel::<AppEvent>();
     let (gw_tx, gw_rx) = unbounded_channel::<String>();
     // Without Discord built in, the API client has no token and is never used.
-    let api = if Service::Discord.built() {
+    let (api, gateway) = if Service::Discord.built() {
         let token = obtain_token(paste_token).await?;
         let api = Api::new(&token)?;
         // Discord connects while WhatsApp starts (or is being linked); its events queue up.
-        tokio::spawn(gateway::run(token, tx.clone(), gw_rx));
-        api
+        (api, Some(tokio::spawn(gateway::run(token, tx.clone(), gw_rx))))
     } else {
-        Api::new("")?
+        (Api::new("")?, None)
     };
 
     // Before the helper opens its database: encrypt data folders at rest.
@@ -293,15 +296,22 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
         app.on_event(AppEvent::Wa(Service::WhatsApp, ev));
     }
     let mut terminal = ratatui::init();
-    let _ = execute!(io::stdout(), EnableBracketedPaste);
+    // Focus changes: the alert only sounds while the window is in the background.
+    let _ = execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange);
+    sound::startup();
     let res = event_loop(&mut terminal, &mut app, &mut rx).await;
     let logout = app.logout;
-    let _ = execute!(io::stdout(), DisableBracketedPaste);
+    let _ = execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
 
     app.flush_ack().await;
     // Closing the helper's stdin lets it disconnect cleanly; kill it if it hangs.
     drop(app);
+    // Dropping the app also tells the gateway to close, which shows the
+    // account offline in Discord at once.
+    if let Some(gateway) = gateway {
+        let _ = tokio::time::timeout(Duration::from_secs(2), gateway).await;
+    }
     if let Some(child) = child.as_mut() {
         if tokio::time::timeout(Duration::from_secs(3), child.wait()).await.is_err() {
             let _ = child.kill().await;

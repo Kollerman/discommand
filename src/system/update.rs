@@ -93,7 +93,7 @@ fn version(v: &str) -> Vec<u64> {
 }
 
 /// What kind of update `tag` is for this build, by the first number that
-/// went up: major.feature.fix ("0.3.0" after "0.2.4" brings new features).
+/// went up: major.feature.fix ("0.3.0" after "0.2.4" brings big new features, like an integration).
 pub fn kind(tag: &str) -> &'static str {
     kind_of(tag, env!("CARGO_PKG_VERSION"))
 }
@@ -104,9 +104,9 @@ fn kind_of(new: &str, old: &str) -> &'static str {
     if part(&new, 0) > part(&old, 0) {
         "new full release"
     } else if part(&new, 0) == part(&old, 0) && part(&new, 1) > part(&old, 1) {
-        "new features"
+        "big new features"
     } else {
-        "bugfixes"
+        "fixes and small features"
     }
 }
 
@@ -121,10 +121,10 @@ mod tests {
 
     #[test]
     fn names_the_kind_of_update() {
-        assert_eq!(kind_of("v0.2.1", "0.2.0"), "bugfixes");
-        assert_eq!(kind_of("v0.3.0", "0.2.4"), "new features");
+        assert_eq!(kind_of("v0.2.1", "0.2.0"), "fixes and small features");
+        assert_eq!(kind_of("v0.3.0", "0.2.4"), "big new features");
         assert_eq!(kind_of("v1.0.0", "0.3.2"), "new full release");
-        assert_eq!(kind_of("v.0.2.0", "0.1.1"), "new features");
+        assert_eq!(kind_of("v.0.2.0", "0.1.1"), "big new features");
     }
 
     #[test]

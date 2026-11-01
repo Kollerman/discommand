@@ -11,10 +11,10 @@ use reqwest::{Method, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::cal::{self, local_midnight};
-use crate::secret;
-use crate::moodle::Moodle;
-use crate::twos::Twos;
+use crate::planner::cal::{self, local_midnight};
+use crate::system::secret;
+use crate::planner::moodle::Moodle;
+use crate::planner::twos::Twos;
 
 const AUTH: &str = "https://login.microsoftonline.com/common/oauth2/v2.0";
 const GRAPH: &str = "https://graph.microsoft.com/v1.0";
@@ -355,7 +355,7 @@ impl Todo {
             }
             let resp = req.send().await.map_err(|e| e.to_string())?;
             let status = resp.status();
-            let wait = crate::cal::retry_after(&resp);
+            let wait = crate::planner::cal::retry_after(&resp);
             let text = resp.text().await.map_err(|e| e.to_string())?;
             // Throttled: wait as long as the server asks (or back off) and retry.
             if matches!(status.as_u16(), 429 | 503) && attempt < 3 {

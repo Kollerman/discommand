@@ -564,6 +564,8 @@ type command struct {
 	Key      string `json:"key"`
 	Path     string `json:"path"`
 	Full     bool   `json:"full"`
+	// What a download is for ("transcribe"; else it's opened), passed back.
+	For string `json:"for"`
 }
 
 func (a *App) readCommands(ctx context.Context) {
@@ -645,7 +647,7 @@ func (a *App) handle(ctx context.Context, cmd command) {
 	case "thumb":
 		a.emit(event{"t": "thumb", "key": cmd.Key, "data": a.thumbnail(ctx, cmd.Chat, cmd.ID, cmd.Full)})
 	case "download":
-		a.download(ctx, cmd.Chat, cmd.ID)
+		a.download(ctx, cmd.Chat, cmd.ID, cmd.For)
 	case "pair":
 		code, err := a.cli.PairPhone(ctx, cmd.Phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 		if err != nil {
@@ -883,7 +885,7 @@ func (a *App) seen(ctx context.Context, chat types.JID) {
 	a.emitChat(ctx, key)
 }
 
-func (a *App) download(ctx context.Context, chat, id string) {
+func (a *App) download(ctx context.Context, chat, id, purpose string) {
 	m, err := a.db.getMsg(ctx, chat, id)
 	if err != nil || len(m.raw) == 0 {
 		a.fail("no media in this message")
@@ -923,7 +925,7 @@ func (a *App) download(ctx context.Context, chat, id string) {
 		}
 		a.emit(event{"t": "status", "status": "connected"})
 	}
-	a.emit(event{"t": "file", "path": path})
+	a.emit(event{"t": "file", "path": path, "for": purpose, "id": id})
 }
 
 func dimensions(m *waE2E.Message) (uint32, uint32) {

@@ -1,12 +1,12 @@
 [package]
 name = "discommand"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Lightweight, battery-friendly terminal Discord client"
 license = "MIT"
 
 [features]
-default = ["native-tls", "discord", "whatsapp", "matrix", "calendar", "todo", "twos", "moodle"]
+default = ["native-tls", "discord", "whatsapp", "matrix", "calendar", "todo", "twos", "moodle", "transcribe", "sound"]
 
 # Integrations: build with any subset, e.g.
 #   cargo build --release --no-default-features --features native-tls,discord,calendar
@@ -21,6 +21,12 @@ todo = []
 twos = []
 # Any Moodle site: courses, their contents and deadlines.
 moodle = []
+# Voice messages to text (t), on this computer: Whisper "small", run with candle
+# (pure Rust). The 259 MB model is downloaded on first use.
+transcribe = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:ogg", "dep:opus-decoder"]
+# Sound: voice messages played (p), with a retro crunch, and an alert for new
+# messages while the window isn't focused. Linux needs the ALSA headers (libasound2-dev).
+sound = ["dep:rodio", "dep:ogg", "dep:opus-decoder"]
 
 # OS TLS stack: SChannel on Windows, Security.framework on macOS, OpenSSL on Linux.
 native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
@@ -57,6 +63,16 @@ matrix-sdk = { version = "0.19", default-features = false, features = ["e2e-encr
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 # The type of a file sent to Matrix.
 mime = { version = "0.3", optional = true }
+
+# Transcription: the model (CPU only); and for it and sound, a pure-Rust Opus decoder
+# for voice messages.
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", default-features = false, optional = true }
+ogg = { version = "0.9", optional = true }
+opus-decoder = { version = "0.1", optional = true }
+# Sound: playback, and mp3 for the startup sound (the voice messages are decoded above).
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"], optional = true }
 
 # The system's file dialog (picking files to send); Linux uses the desktop's
 # portal, so no GTK is needed to build.

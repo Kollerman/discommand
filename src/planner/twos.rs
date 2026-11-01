@@ -12,8 +12,8 @@ use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::secret;
-use crate::todo::{self, Page, Task, TaskList};
+use crate::system::secret;
+use crate::planner::todo::{self, Page, Task, TaskList};
 
 const API: &str = "https://www.twosapp.com/api/v1";
 const SECRET_NAME: &str = "twos";
@@ -290,7 +290,7 @@ impl Twos {
             }
             let resp = req.send().await.map_err(|e| e.to_string())?;
             let status = resp.status();
-            let wait = crate::cal::retry_after(&resp);
+            let wait = crate::planner::cal::retry_after(&resp);
             let text = resp.text().await.map_err(|e| e.to_string())?;
             if status.as_u16() == 429 && attempt < 2 {
                 tokio::time::sleep(Duration::from_secs(wait.unwrap_or(5).min(60))).await;

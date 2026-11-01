@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Local};
 
-use crate::pics::PicRef;
+use crate::ui::pics::PicRef;
 
 #[derive(Default)]
 pub enum Reply {
@@ -16,6 +16,8 @@ pub enum Reply {
 
 #[derive(Default)]
 pub struct ViewMsg {
+    /// The message's id in its service.
+    pub id: String,
     pub author: String,
     /// Stable author id: groups consecutive messages and picks the name color.
     pub author_key: String,
@@ -32,4 +34,6 @@ pub struct ViewMsg {
     pub reactions: String,
     /// Pictures drawn under the body.
     pub pics: Vec<PicRef>,
+    /// What a voice message says (`t`), shown under it.
+    pub transcript: Option<String>,
 }
