@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" alt="discommand logo" width="160"></p>
+
 # discommand
 
 A small, vim-style terminal client for **Discord, WhatsApp, Matrix, Google Calendar, Microsoft To Do and Twos**, written in Rust.
@@ -681,7 +683,7 @@ GitHub). Users can turn it off by setting `DISCOMMAND_NO_UPDATE_CHECK=1`.
 | `src/audio/` | Decoding audio, playing sounds (`sound`), transcripts (`voice`), Whisper (`transcribe`) |
 | `src/pdf/` | PDFs: reading and drawing them with hayro (`engine`), the viewer's state and page sizes (`view`) |
 | `src/system/` | Data folders and secrets (`secret`), update check, file dialog (`pick`), opening links and files (`open`) |
-| `assets/` | The alert and startup sounds, built into the program |
+| `assets/` | The logo, and the alert and startup sounds (built into the program) |
 | `wa/` | The WhatsApp helper (Go, whatsmeow) |
 | `keys/` | The publisher's app IDs for Google and Microsoft sign-in (not in git) |
 

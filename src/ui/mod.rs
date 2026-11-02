@@ -604,41 +604,89 @@ const LOGO_SMALL: [&str; 4] = [
     r"\_,_/_/___/\__/\___/_/_/_/_/_/_/\_,_/_//_/\_,_/",
 ];
 
-/// The empty chat pane: the logo, leaning right (each row starts one
-/// column left of the one above), in a cyan → magenta neon gradient.
+/// The logo mark (`assets/logo.svg`) in half blocks, two pixels per cell.
+const MARK: [&str; 11] = [
+    "       ▄              ▄",
+    "       ▀█▄          ▄█▀",
+    "         ██▄      ▄██",
+    "      ▄███████▀▀███████▄",
+    "     ████████▀  ▀████████",
+    "   ▄████████▀    ▀████████▄",
+    "  █████████▀      ▀█████████",
+    "▄█████████▀        ▀█████████▄",
+    "▀████████▀          ▀████████▀",
+    "  ▀█████▀            ▀█████▀",
+    "    ▀████▄          ▄████▀",
+];
+
+/// For smaller panes.
+const MARK_SMALL: [&str; 7] = [
+    "     ▀▄▄    ▄▄▀",
+    "    █████▀▀█████",
+    "  ▄█████▀  ▀█████▄",
+    " ██████▀    ▀██████",
+    "▀█████▀      ▀█████▀",
+    "  ▀███        ███▀",
+    "    ▀▀█▄    ▄█▀▀",
+];
+
+/// The empty chat pane: the logo mark over the name, the name leaning right
+/// (each row starts one column left of the one above), in a cyan → magenta
+/// neon gradient. Smaller versions, or no mark, where the pane is small.
 fn draw_logo(f: &mut Frame, area: Rect) {
     let (w, h) = (area.width as usize, area.height as usize);
     let lean = LOGO.len() - 1;
     let big_w = LOGO[1].chars().count() + lean;
-    let rows: Vec<String> = if w >= big_w + 2 && h >= LOGO.len() + 5 {
-        LOGO.iter().enumerate().map(|(i, l)| format!("{}{l}", " ".repeat(lean - i))).collect()
-    } else if w >= LOGO_SMALL[1].len() + 2 {
-        LOGO_SMALL.iter().map(|l| l.to_string()).collect()
+    let small_w = LOGO_SMALL[1].len();
+    let big: Vec<String> = LOGO.iter().enumerate().map(|(i, l)| format!("{}{l}", " ".repeat(lean - i))).collect();
+    let small: Vec<String> = LOGO_SMALL.iter().map(|l| l.to_string()).collect();
+    // The rows under the logo: a blank line, the tagline and the hint.
+    let below = 3;
+    let (mark, name): (&[&str], Vec<String>) = if w >= big_w + 2 && h >= MARK.len() + 1 + LOGO.len() + below {
+        (&MARK, big)
+    } else if w >= big_w + 2 && h >= LOGO.len() + below {
+        (&[], big)
+    } else if w >= small_w + 2 && h >= MARK_SMALL.len() + 1 + LOGO_SMALL.len() + below {
+        (&MARK_SMALL, small)
+    } else if w >= small_w + 2 {
+        (&[], small)
+    } else if h >= MARK_SMALL.len() + below {
+        (&MARK_SMALL, Vec::new())
     } else {
-        vec!["discommand".to_string()]
-    };
-    let logo_w = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
-    let neon = |x: usize| {
-        let t = x as f32 / logo_w.max(1) as f32;
-        let mix = |a: f32, b: f32| (a + (b - a) * t) as u8;
-        Color::Rgb(mix(0.0, 255.0), mix(230.0, 40.0), mix(255.0, 200.0))
+        (&[], vec!["discommand".to_string()])
     };
     let shadow = Style::new().fg(Color::Rgb(95, 45, 150));
-    let pad = " ".repeat(w.saturating_sub(logo_w) / 2);
     let mut lines: Vec<Line> = Vec::new();
-    for row in &rows {
-        let mut spans = vec![Span::raw(pad.clone())];
-        for (x, c) in row.chars().enumerate() {
-            let style = match c {
-                ' ' => Style::new(),
-                // The big logo's shadow is drawn with box lines.
-                '╗' | '╔' | '║' | '═' | '╝' | '╚' => shadow,
-                _ => Style::new().fg(neon(x)).add_modifier(Modifier::BOLD),
-            };
-            spans.push(Span::styled(c.to_string(), style));
+    // Each block centered on its own, with the gradient across its width.
+    let mut block = |rows: &[String]| {
+        let block_w = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0);
+        let neon = |x: usize| {
+            let t = x as f32 / block_w.max(1) as f32;
+            let mix = |a: f32, b: f32| (a + (b - a) * t) as u8;
+            Color::Rgb(mix(0.0, 255.0), mix(230.0, 40.0), mix(255.0, 200.0))
+        };
+        let pad = " ".repeat(w.saturating_sub(block_w) / 2);
+        for row in rows {
+            let mut spans = vec![Span::raw(pad.clone())];
+            for (x, c) in row.chars().enumerate() {
+                let style = match c {
+                    ' ' => Style::new(),
+                    // The big logo's shadow is drawn with box lines.
+                    '╗' | '╔' | '║' | '═' | '╝' | '╚' => shadow,
+                    _ => Style::new().fg(neon(x)).add_modifier(Modifier::BOLD),
+                };
+                spans.push(Span::styled(c.to_string(), style));
+            }
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::from(spans));
+    };
+    if !mark.is_empty() {
+        block(&mark.iter().map(|r| r.to_string()).collect::<Vec<_>>());
+        if !name.is_empty() {
+            block(&[String::new()]);
+        }
     }
+    block(&name);
     let center = |text: &str| " ".repeat(w.saturating_sub(text.chars().count()) / 2);
     let tag = "░▒▓█ TERMINAL UPLINK █▓▒░";
     lines.push(Line::from(""));
