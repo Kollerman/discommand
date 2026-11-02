@@ -710,3 +710,7 @@ Remember that both services' terms forbid unofficial clients, and say so to your
   login: addresses and form field names, never values or passwords.
 - "client version rejected": update whatsmeow (`cd wa && go get go.mau.fi/whatsmeow@latest`)
   and re-run the install script.
+
+## License
+
+[MIT](LICENSE). The WhatsApp helper uses [whatsmeow](https://github.com/tulir/whatsmeow), which is under the MPL-2.0.
