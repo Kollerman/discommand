@@ -9,12 +9,14 @@
 //! - `voice_messages`: playing and transcribing voice messages, the alert
 //! - `tree`: the sidebar
 //! - `keys`: what each key does
+//! - `pdf_viewer`: the PDF viewer
 //! - `commands`: the `:` commands
 
 mod calendar;
 mod chat;
 mod commands;
 mod keys;
+mod pdf_viewer;
 mod tasks;
 mod tree;
 mod voice_messages;
@@ -65,6 +67,8 @@ pub enum AppEvent {
     Transcript(String, Result<String, String>),
     /// A voice message started playing (its `voice::key`), this long.
     Playing(String, Result<std::time::Duration, String>),
+    /// From the PDF viewer (opening, text, pictures of pages).
+    Pdf(pdf_viewer::PdfMsg),
 }
 
 pub enum TodoMsg {
@@ -442,6 +446,12 @@ pub struct App {
     away: bool,
     /// The status chosen in Discord (away is only set over "online").
     discord_status: String,
+    /// The PDF shown (over everything else), and how many were opened.
+    pub pdf: Option<crate::pdf::Viewer>,
+    pdf_id: u64,
+    /// The screen must be cleared before the next draw (pictures don't go
+    /// away by themselves).
+    pub clear_screen: bool,
 }
 
 impl App {
@@ -538,6 +548,9 @@ impl App {
             last_input: Instant::now(),
             away: false,
             discord_status: String::new(),
+            pdf: None,
+            pdf_id: 0,
+            clear_screen: false,
         }
     }
 
@@ -818,6 +831,7 @@ impl App {
                 }
                 Err(e) => self.status = format!("couldn't play it: {e}"),
             },
+            AppEvent::Pdf(msg) => self.on_pdf(msg),
             AppEvent::Wa(s, ev) => self.on_wa(s, ev),
             AppEvent::Pic { key, pic } => self.pics.finish(key, pic),
             AppEvent::Cal(msg) => self.on_cal(msg),

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::system::secret;
-use crate::planner::todo::{Page, Task, TaskList};
+use crate::planner::todo::{Page, Task, TaskList, TodoState};
 
 const SECRET_NAME: &str = "moodle";
 const DEADLINES: &str = "deadlines";
@@ -1048,6 +1048,8 @@ impl Moodle {
         }
         let others: Vec<&String> = names.iter().filter(|(id, _)| **id != uid).map(|(_, n)| n).collect();
         let title = others.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ");
+        // Read now, as on the site: the "new" goes away there too.
+        let _ = self.call("core_message_mark_all_conversation_messages_as_read", json!({ "userid": uid, "conversationid": convid })).await;
         let mut page = numbered(list, &title, "✉", lines);
         page.list = list.into();
         Ok(page)
@@ -1792,7 +1794,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// A file name that is safe to create in the download folder.
-fn safe_name(name: &str) -> String {
+pub fn safe_name(name: &str) -> String {
     let name = name.rsplit(['/', '\\']).next().unwrap_or("");
     let name: String = name
         .chars()
@@ -2342,6 +2344,25 @@ fn form_error(html: &str) -> Option<String> {
     None
 }
 
+/// A conversation was opened (and marked read on the site): its "n new" goes
+/// from the list of messages and from the count beside "Messages".
+pub fn conversation_read(st: &mut TodoState, list: &str) {
+    let Some(page) = st.pages.get_mut(MESSAGES) else { return };
+    let Some(line) = page.lines.iter_mut().find(|l| l.important && l.sublist.as_deref() == Some(list)) else { return };
+    line.important = false;
+    line.title = line.title.replacen(&format!(" · {} new", unread_in(&line.title)), "", 1);
+    let total: usize = page.lines.iter().filter(|l| l.important).map(|l| unread_in(&l.title)).sum();
+    if let Some(l) = st.lists.iter_mut().find(|l| l.id == MESSAGES) {
+        l.name = if total > 0 { format!("Messages ({total} new)") } else { "Messages".into() };
+    }
+}
+
+/// The "n new" in a conversation's line ("Name  · 12 Oct · 2 new — preview").
+fn unread_in(title: &str) -> usize {
+    let before_preview = title.split(" — ").next().unwrap_or(title);
+    before_preview.split(" · ").find_map(|part| part.strip_suffix(" new")?.parse().ok()).unwrap_or(0)
+}
+
 /// Ids of the lists beside the courses, and the page ids of conversations.
 pub const NOTIFICATIONS: &str = "notifications";
 pub const MESSAGES: &str = "messages";
@@ -2439,6 +2460,28 @@ pub const POLL: Duration = Duration::from_secs(30 * 60);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opened_conversations_lose_their_new() {
+        let line = |id: &str, title: &str, new: bool| Task {
+            title: title.into(),
+            important: new,
+            sublist: Some(format!("{CONVERSATION}{id}")),
+            ..Task::default()
+        };
+        let mut st = TodoState::default();
+        st.lists.push(TaskList { id: MESSAGES.into(), name: "Messages (3 new)".into(), ..TaskList::default() });
+        let lines = vec![line("1", "Anna  · 12 Oct · 1 new — hi · there", true), line("2", "Ben  · 11 Oct · 2 new — ok", true)];
+        st.pages.insert(MESSAGES.into(), numbered(MESSAGES, "Messages", "✉", lines));
+        conversation_read(&mut st, "conversation:1");
+        let page = &st.pages[MESSAGES];
+        let anna = page.lines.iter().find(|l| l.sublist.as_deref() == Some("conversation:1")).unwrap();
+        assert_eq!(anna.title, "Anna  · 12 Oct — hi · there");
+        assert!(!anna.important);
+        assert_eq!(st.lists[0].name, "Messages (2 new)");
+        conversation_read(&mut st, "conversation:2");
+        assert_eq!(st.lists[0].name, "Messages");
+    }
 
     #[test]
     fn sites_are_normalized() {

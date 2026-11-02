@@ -162,6 +162,10 @@ impl App {
             self.finder_key(k);
             return;
         }
+        if self.pdf.is_some() && self.focus != Focus::Command {
+            self.pdf_key(k);
+            return;
+        }
         match self.focus {
             Focus::Input => self.insert_key(k, paste_burst),
             Focus::Command => self.command_key(k),

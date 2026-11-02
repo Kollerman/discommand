@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod chats;
 mod discord;
+mod pdf;
 mod planner;
 mod system;
 mod ui;
@@ -298,6 +299,8 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
     let mut terminal = ratatui::init();
     // Focus changes: the alert only sounds while the window is in the background.
     let _ = execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange);
+    // What pictures the terminal can show, for PDFs: asked before input is read.
+    pdf::view::detect();
     sound::startup();
     let res = event_loop(&mut terminal, &mut app, &mut rx).await;
     let logout = app.logout;
@@ -379,6 +382,10 @@ async fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, rx: &mut Unbo
         // Redraw only when something changed. The only timer is for calendar
         // reminders/polling, and it sleeps until exactly when it's needed.
         if app.dirty {
+            if app.clear_screen {
+                terminal.clear()?;
+                app.clear_screen = false;
+            }
             if app.tree_dirty {
                 app.rebuild_tree();
             }
@@ -386,6 +393,7 @@ async fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, rx: &mut Unbo
             terminal.draw(|f| ui::draw(f, app))?;
             app.dirty = false;
             app.load_pics();
+            app.load_pdf_page();
         }
         let wake = app.next_wake();
         tokio::select! {

@@ -178,6 +178,7 @@ sh install.sh --with discord,calendar          # Linux, macOS
 | `moodle` | Moodle (any university or school site) |
 | `transcribe` | Voice message transcription (not an integration: `t` in WhatsApp, Discord and Matrix chats; about 3 minutes of extra build time) |
 | `sound` | Sound (not an integration: `p` plays voice messages, and an alert sounds for new messages while the window is in the background; on Linux it needs the ALSA headers, `libasound2-dev`, and the script leaves it out without them or on Termux) |
+| `pdf` | PDF viewer (not an integration: PDFs from chats and Moodle open inside discommand, see [PDFs](#pdfs)) |
 
 Integrations that aren't built in are left out of the program completely: no tab, no
 login at startup, no background activity. `--with all` (or `-With all`) builds
@@ -268,7 +269,7 @@ The app is modal like vim. Press `?` inside it for this list.
 | sending files | **`F`** opens the file dialog; the file waits above the input (`📎 name`), you can type a caption, `Enter` sends it, `Esc` removes it. `:attach <path>` does the same without the dialog (SSH, Termux). Discord, WhatsApp (photo/video/audio/document by file type, up to 100 MB) and Matrix (encrypted in encrypted rooms). |
 | messages | `j k Ctrl-u Ctrl-d` select · `gg` top + load history · `G`/`Esc` newest · `r`/`R` reply (ping/no ping) · `+` react (then `1`–`5`: ❤️ 👍 😂 💀 😅; the same again removes it) · `e` edit · `dd` delete · `o`/`gx` open link, attachment or WhatsApp media · `t` transcribe a voice message · `p` play a voice message (again: stop) |
 | insert | `Enter` send · `Alt-Enter` newline · `↑` on empty input edits your last message · `Esc` normal · `Shift-Tab` switch service |
-| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:mute [15m\|1h\|8h\|24h\|7d]` / `:unmute` the selected Discord server, category, channel or DM · `:images on\|off` · `:startup true\|false` the startup sound · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
+| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:mute [15m\|1h\|8h\|24h\|7d]` / `:unmute` the selected Discord server, category, channel or DM · `:images on\|off` · `:startup true\|false` the startup sound · `:pdf [path]` open a PDF · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
 
 Each service keeps its own open chat, sidebar position and unsent draft. The
 statusline shows which service is active, and how many unread chats or mentions
@@ -334,7 +335,6 @@ All of this is the `sound` option of the install script.
 
 ### Transcribing (`t`)
 
-
 - **On this computer.** The audio never leaves it. The speech model is OpenAI's
   Whisper "small", quantized to 8 bits (259 MB). It's downloaded once from Hugging Face
   on the first `t`, checked against fixed SHA-256 sums, and kept in
@@ -359,6 +359,38 @@ All of this is the `sound` option of the install script.
 
 Ogg/Opus voice messages are supported, which is what WhatsApp, Discord and Element
 send. Other audio formats (mp3, m4a) can't be played or transcribed yet.
+
+## PDFs
+
+PDFs open inside discommand: attachments in Discord, WhatsApp and Matrix chats (`o`),
+files in Moodle courses, and any file with `:pdf <path>` (`:pdf` alone opens the file
+dialog). There are two views of the same PDF, `Tab` switches between them:
+
+- **Page view:** each page drawn as a real picture, sharp enough to read slides and
+  documents. This needs a terminal that shows pictures: Windows Terminal 1.22 or later
+  (Sixel), WezTerm, foot, Kitty, Ghostty or iTerm2. discommand asks the terminal at start.
+  Elsewhere (older terminals, tmux, Termux) pages are blocky previews, so PDFs open in
+  the text view there.
+- **Text view:** the text of every page, readable and searchable in any terminal. Scanned
+  PDFs without a text layer show nothing here.
+
+| Key | |
+| --- | --- |
+| `j` `k` `Ctrl-d` `Ctrl-u` | scroll; at the end of a page on to the next |
+| `h` `l` (or `PgUp` `PgDn`, `Space`) | previous / next page |
+| `gg` `G` | first / last page |
+| `Tab` | text view / page view |
+| `w` | whole page / as wide as the screen |
+| `+` `-`, `H` `L` | zoom, and move sideways when zoomed in |
+| `/` (or `#`), `n` `N` | search the text, next / previous match |
+| `o` | open in the system's PDF program |
+| `q` `Esc` | close |
+
+PDFs are read with [hayro](https://github.com/LaurenzV/hayro), which is pure Rust, so
+nothing extra is needed to build. It draws the vast majority of PDFs correctly;
+password-protected ones can't be opened. Pages are drawn in the background, about
+0.1–0.5 s each. Discord attachments are downloaded into the cache folder first (at most
+100 MB). It's the `pdf` option of the install script.
 
 ## Calendar
 
@@ -647,6 +679,7 @@ GitHub). Users can turn it off by setting `DISCOMMAND_NO_UPDATE_CHECK=1`.
 | `src/chats/` | WhatsApp (`wa`, talking to the Go helper) and Matrix |
 | `src/planner/` | Google Calendar (`cal`), Microsoft To Do (`todo`, also the shared task types), Twos, Moodle |
 | `src/audio/` | Decoding audio, playing sounds (`sound`), transcripts (`voice`), Whisper (`transcribe`) |
+| `src/pdf/` | PDFs: reading and drawing them with hayro (`engine`), the viewer's state and page sizes (`view`) |
 | `src/system/` | Data folders and secrets (`secret`), update check, file dialog (`pick`), opening links and files (`open`) |
 | `assets/` | The alert and startup sounds, built into the program |
 | `wa/` | The WhatsApp helper (Go, whatsmeow) |

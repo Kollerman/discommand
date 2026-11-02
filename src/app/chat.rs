@@ -103,6 +103,7 @@ impl App {
                     Some(AppEvent::Playing(key, result))
                 });
             }
+            WaEvent::File { path, .. } if crate::pdf::is_pdf(&path) => self.open_pdf(path.into()),
             WaEvent::File { path, .. } => match open_file(&path) {
                 Ok(true) => {}
                 Ok(false) => self.status = format!("saved {path}; not opened because this file type can run code"),
@@ -811,6 +812,12 @@ impl App {
             self.status = "select a message first (k)".into();
             return;
         };
+        // A PDF opens in the viewer.
+        if let Some(a) = m.attachments.iter().find(|a| crate::pdf::is_pdf(&a.filename)).filter(|_| crate::pdf::BUILT) {
+            let (url, name) = (a.url.clone(), a.filename.clone());
+            self.open_pdf_link(url, name);
+            return;
+        }
         // A picture opens in full quality; then files, then links.
         let url = crate::discord::state::full_picture(m)
             .or_else(|| m.attachments.first().map(|a| a.url.clone()))

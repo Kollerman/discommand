@@ -90,6 +90,7 @@ impl App {
                 st.apply(lists, tasks, pages);
                 self.done_refreshing();
             }
+            TodoMsg::File(Ok(path)) if crate::pdf::is_pdf(&path) => self.open_pdf(path.into()),
             TodoMsg::File(Ok(path)) => match open_file(&path) {
                 Ok(true) => self.status = format!("opened {path}"),
                 Ok(false) => self.status = format!("saved {path}; not opened because this file type can run code"),
@@ -120,7 +121,13 @@ impl App {
                     }
                     let st = &mut tab.state;
                     st.loading.remove(&list);
+                    // Opening a conversation marked it read: its "new" goes.
+                    let read = list.starts_with(moodle::CONVERSATION);
+                    if read {
+                        moodle::conversation_read(st, &list);
+                    }
                     st.pages.insert(list, p);
+                    self.tree_dirty |= read;
                 }
                 // Stays marked as loading, so it's tried again at the next sync, not on every redraw.
                 Err(e) => self.status = e,

@@ -3,13 +3,13 @@
 # Works on Linux, macOS and Termux. Re-run after changes to update.
 #
 #   sh install.sh                          asks which integrations to build
-#   sh install.sh --with discord,calendar  only these: discord, whatsapp, matrix, calendar, todo, twos, moodle, transcribe, sound
+#   sh install.sh --with discord,calendar  only these: discord, whatsapp, matrix, calendar, todo, twos, moodle, transcribe, sound, pdf
 #   sh install.sh --with all               back to all of them
 set -e
 cd "$(dirname "$0")"
 
 # Every integration (the default features in Cargo.toml).
-all="discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound"
+all="discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound,pdf"
 with=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,22 +35,23 @@ if [ -z "$with" ]; then
         with="$last"
     else
         while [ -z "$with" ]; do
-            for name in discord whatsapp matrix calendar todo twos moodle transcribe sound; do
+            for name in discord whatsapp matrix calendar todo twos moodle transcribe sound pdf; do
                 case $name in
                     discord) label="Discord" ;;
-                    whatsapp) label="WhatsApp (needs Go)" ;;
-                    matrix) label="Matrix (adds a few minutes to the build)" ;;
+                    whatsapp) label="WhatsApp" ;;
+                    matrix) label="Matrix" ;;
                     calendar) label="Google Calendar" ;;
                     todo) label="Microsoft To Do" ;;
                     twos) label="Twos" ;;
-                    moodle) label="Moodle (university / school)" ;;
-                    transcribe) label="Voice message transcription (on this computer; adds a few minutes to the build, downloads a 259 MB model on first use)" ;;
-                    sound) label="Sound (plays voice messages with p, and an alert for new messages while the window is in the background; Linux needs libasound2-dev)" ;;
+                    moodle) label="Moodle" ;;
+                    transcribe) label="Voice transcription" ;;
+                    sound) label="Sound" ;;
+                    pdf) label="PDF viewer" ;;
                 esac
                 ask "  $label" && with="${with:+$with,}$name"
             done
-            # Transcription and sound aren't integrations of their own.
-            if [ -z "$(printf '%s' ",$with," | sed 's/,transcribe,/,/; s/,sound,/,/; s/^,*//; s/,*$//')" ]; then
+            # Transcription, sound and the PDF viewer aren't integrations of their own.
+            if [ -z "$(printf '%s' ",$with," | sed 's/,transcribe,/,/; s/,sound,/,/; s/,pdf,/,/; s/^,*//; s/,*$//')" ]; then
                 echo "Choose at least one integration."
                 with=""
             fi
@@ -82,7 +83,7 @@ bin="${CARGO_HOME:-$HOME/.cargo}/bin"
 if [ -n "$with" ]; then
     echo "Integrations: $with"
 else
-    echo "Integrations: all (choose with --with discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound)"
+    echo "Integrations: all (choose with --with discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound,pdf)"
 fi
 if [ -f keys/keys.env ]; then
     echo "Building with keys/keys.env (one-step Google/Microsoft sign-in)."

@@ -2,6 +2,7 @@
 //! Its parts: the message model it draws (`view`), inline pictures (`pics`),
 //! text wrapping and the input line (`text`) and QR codes for logins (`qr`).
 
+pub mod pdf;
 pub mod pics;
 pub mod qr;
 pub mod text;
@@ -45,7 +46,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
 
     let narrow = main.width < 70;
-    if app.service == Service::Calendar && app.cal_view != CalView::Agenda {
+    if let Some(v) = app.pdf.as_mut() {
+        pdf::draw(f, v, main);
+    } else if app.service == Service::Calendar && app.cal_view != CalView::Agenda {
         draw_cal_grid(f, app, main);
     } else if narrow {
         if app.focus == Focus::Tree {
@@ -60,7 +63,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_chat(f, app, right);
     }
     draw_statusline(f, app, statusline);
-    draw_cmdline(f, app, cmdline);
+    if !app.pdf.as_ref().is_some_and(|v| pdf::draw_search(f, v, cmdline)) {
+        draw_cmdline(f, app, cmdline);
+    }
 
     if app.finder.is_some() {
         draw_finder(f, app);
@@ -75,6 +80,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_confirm(f, c);
     }
     scrub(f);
+    if let Some(v) = &app.pdf {
+        pdf::draw_picture(f, v);
+    }
 }
 
 /// Removes control and bidi-override characters from everything drawn.
@@ -1046,7 +1054,7 @@ const HELP: &[(&str, &str)] = &[
     ("r R", "reply (with / without ping)"),
     ("e  dd", "edit / delete selected"),
     ("+  (or =)", "react: 1 ❤️ 2 👍 3 😂 4 💀 5 😅"),
-    ("o gx", "open link / attachment / media"),
+    ("o gx", "open link / attachment / media (PDFs: in the viewer)"),
     ("t", "transcribe a voice message (on this computer)"),
     ("p", "play a voice message (again: stop)"),
     ("", "CALENDAR"),
@@ -1058,6 +1066,12 @@ const HELP: &[(&str, &str)] = &[
     ("", "TASKS"),
     ("n  e  dd", "new / edit / delete task"),
     ("x  space", "done / not done (also on tasks in the calendar)"),
+    ("", "PDF VIEWER"),
+    ("j k  ^d ^u", "scroll (on to the next page at the end)"),
+    ("h l  gg G", "previous / next page · first / last"),
+    ("tab  w  + -", "text / page view · fit width · zoom"),
+    ("/  n N", "search the text · next / previous match"),
+    ("o  q", "open in the system's PDF program · close"),
     ("", "INSERT"),
     ("⏎  alt-⏎", "send / newline"),
     ("↑", "edit your last message (empty input)"),
@@ -1067,6 +1081,7 @@ const HELP: &[(&str, &str)] = &[
     (":r", "reload chat / sync calendar"),
     ("A", "mark all chats of this service read"),
     ("F  :attach PATH", "send a file (F: pick it in the file dialog)"),
+    (":pdf [PATH]", "open a PDF (no path: the file dialog)"),
     (":mute [1h]  :unmute", "mute the selected server/channel/DM"),
     (":read  :read all", "the same / in every chat service"),
     (":images on|off", "show pictures in chats (on)"),

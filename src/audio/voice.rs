@@ -106,7 +106,7 @@ pub async fn transcribe(_data: Vec<u8>, _context: String) -> Result<String, Stri
 }
 
 /// Shown on `t` when the feature isn't built in.
-pub const NOT_BUILT: &str = "voice transcription isn't built in: run the install script again and answer y for \"Voice message transcription\"";
+pub const NOT_BUILT: &str = "voice transcription isn't built in: run the install script again and answer y for \"Voice transcription\"";
 
 /// Whether the speech model still has to be downloaded (259 MB, once).
 pub fn needs_model() -> bool {
