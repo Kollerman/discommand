@@ -3,13 +3,13 @@
 # Works on Linux, macOS and Termux. Re-run after changes to update.
 #
 #   sh install.sh                          asks which integrations to build
-#   sh install.sh --with discord,calendar  only these: discord, whatsapp, matrix, calendar, todo, twos, moodle, transcribe, sound, pdf
+#   sh install.sh --with discord,calendar  only these: discord, whatsapp, matrix, calendar, todo, twos, moodle, transcribe, sound, pdf, totp
 #   sh install.sh --with all               back to all of them
 set -e
 cd "$(dirname "$0")"
 
 # Every integration (the default features in Cargo.toml).
-all="discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound,pdf"
+all="discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound,pdf,totp"
 with=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -35,7 +35,7 @@ if [ -z "$with" ]; then
         with="$last"
     else
         while [ -z "$with" ]; do
-            for name in discord whatsapp matrix calendar todo twos moodle transcribe sound pdf; do
+            for name in discord whatsapp matrix calendar todo twos moodle transcribe sound pdf totp; do
                 case $name in
                     discord) label="Discord" ;;
                     whatsapp) label="WhatsApp" ;;
@@ -47,11 +47,12 @@ if [ -z "$with" ]; then
                     transcribe) label="Voice transcription" ;;
                     sound) label="Sound" ;;
                     pdf) label="PDF viewer" ;;
+                    totp) label="Authenticator" ;;
                 esac
                 ask "  $label" && with="${with:+$with,}$name"
             done
-            # Transcription, sound and the PDF viewer aren't integrations of their own.
-            if [ -z "$(printf '%s' ",$with," | sed 's/,transcribe,/,/; s/,sound,/,/; s/,pdf,/,/; s/^,*//; s/,*$//')" ]; then
+            # Transcription, sound, the PDF viewer and the authenticator aren't integrations.
+            if [ -z "$(printf '%s' ",$with," | sed 's/,transcribe,/,/; s/,sound,/,/; s/,pdf,/,/; s/,totp,/,/; s/^,*//; s/,*$//')" ]; then
                 echo "Choose at least one integration."
                 with=""
             fi
@@ -83,7 +84,7 @@ bin="${CARGO_HOME:-$HOME/.cargo}/bin"
 if [ -n "$with" ]; then
     echo "Integrations: $with"
 else
-    echo "Integrations: all (choose with --with discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound,pdf)"
+    echo "Integrations: all (choose with --with discord,whatsapp,matrix,calendar,todo,twos,moodle,transcribe,sound,pdf,totp)"
 fi
 if [ -f keys/keys.env ]; then
     echo "Building with keys/keys.env (one-step Google/Microsoft sign-in)."

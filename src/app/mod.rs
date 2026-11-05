@@ -10,11 +10,13 @@
 //! - `tree`: the sidebar
 //! - `keys`: what each key does
 //! - `pdf_viewer`: the PDF viewer
+//! - `authenticator`: the authenticator tab (`:totp`)
 //! - `commands`: the `:` commands
 
 mod calendar;
 mod chat;
 mod commands;
+mod authenticator;
 mod keys;
 mod pdf_viewer;
 mod tasks;
@@ -452,6 +454,8 @@ pub struct App {
     /// The screen must be cleared before the next draw (pictures don't go
     /// away by themselves).
     pub clear_screen: bool,
+    /// The authenticator tab is shown (`:totp`).
+    pub totp: bool,
 }
 
 impl App {
@@ -551,6 +555,7 @@ impl App {
             pdf: None,
             pdf_id: 0,
             clear_screen: false,
+            totp: false,
         }
     }
 
@@ -746,7 +751,9 @@ impl App {
             std::time::Instant::now() + std::time::Duration::from_secs(secs)
         });
         let away = self.can_go_away().then(|| self.last_input + AWAY);
-        [cal, grid, away].into_iter().flatten().min()
+        // The authenticator's countdown moves every second.
+        let tick = self.totp.then(|| Instant::now() + std::time::Duration::from_secs(1));
+        [cal, grid, away, tick].into_iter().flatten().min()
     }
 
     /// Timers: reminders, polling, and redraws when events start or end.

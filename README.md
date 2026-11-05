@@ -181,6 +181,7 @@ sh install.sh --with discord,calendar          # Linux, macOS
 | `transcribe` | Voice message transcription (not an integration: `t` in WhatsApp, Discord and Matrix chats; about 3 minutes of extra build time) |
 | `sound` | Sound (not an integration: `p` plays voice messages, and an alert sounds for new messages while the window is in the background; on Linux it needs the ALSA headers, `libasound2-dev`, and the script leaves it out without them or on Termux) |
 | `pdf` | PDF viewer (not an integration: PDFs from chats and Moodle open inside discommand, see [PDFs](#pdfs)) |
+| `totp` | Authenticator (not an integration: codes for logins with a second factor, in a tab only `:totp` opens, see [Authenticator](#authenticator)) |
 
 Integrations that aren't built in are left out of the program completely: no tab, no
 login at startup, no background activity. `--with all` (or `-With all`) builds
@@ -271,7 +272,7 @@ The app is modal like vim. Press `?` inside it for this list.
 | sending files | **`F`** opens the file dialog; the file waits above the input (`📎 name`), you can type a caption, `Enter` sends it, `Esc` removes it. `:attach <path>` does the same without the dialog (SSH, Termux). Discord, WhatsApp (photo/video/audio/document by file type, up to 100 MB) and Matrix (encrypted in encrypted rooms). |
 | messages | `j k Ctrl-u Ctrl-d` select · `gg` top + load history · `G`/`Esc` newest · `r`/`R` reply (ping/no ping) · `+` react (then `1`–`5`: ❤️ 👍 😂 💀 😅; the same again removes it) · `e` edit · `dd` delete · `o`/`gx` open link, attachment or WhatsApp media · `t` transcribe a voice message · `p` play a voice message (again: stop) |
 | insert | `Enter` send · `Alt-Enter` newline · `↑` on empty input edits your last message · `Esc` normal · `Shift-Tab` switch service |
-| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:mute [15m\|1h\|8h\|24h\|7d]` / `:unmute` the selected Discord server, category, channel or DM · `:images on\|off` · `:startup true\|false` the startup sound · `:pdf [path]` open a PDF · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
+| commands | `:b <name>` open chat · `:r` reload the open chat / sync the calendar · `:read` the same as `A` · `:read all` every chat in Discord, WhatsApp and Matrix · `:mute [15m\|1h\|8h\|24h\|7d]` / `:unmute` the selected Discord server, category, channel or DM · `:images on\|off` · `:startup true\|false` the startup sound · `:pdf [path]` open a PDF · `:totp` the authenticator tab · `:wa receipts on\|off` · `:wa logout` · `:mx receipts on\|off` · `:mx logout` · `:q` quit · `:logout` |
 
 Each service keeps its own open chat, sidebar position and unsent draft. The
 statusline shows which service is active, and how many unread chats or mentions
@@ -393,6 +394,27 @@ nothing extra is needed to build. It draws the vast majority of PDFs correctly;
 password-protected ones can't be opened. Pages are drawn in the background, about
 0.1–0.5 s each. Discord attachments are downloaded into the cache folder first (at most
 100 MB). It's the `pdf` option of the install script.
+
+## Authenticator
+
+discommand can be your authenticator app for logins with a second factor: it shows
+the same 6-digit codes as Google Authenticator or the Microsoft Authenticator
+(TOTP, the open standard behind them). The University of Regensburg's MFA accepts a
+"TOTP authenticator", for example.
+
+1. Where you add a sign-in method (for Microsoft accounts: *Security info* on
+   mysignins.microsoft.com), add an authenticator app and choose *I want to use a
+   different authenticator app*. Under *Can't scan image?* the page shows a key.
+2. In discommand: `:totp setup <key>` (spaces don't matter; a whole `otpauth://` link
+   works too). The authenticator tab opens with the current code: enter it on the page
+   to confirm.
+3. From then on `:totp` opens the authenticator tab: the current code in big digits and how
+   long it's still valid. It isn't in the Shift+Tab cycle; `q`, Shift+Tab or `gt` leave it.
+
+The key is stored encrypted like the Discord token, `:totp forget` or `--logout-a`
+deletes it. Keep your phone app as a second method. And note: with the key on the
+same computer as your password, both factors are on one machine. Anyone who gets into
+your user account there has both, as with password managers that store codes.
 
 ## Calendar
 

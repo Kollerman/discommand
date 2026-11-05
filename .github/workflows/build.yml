@@ -29,7 +29,7 @@ env:
   CARGO_TERM_COLOR: always
   # Every option except transcription: its matrix code (gemm) only compiles
   # optimised on ARM Linux and Windows, so their debug tests leave it out.
-  NO_WHISPER: native-tls,discord,whatsapp,matrix,calendar,todo,twos,moodle,sound,pdf
+  NO_WHISPER: native-tls,discord,whatsapp,matrix,calendar,todo,twos,moodle,sound,pdf,totp
 
 jobs:
   test:
@@ -100,7 +100,7 @@ jobs:
             echo "::endgroup::"
           done
           # The options aren't integrations: each with one integration.
-          for f in transcribe sound pdf; do
+          for f in transcribe sound pdf totp; do
             echo "::group::discord + $f"
             cargo check --no-default-features --features native-tls,discord,$f
             echo "::endgroup::"

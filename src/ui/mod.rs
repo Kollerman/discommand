@@ -2,6 +2,7 @@
 //! Its parts: the message model it draws (`view`), inline pictures (`pics`),
 //! text wrapping and the input line (`text`) and QR codes for logins (`qr`).
 
+pub mod authenticator;
 pub mod pdf;
 pub mod pics;
 pub mod qr;
@@ -46,7 +47,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Min(1), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
 
     let narrow = main.width < 70;
-    if let Some(v) = app.pdf.as_mut() {
+    if app.totp {
+        authenticator::draw(f, main);
+    } else if let Some(v) = app.pdf.as_mut() {
         pdf::draw(f, v, main);
     } else if app.service == Service::Calendar && app.cal_view != CalView::Agenda {
         draw_cal_grid(f, app, main);
@@ -80,7 +83,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_confirm(f, c);
     }
     scrub(f);
-    if let Some(v) = &app.pdf {
+    if let Some(v) = app.pdf.as_ref().filter(|_| !app.totp) {
         pdf::draw_picture(f, v);
     }
 }
@@ -952,6 +955,7 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
         _ => (" NORMAL ", ACCENT),
     };
     let (service, service_bg) = match app.service {
+        _ if app.totp => (" AUTHENTICATOR ", Color::Indexed(141)),
         Service::Discord => (" DISCORD ", Color::Indexed(99)),
         Service::WhatsApp => (" WHATSAPP ", WA_GREEN),
         Service::Matrix => (" MATRIX ", Color::Indexed(37)),
@@ -1130,6 +1134,7 @@ const HELP: &[(&str, &str)] = &[
     ("A", "mark all chats of this service read"),
     ("F  :attach PATH", "send a file (F: pick it in the file dialog)"),
     (":pdf [PATH]", "open a PDF (no path: the file dialog)"),
+    (":totp  :totp setup KEY", "authenticator tab (codes for logins) · store its key"),
     (":mute [1h]  :unmute", "mute the selected server/channel/DM"),
     (":read  :read all", "the same / in every chat service"),
     (":images on|off", "show pictures in chats (on)"),

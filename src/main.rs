@@ -2,6 +2,8 @@ mod app;
 mod audio;
 mod chats;
 mod discord;
+#[cfg(feature = "groupwise")]
+mod groupwise;
 mod pdf;
 mod planner;
 mod system;
@@ -42,7 +44,7 @@ const USAGE: &str = "discommand — lightweight terminal client for Discord, Wha
 Google Calendar, Microsoft To Do and Twos (whichever are built in, see --version)
 
 usage: discommand [--wa-phone NUMBER] [--discord-token] [--logout] [--logout-a]
-                  [--moodle-login] [--check-update] [--help] [--version]
+                  [--moodle-login] [--groupwise-login] [--check-update] [--help] [--version]
 
 The accounts of the chat services built in are required. The Discord token is read from $DISCORD_TOKEN,
 then from the saved token (encrypted with DPAPI on Windows), otherwise you
@@ -54,6 +56,10 @@ WhatsApp is linked once by scanning a QR code (Linked devices).
                      (international format, e.g. +491701234567)
   --logout           delete the saved Discord token and exit
                      (unlink WhatsApp with :wa logout inside the app)
+  --groupwise-login sign in to GroupWise (University of Regensburg): the UR
+                     login, then Microsoft's second factor with the code of
+                     discommand's authenticator (:totp); DISCOMMAND_GW_LOG=FILE
+                     writes a trace of the steps (no passwords or codes)
   --moodle-login     connect a Moodle site (any university or school): asks for
                      its address, your user name and password (hidden)
   --check-update     check now whether a newer version is on GitHub (it's
@@ -62,7 +68,7 @@ WhatsApp is linked once by scanning a QR code (Linked devices).
   --logout-a         log out of everything: Discord, WhatsApp (unlinked),
                      Matrix, Google, Microsoft and Twos; also deletes the
                      WhatsApp chat history, the Matrix store, cached media
-                     and transcripts of voice messages.
+                     transcripts of voice messages and the authenticator key.
                      Close discommand first.";
 
 fn clean(t: &str) -> String {
@@ -174,6 +180,14 @@ async fn logout_all() {
     if voice::forget() {
         println!("Transcripts of voice messages deleted");
     }
+    #[cfg(feature = "groupwise")]
+    if groupwise::Creds::load().is_some() {
+        groupwise::Creds::remove();
+        println!("GroupWise: stored login deleted");
+    }
+    if system::totp::forget() {
+        println!("Authenticator key deleted");
+    }
     let _ = std::fs::remove_dir_all(secret::cache_dir());
     println!("Cached pictures and downloads deleted. Logged out of everything.");
 }
@@ -185,6 +199,7 @@ fn main() {
     let mut logout_everything = false;
     let mut check_update = false;
     let mut moodle_login = false;
+    let mut groupwise_login = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return println!("{USAGE}"),
@@ -205,6 +220,7 @@ fn main() {
             "--logout-a" | "--logout-all" => logout_everything = true,
             "--check-update" => check_update = true,
             "--moodle-login" => moodle_login = true,
+            "--groupwise-login" => groupwise_login = true,
             "--discord-token" => paste_token = true,
             "--wa-phone" => match args.next() {
                 Some(n) => wa_phone = Some(n),
@@ -227,6 +243,17 @@ fn main() {
     }
     if moodle_login {
         if let Err(e) = rt.block_on(moodle::login_interactive()) {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if groupwise_login {
+        #[cfg(feature = "groupwise")]
+        let result = rt.block_on(groupwise::login_interactive());
+        #[cfg(not(feature = "groupwise"))]
+        let result: Result<(), String> = Err("GroupWise isn't built in (the groupwise feature)".into());
+        if let Err(e) = result {
             eprintln!("error: {e}");
             std::process::exit(1);
         }

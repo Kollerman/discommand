@@ -95,6 +95,7 @@ impl App {
             "moodle" => self.moodle_command(arg),
             "attach" | "file" | "send" => self.attach(Some(arg)),
             "pdf" => self.pdf_command(arg),
+            "totp" => self.totp_command(arg),
             "images" | "img" => {
                 self.pics.enabled = match arg {
                     "on" => true,

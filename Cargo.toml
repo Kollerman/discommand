@@ -6,7 +6,7 @@ description = "Lightweight, battery-friendly terminal Discord client"
 license = "MIT"
 
 [features]
-default = ["native-tls", "discord", "whatsapp", "matrix", "calendar", "todo", "twos", "moodle", "transcribe", "sound", "pdf"]
+default = ["native-tls", "discord", "whatsapp", "matrix", "calendar", "todo", "twos", "moodle", "transcribe", "sound", "pdf", "totp", "groupwise"]
 
 # Integrations: build with any subset, e.g.
 #   cargo build --release --no-default-features --features native-tls,discord,calendar
@@ -29,6 +29,12 @@ transcribe = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "de
 # PDFs shown in the app: pages as pictures (Sixel or Kitty, where the terminal can) and
 # their text, searchable, everywhere. hayro reads them (pure Rust).
 pdf = ["dep:hayro", "dep:ratatui-image"]
+# An authenticator app: the 6-digit codes of logins with a second factor (TOTP), shown
+# with :totp. No tab of its own.
+totp = ["dep:hmac", "dep:sha1"]
+# GroupWise at the University of Regensburg: so far the login (university login,
+# Microsoft's second factor), tried with --groupwise-login.
+groupwise = []
 sound = ["dep:rodio", "dep:ogg", "dep:opus-decoder"]
 
 # OS TLS stack: SChannel on Windows, Security.framework on macOS, OpenSSL on Linux.
@@ -57,6 +63,9 @@ qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 # Google sign-in (PKCE) and Discord's QR-code login.
 sha2 = "0.10"
+# The authenticator codes (TOTP).
+hmac = { version = "0.12", optional = true }
+sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "getrandom"], optional = true }
 getrandom = "0.4"
 

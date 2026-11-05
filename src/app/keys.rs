@@ -162,6 +162,10 @@ impl App {
             self.finder_key(k);
             return;
         }
+        if self.totp && self.focus != Focus::Command {
+            self.totp_key(k);
+            return;
+        }
         if self.pdf.is_some() && self.focus != Focus::Command {
             self.pdf_key(k);
             return;
@@ -246,7 +250,7 @@ impl App {
         }
     }
 
-    fn normal_key(&mut self, k: KeyEvent) {
+    pub(super) fn normal_key(&mut self, k: KeyEvent) {
         let ctrl = is_ctrl(&k);
         let pending = self.pending.take();
 
