@@ -3,6 +3,7 @@
 //! text wrapping and the input line (`text`) and QR codes for logins (`qr`).
 
 pub mod authenticator;
+pub mod compose;
 pub mod pdf;
 pub mod pics;
 pub mod qr;
@@ -81,6 +82,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     if let Some(c) = &app.confirm {
         draw_confirm(f, c);
+    }
+    if let Some(m) = &app.mail_move {
+        compose::draw_move(f, m, f.area());
     }
     scrub(f);
     if let Some(v) = app.pdf.as_ref().filter(|_| !app.totp) {
@@ -171,6 +175,9 @@ fn draw_tree(f: &mut Frame, app: &mut App, area: Rect, split: bool) {
 }
 
 fn draw_chat(f: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(c) = app.compose.as_ref().filter(|_| app.service == Service::GroupWise) {
+        return compose::draw(f, c, area);
+    }
     let width = area.width.saturating_sub(1).max(1) as usize;
     let input_h = input_height(app, width);
     let [header, body, input] =
@@ -254,6 +261,7 @@ fn draw_input(f: &mut Frame, app: &App, input: Rect) {
             Service::Twos => "› n new · x done · e edit · dd delete · ⇥ list pane · ⏎ open sub-list",
             Service::Tasks => "› n new task · x done · e edit · dd delete",
             Service::Moodle => "› ⏎ open here (files download) · o browser · h back · x tick off · r refresh",
+            Service::GroupWise => "› ⏎ open · n new · r R reply · x select · a all · A all read · m move · dd delete · h back",
             _ => "› press i to type",
         };
         f.render_widget(Paragraph::new(Line::from(Span::styled(hint, DIM))), inner);
@@ -312,6 +320,7 @@ fn draw_task(f: &mut Frame, app: &App, area: Rect) {
         let steps: &[&str] = match app.service {
             Service::Twos => TWOS_SETUP,
             Service::Moodle => MOODLE_SETUP,
+            Service::GroupWise => GROUPWISE_SETUP,
             _ if crate::planner::todo::builtin_client_id().is_some() => TODO_SIGN_IN,
             _ => TODO_SETUP,
         };
@@ -452,6 +461,18 @@ fn draw_page(f: &mut Frame, app: &App, area: Rect) {
     let top = if sel_rows.end + 2 > h { (sel_rows.end + 2 - h).min(sel_rows.start) } else { 0 };
     f.render_widget(Paragraph::new(lines).scroll((top as u16, 0)), col);
 }
+
+const GROUPWISE_SETUP: &[&str] = &[
+    "GroupWise mail (University of Regensburg).",
+    "",
+    "Set up the authenticator first (:totp setup KEY), then run once in a terminal:",
+    "",
+    "    discommand --groupwise-login",
+    "",
+    "It signs in through the university login and Microsoft (with the",
+    "authenticator's code) and stores the login encrypted. After that this tab",
+    "signs in by itself whenever needed.",
+];
 
 const MOODLE_SETUP: &[&str] = &[
     "Connect Moodle (any university or school):",
@@ -951,6 +972,7 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
             Mode::Normal => (" INSERT ", Color::Green),
         },
         Focus::Command => (" COMMAND ", Color::Yellow),
+        _ if app.service == Service::GroupWise && app.compose.as_ref().is_some_and(|c| c.typing) => (" INSERT ", Color::Green),
         _ if app.finder.is_some() => (" FIND ", Color::Yellow),
         _ => (" NORMAL ", ACCENT),
     };
@@ -963,6 +985,7 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
         Service::Tasks => (" TASKS ", Color::LightBlue),
         Service::Twos => (" TWOS ", Color::Indexed(209)),
         Service::Moodle => (" MOODLE ", Color::Indexed(208)),
+        Service::GroupWise => (" MAIL ", Color::Indexed(33)),
     };
     // What's waiting in the other chat services.
     let mut waiting = Vec::new();
@@ -1005,8 +1028,8 @@ fn draw_statusline(f: &mut Frame, app: &App, area: Rect) {
         }
         Service::Calendar if app.cal.status.is_empty() => ("Google Calendar".to_string(), "not connected"),
         Service::Calendar => (app.cal.account.clone(), app.cal.status.as_str()),
-        Service::Tasks | Service::Twos | Service::Moodle if app.tasks().status.is_empty() => (app.service.name().to_string(), "not connected"),
-        Service::Tasks | Service::Twos | Service::Moodle => (app.service.name().to_string(), app.tasks().status.as_str()),
+        Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise if app.tasks().status.is_empty() => (app.service.name().to_string(), "not connected"),
+        Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => (app.service.name().to_string(), app.tasks().status.as_str()),
     };
     let right = format!(" {name} · {conn} ");
     let mut spans = vec![
@@ -1118,6 +1141,14 @@ const HELP: &[(&str, &str)] = &[
     ("", "TASKS"),
     ("n  e  dd", "new / edit / delete task"),
     ("x  space", "done / not done (also on tasks in the calendar)"),
+    ("", "MAIL (GROUPWISE)"),
+    ("⏎  h", "open a folder / mail (marks it read) · back"),
+    ("n  r  R", "new mail / reply / reply to all (compose window)"),
+    ("x  a  A", "select a mail / all / mark all read"),
+    ("m  dd", "move to a folder / delete (selected, else this one)"),
+    ("Tab  ^S  Esc", "compose: next field · send · stop typing"),
+    (":w  :q!  i", "compose, not typing: send · discard · type again"),
+    ("↑ ↓  Tab", "compose: pick and take a suggested address"),
     ("", "PDF VIEWER"),
     ("j k  ^d ^u", "scroll (on to the next page at the end)"),
     ("h l  gg G", "previous / next page · first / last"),

@@ -29,7 +29,7 @@ env:
   CARGO_TERM_COLOR: always
   # Every option except transcription: its matrix code (gemm) only compiles
   # optimised on ARM Linux and Windows, so their debug tests leave it out.
-  NO_WHISPER: native-tls,discord,whatsapp,matrix,calendar,todo,twos,moodle,sound,pdf,totp
+  NO_WHISPER: native-tls,discord,whatsapp,matrix,calendar,todo,twos,moodle,groupwise,sound,pdf,totp
 
 jobs:
   test:
@@ -94,7 +94,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - name: Check
         run: |
-          for f in discord whatsapp matrix calendar todo twos moodle; do
+          for f in discord whatsapp matrix calendar todo twos moodle groupwise; do
             echo "::group::$f"
             cargo check --no-default-features --features native-tls,$f
             echo "::endgroup::"

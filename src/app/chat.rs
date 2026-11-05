@@ -345,7 +345,7 @@ impl App {
     }
 
     pub(super) fn fetch_older(&mut self) {
-        if matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle) {
+        if matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise) {
             return;
         }
         if self.service.is_wa_like() {
@@ -525,7 +525,7 @@ impl App {
                 self.cal_select(&id);
                 self.focus = Focus::Tree;
             }
-            Service::Tasks | Service::Twos | Service::Moodle => self.focus = Focus::Tree,
+            Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => self.focus = Focus::Tree,
         }
     }
 
@@ -719,7 +719,7 @@ impl App {
                 .wa_messages()
                 .get(idx)
                 .map(|m| (m.from_me && m.kind == "text" && !m.deleted, m.id.clone(), m.text.clone())),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => None,
         };
         let Some((own, id, content)) = found else { return };
         if !own {
@@ -761,7 +761,7 @@ impl App {
                 let cmd = json!({"c": "react", "chat": m.chat, "id": m.id, "text": emoji});
                 wa::send(self.cmd_of(self.service), cmd);
             }
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => {}
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => {}
         }
     }
 
@@ -778,7 +778,7 @@ impl App {
                 let cmd = json!({"c": "delete", "chat": m.chat, "id": m.id});
                 wa::send(self.cmd_of(self.service), cmd);
             }
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => {}
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => {}
         }
     }
 

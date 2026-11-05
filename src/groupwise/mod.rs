@@ -1,14 +1,17 @@
 //! GroupWise at the University of Regensburg (gw.uni-regensburg.de): signing
 //! in through the university's login and Microsoft's second factor (`login`),
-//! and GroupWise's SOAP interface behind it (`soap`). So far only the login;
-//! `discommand --groupwise-login` tries it.
+//! GroupWise's SOAP interface behind it (`soap`, read with `xml`), and the
+//! mail tab's backend (`mail`). `discommand --groupwise-login` stores the
+//! login (or takes Moodle's), after which the tab works on its own.
 //!
 //! The UR user name and password are stored encrypted like the Discord token,
 //! so the login can be repeated whenever the session ends; the second factor
 //! comes from discommand's authenticator (`:totp`).
 
 pub mod login;
+pub mod mail;
 pub mod soap;
+pub mod xml;
 
 use serde::{Deserialize, Serialize};
 

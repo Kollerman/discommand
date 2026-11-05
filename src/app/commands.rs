@@ -33,7 +33,7 @@ impl App {
                 }
                 self.cal_sync();
             }
-            Service::Tasks | Service::Twos | Service::Moodle => {
+            Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => {
                 if !self.tasks_connected() {
                     self.status = format!("{} isn't connected (see the right pane)", self.service.name());
                     return;
@@ -53,6 +53,10 @@ impl App {
     pub(super) fn run_command(&mut self, cmd: &str) {
         let cmd = cmd.trim();
         let (name, arg) = cmd.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((cmd, ""));
+        // With a mail being written, the vim commands are about it.
+        if self.compose.is_some() && self.service == Service::GroupWise && self.compose_command(name) {
+            return;
+        }
         match name {
             "" => {}
             "q" | "q!" | "qa" | "qa!" | "quit" | "wq" | "x" => self.quit = true,
@@ -96,6 +100,7 @@ impl App {
             "attach" | "file" | "send" => self.attach(Some(arg)),
             "pdf" => self.pdf_command(arg),
             "totp" => self.totp_command(arg),
+            "mail" => self.mail_command(arg),
             "images" | "img" => {
                 self.pics.enabled = match arg {
                     "on" => true,
@@ -192,6 +197,7 @@ impl App {
             "cal" | "calendar" => Service::Calendar,
             "twos" => Service::Twos,
             "moodle" => Service::Moodle,
+            "groupwise" | "gw" | "mail" => Service::GroupWise,
             _ => Service::Tasks,
         }
     }

@@ -153,7 +153,7 @@ pub fn forms(html: &str) -> Vec<Form> {
     let mut out = Vec::new();
     let mut pos = 0;
     while let Some(start) = lower[pos..].find("<form").map(|i| pos + i) {
-        let Some(tag_end) = lower[start..].find('>').map(|i| start + i) else { break };
+        let Some(tag_end) = tag_close(&lower, start) else { break };
         let end = lower[tag_end..].find("</form").map_or(html.len(), |i| tag_end + i);
         let attrs = attributes(&html[start + 1..tag_end]);
         let mut form = Form {
@@ -163,7 +163,7 @@ pub fn forms(html: &str) -> Vec<Form> {
         };
         let mut i = tag_end;
         while let Some(t) = lower[i..end].find('<').map(|j| i + j) {
-            let Some(close) = lower[t..end].find('>').map(|j| t + j) else { break };
+            let Some(close) = tag_close(&lower[..end], t) else { break };
             let tag = &lower[t + 1..close];
             if tag.starts_with("input") || tag.starts_with("button") {
                 let a = attributes(&html[t + 1..close]);
@@ -180,6 +180,22 @@ pub fn forms(html: &str) -> Vec<Form> {
         pos = end.max(tag_end + 1);
     }
     out
+}
+
+/// Where the tag starting at `start` (its `<`) ends: the first `>` outside
+/// quotes. Values may contain `>` (a SAML or WS-Federation answer is a
+/// whole XML document in a hidden field).
+fn tag_close(html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (i, c) in html[start..].char_indices() {
+        match (quote, c) {
+            (None, '"' | '\x27') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '>') => return Some(start + i),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whether a page asks for a one-time code (two-factor), which can't be
@@ -227,3 +243,19 @@ pub fn page_redirect(page: &str) -> Option<String> {
     None
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::forms;
+
+    #[test]
+    fn keeps_xml_in_hidden_fields() {
+        // A WS-Federation answer: a whole XML document as a value, with `>` in it.
+        let page = r#"<form method="POST" action="https://login.microsoftonline.com/login.srf"><input type="hidden" name="wa" value="wsignin1.0"><input type="hidden" name="wresult" value="<t:RequestSecurityTokenResponse xmlns:t='x'><a>1</a></t:RequestSecurityTokenResponse>"><input type="hidden" name="wctx" value="c=1&amp;d=2"></form>"#;
+        let f = &forms(page)[0];
+        let field = |n: &str| f.fields.iter().find(|(_, name, _)| name == n).map(|(_, _, v)| v.as_str());
+        assert_eq!(field("wresult"), Some("<t:RequestSecurityTokenResponse xmlns:t='x'><a>1</a></t:RequestSecurityTokenResponse>"));
+        assert_eq!(field("wctx"), Some("c=1&d=2"));
+        assert_eq!(f.fields.len(), 3);
+    }
+}

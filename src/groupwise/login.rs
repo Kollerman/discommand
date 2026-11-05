@@ -128,6 +128,9 @@ impl Step {
             Step::Get(u) => (u.clone(), http.get(u)),
             Step::Post(u, fields) => {
                 trace.note(format!("  fields: {}", fields.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")));
+                for (k, v) in fields.iter().filter(|(k, v)| v.len() > 200 && !k.to_ascii_lowercase().contains("pass")) {
+                    trace.note(format!("    {k}: {}", shape(v)));
+                }
                 (u.clone(), http.post(u).form(&fields))
             }
         };
@@ -233,11 +236,9 @@ async fn microsoft(
         "ConvergedProofUpRedirect" | "ConvergedProofUp" => {
             Err("Microsoft wants more security info set up for this account: sign in once in a browser".into())
         }
-        // Pages that send themselves on: their fields are in the settings.
-        _ if config["oPostParams"].is_object() && !s("urlPost").is_empty() => {
-            let fields = config["oPostParams"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect();
-            Ok(Step::Post(post_url()?, fields))
-        }
+        // Pages that send themselves on: their fields are in the settings,
+        // HTML-encoded (the page's script decodes them before sending).
+        _ if config["oPostParams"].is_object() && !s("urlPost").is_empty() => Ok(Step::Post(post_url()?, post_params(config))),
         // Pages that only forward (with Microsoft's settings in them too).
         _ => {
             let mut sent = false;
@@ -349,6 +350,12 @@ async fn ms_api(http: &reqwest::Client, page: &Url, config: &Value, key: &str, b
     resp.json().await.map_err(|e| format!("Microsoft answered strangely: {e}"))
 }
 
+/// The fields of a page that sends itself on (`oPostParams`), decoded.
+fn post_params(config: &Value) -> Vec<(String, String)> {
+    let decode = crate::system::login_pages::unescape;
+    config["oPostParams"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), decode(v.as_str().unwrap_or_default()))).collect()
+}
+
 /// The settings Microsoft's login pages carry (`$Config={…};`).
 fn ms_config(page: &str) -> Option<Value> {
     let start = page.find("$Config=")? + "$Config=".len();
@@ -373,6 +380,27 @@ async fn finish(http: &reqwest::Client, at: &Url, state: &str, verifier: &str, t
     trace.note(format!("token answer {}: {}", status.as_u16(), v.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default()));
     let access = v["access_token"].as_str().ok_or_else(|| format!("no token from my.ur.de ({})", v["error_description"].as_str().or(v["error"].as_str()).unwrap_or("no reason given")))?;
     Ok(Tokens { access: access.to_string(), refresh: v["refresh_token"].as_str().map(String::from) })
+}
+
+/// What a long value looks like, for the trace, without what it says: its
+/// length, its first and last tag names, and signs of being encoded twice.
+fn shape(v: &str) -> String {
+    let tag = |s: &str| s.chars().take_while(|c| !c.is_whitespace() && *c != '>').take(40).collect::<String>();
+    let first = v.find('<').map(|i| tag(&v[i..])).unwrap_or_default();
+    let last = v.rfind("</").map(|i| tag(&v[i..])).unwrap_or_default();
+    let end: String = v.chars().rev().take(3).collect::<Vec<_>>().into_iter().rev().collect();
+    let has = |s: &str| v.contains(s);
+    format!(
+        "{} chars, starts {:?}, first tag {first:?}, last tag {last:?}, ends {end:?}, has entity-lt {} entity-amp {} numeric {} json-escape {} percent {} cr {}",
+        v.len(),
+        v.chars().take(6).collect::<String>(),
+        has("&lt;"),
+        has("&amp;"),
+        has("&#"),
+        has("\\u003c"),
+        has("%3C"),
+        v.contains('\r'),
+    )
 }
 
 fn random(bytes: usize) -> String {
@@ -423,6 +451,15 @@ $Config={"pgid":"ConvergedTFA","sFT":"flow","arrUserProofs":[{"authMethodId":"Ph
         assert_eq!(c["pgid"], "ConvergedTFA");
         assert_eq!(c["arrUserProofs"][0]["authMethodId"], "PhoneAppOTP");
         assert!(ms_config("<html>no settings</html>").is_none());
+    }
+
+    #[test]
+    fn decodes_auto_post_fields() {
+        // As Microsoft passes a WS-Federation answer on.
+        let c = ms_config(r#"$Config={"urlPost":"/common/wsfederation","oPostParams":{"wresult":"&lt;t:R a=&quot;1&quot;&gt;x&lt;/t:R&gt;","wctx":"a=1&amp;b=2"}};"#).unwrap();
+        let mut p = super::post_params(&c);
+        p.sort();
+        assert_eq!(p, [("wctx".to_string(), "a=1&b=2".to_string()), ("wresult".to_string(), r#"<t:R a="1">x</t:R>"#.to_string())]);
     }
 }
 

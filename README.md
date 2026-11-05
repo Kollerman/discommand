@@ -178,6 +178,7 @@ sh install.sh --with discord,calendar          # Linux, macOS
 | `todo` | Microsoft To Do |
 | `twos` | Twos |
 | `moodle` | Moodle (any university or school site) |
+| `groupwise` | GroupWise mail of the University of Regensburg (signs in with the UR login and the authenticator, see [GroupWise mail](#groupwise-mail)) |
 | `transcribe` | Voice message transcription (not an integration: `t` in WhatsApp, Discord and Matrix chats; about 3 minutes of extra build time) |
 | `sound` | Sound (not an integration: `p` plays voice messages, and an alert sounds for new messages while the window is in the background; on Linux it needs the ALSA headers, `libasound2-dev`, and the script leaves it out without them or on Termux) |
 | `pdf` | PDF viewer (not an integration: PDFs from chats and Moodle open inside discommand, see [PDFs](#pdfs)) |
@@ -636,6 +637,50 @@ submission status, your submitted files (Enter downloads them) and the feedback
 `:moodle logout` removes the login, and `:moodle refresh` (or `r`)
 syncs now; otherwise it syncs every 30 minutes.
 
+## GroupWise mail
+
+The University of Regensburg's mail (GroupWise, gw.uni-regensburg.de) in a tab of its
+own: your folders in the sidebar with unread counts, the newest mails of each folder,
+and each mail as a page (sender, recipients, text, attachments). Opening a mail marks
+it read; attachments open with ⏎ (PDFs in the viewer). New mail is looked for every
+two minutes and rings the alert when the window is in the background.
+
+Writing happens in a compose window in the right pane, laid out like GroupWise's
+"New Message": To, Cc, Subject and the text. `n` opens an empty one (`:mail
+name@uni-regensburg.de Subject` too), `r` on an open mail a reply to the sender, `R` a
+reply to everyone; the original is shown dimmed under the text and sent quoted. Tab and
+Shift+Tab (or ↑ ↓) move between the fields, Enter starts a new line in the text,
+**Ctrl+S sends**. Esc stops typing, as insert mode does elsewhere: then `:` opens the
+command bar (`:w` sends, `:q!` discards, `:q` closes a mail with nothing written), `i`
+types again, and Esc (twice, with text written) discards. Mails are sent as plain text, without attachments
+for now.
+
+Sorting mails: `x` (or space) selects the mail under the cursor, `a` selects all of the
+folder (again: none), and `m` and `dd` act on the selected ones, or on the mail under the
+cursor or open: `m` opens a menu of your folders to move them to, as in GroupWise's
+"Move to folder" (j/k, ⏎); `dd` deletes them (GroupWise keeps them in the Trash). `A`
+marks every mail of the folder read.
+
+While you type a name or address under To or Cc, matching people appear below it, as
+in GroupWise Web: from your Frequent Contacts and address books, then the university's
+directory. ↑ ↓ pick one, Tab or Enter takes it, Esc closes the list.
+
+**Signing in, without a browser:** the login goes through the university's login
+server and Microsoft's second factor, as on the website. discommand does all of it by
+itself, with the code of its own [authenticator](#authenticator):
+
+1. Set up the authenticator (`:totp setup <key>`).
+2. Run `discommand --groupwise-login` once in a terminal. It offers the UR login stored
+   for Moodle, or asks for your UR user name and password, signs in once to check, and
+   stores the login encrypted.
+3. From then on the GroupWise tab signs in whenever it needs to (a GroupWise session
+   doesn't last long, and the university gives no token to renew it), which takes a
+   few seconds.
+
+If the login fails, `DISCOMMAND_GW_LOG=<file>` writes a trace of its steps: addresses,
+form field names and the shapes of long values, never passwords, codes or tokens.
+`--logout-a` deletes the stored login.
+
 ## Publishing a release
 
 To let other people sign in to Google and Microsoft with nothing but their account,
@@ -701,6 +746,7 @@ GitHub). Users can turn it off by setting `DISCOMMAND_NO_UPDATE_CHECK=1`.
 | `src/ui/` | Drawing the screen (`mod.rs`), the message model it draws (`view`), pictures (`pics`), text and the input line (`text`), QR codes (`qr`) |
 | `src/discord/` | Discord: REST API, gateway, data types (`model`), what's known about servers and channels (`state`), QR login (`remote_auth`) |
 | `src/chats/` | WhatsApp (`wa`, talking to the Go helper) and Matrix |
+| `src/groupwise/` | GroupWise: the login (`login`), the SOAP interface (`soap`, `xml`), the mail tab's backend (`mail`) |
 | `src/planner/` | Google Calendar (`cal`), Microsoft To Do (`todo`, also the shared task types), Twos, Moodle |
 | `src/audio/` | Decoding audio, playing sounds (`sound`), transcripts (`voice`), Whisper (`transcribe`) |
 | `src/pdf/` | PDFs: reading and drawing them with hayro (`engine`), the viewer's state and page sizes (`view`) |

@@ -18,7 +18,7 @@ impl App {
         match self.service {
             Service::WhatsApp | Service::Matrix => return self.rebuild_wa_tree(),
             Service::Calendar => return self.rebuild_cal_tree(),
-            Service::Tasks | Service::Twos | Service::Moodle => return self.rebuild_todo_tree(),
+            Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => return self.rebuild_todo_tree(),
             Service::Discord => {}
         }
         let sel_key = self.tree.get(self.tree_sel()).map(|t| (t.kind, t.id.clone()));
@@ -370,7 +370,7 @@ impl App {
     fn save_folds(&self) {
         let Some(path) = folds_path() else { return };
         let mut all = serde_json::Map::new();
-        for s in [Service::Tasks, Service::Twos, Service::Moodle] {
+        for s in [Service::Tasks, Service::Twos, Service::Moodle, Service::GroupWise] {
             let tab = self.tab(s);
             let mut open: serde_json::Map<String, serde_json::Value> = tab.open.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
             open.insert(MORE_LISTS.into(), json!(tab.more_open));
@@ -386,7 +386,7 @@ impl App {
         let Some(saved) = folds_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else {
             return;
         };
-        for s in [Service::Tasks, Service::Twos, Service::Moodle] {
+        for s in [Service::Tasks, Service::Twos, Service::Moodle, Service::GroupWise] {
             let Some(map) = saved[s.name()].as_object() else { continue };
             let tab = self.tab_mut(s);
             for (k, v) in map {

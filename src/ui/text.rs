@@ -144,6 +144,30 @@ impl Input {
         self.chars[self.cursor..].iter().position(|&c| c == '\n').map_or(self.chars.len(), |i| self.cursor + i)
     }
 
+    /// Moves the cursor to the line above (or below), keeping its column as
+    /// far as that line is long. False at the first (or last) line.
+    pub fn move_line(&mut self, down: bool) -> bool {
+        let start = self.line_start();
+        let column = self.cursor - start;
+        let target = if down {
+            let end = self.line_end();
+            if end >= self.chars.len() {
+                return false;
+            }
+            end + 1
+        } else {
+            if start == 0 {
+                return false;
+            }
+            self.cursor = start - 1;
+            self.line_start()
+        };
+        self.cursor = target;
+        let end = self.line_end();
+        self.cursor = (target + column).min(end);
+        true
+    }
+
     /// Handles common editing keys. Returns false when the key wasn't used.
     pub fn handle_key(&mut self, k: &KeyEvent) -> bool {
         let alt = k.modifiers.contains(KeyModifiers::ALT);

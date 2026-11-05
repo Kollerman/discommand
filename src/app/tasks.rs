@@ -10,6 +10,7 @@ impl App {
         match s {
             Service::Twos => &self.twos,
             Service::Moodle => &self.moodle,
+            Service::GroupWise => &self.groupwise,
             _ => &self.todo,
         }
     }
@@ -18,6 +19,7 @@ impl App {
         match s {
             Service::Twos => &mut self.twos,
             Service::Moodle => &mut self.moodle,
+            Service::GroupWise => &mut self.groupwise,
             _ => &mut self.todo,
         }
     }
@@ -88,6 +90,17 @@ impl App {
                 st.syncing = false;
                 st.next_poll = Some(std::time::Instant::now() + poll);
                 st.apply(lists, tasks, pages);
+                if s == Service::GroupWise {
+                    self.mark_selected();
+                }
+                #[cfg(feature = "groupwise")]
+                if s == Service::GroupWise {
+                    let now = crate::groupwise::mail::unread(&self.groupwise.state);
+                    if self.mail_unread.is_some_and(|before| now > before) {
+                        self.ring(false);
+                    }
+                    self.mail_unread = Some(now);
+                }
                 self.done_refreshing();
             }
             TodoMsg::File(Ok(path)) if crate::pdf::is_pdf(&path) => self.open_pdf(path.into()),
@@ -121,13 +134,22 @@ impl App {
                     }
                     let st = &mut tab.state;
                     st.loading.remove(&list);
-                    // Opening a conversation marked it read: its "new" goes.
+                    // Opening a conversation or a mail marked it read: its "new" goes.
                     let read = list.starts_with(moodle::CONVERSATION);
                     if read {
                         moodle::conversation_read(st, &list);
                     }
+                    #[cfg(feature = "groupwise")]
+                    let read = read || (s == Service::GroupWise && list.starts_with(crate::groupwise::mail::MAIL));
+                    #[cfg(feature = "groupwise")]
+                    if read && s == Service::GroupWise {
+                        crate::groupwise::mail::mail_read(st, &list);
+                    }
                     st.pages.insert(list, p);
                     self.tree_dirty |= read;
+                    if s == Service::GroupWise {
+                        self.mark_selected();
+                    }
                 }
                 // Stays marked as loading, so it's tried again at the next sync, not on every redraw.
                 Err(e) => self.status = e,
@@ -302,7 +324,7 @@ impl App {
         self.tab(self.service).page_sel
     }
 
-    fn page_task(&self) -> Option<&Task> {
+    pub(super) fn page_task(&self) -> Option<&Task> {
         self.page()?.lines.get(self.page_sel()?)
     }
 
@@ -461,11 +483,32 @@ impl App {
     }
 
     pub(super) fn todo_key(&mut self, k: KeyEvent, pending: Option<char>) -> bool {
+        // Mail: n writes a new one; r / R reply to the open mail (else r
+        // refreshes); x / space select one, a all; A marks all read; m moves;
+        // dd deletes (the selected mails, else the one under the cursor).
+        if self.service == Service::GroupWise {
+            let mail_open = self.tab(self.service).page.as_deref().is_some_and(|p| p.starts_with("gwmail:"));
+            let in_page = self.in_page();
+            match k.code {
+                KeyCode::Char('d') if pending == Some('d') => self.mail_delete(),
+                KeyCode::Char('d') if !is_ctrl(&k) => self.pending = Some('d'),
+                _ if pending.is_some() => return false,
+                KeyCode::Char('n' | 'c') => self.mail_command(""),
+                KeyCode::Char('r' | 'R') if mail_open => self.mail_reply(k.code == KeyCode::Char('R')),
+                KeyCode::Char('x' | ' ') if in_page && !mail_open => self.mail_toggle(),
+                KeyCode::Char('a') if !mail_open => self.mail_select_all(),
+                KeyCode::Char('A') => self.mail_all_read(),
+                KeyCode::Char('m') => self.mail_move_menu(),
+                _ => return false,
+            }
+            return true;
+        }
         // Read-only backends (Moodle): no adding, editing or deleting.
         let editable = self.tab(self.service).api.as_ref().is_none_or(Backend::editable);
         let edit_key = matches!(k.code, KeyCode::Char('n' | 'i' | 'a' | 'e' | 'c')) || (k.code == KeyCode::Char('d') && !is_ctrl(&k));
         if !editable && edit_key {
-            self.status = todo::READ_ONLY.into();
+            let mail = self.tab(self.service).api.as_ref().is_some_and(Backend::is_mail);
+            self.status = if mail { "mail: open one (⏎), then r reply · R reply to all; :mail ADDRESS SUBJECT writes a new one".into() } else { todo::READ_ONLY.into() };
             return true;
         }
         match k.code {

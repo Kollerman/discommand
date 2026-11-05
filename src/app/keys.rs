@@ -9,7 +9,7 @@ impl App {
         self.switch_service(self.service.step(if right_shift_held() { -1 } else { 1 }));
     }
 
-    fn switch_service(&mut self, to: Service) {
+    pub(super) fn switch_service(&mut self, to: Service) {
         if to == self.service {
             return;
         }
@@ -42,7 +42,7 @@ impl App {
                     self.mark_read(&ch);
                 }
             }
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => {}
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => {}
         }
         if self.current_chat().is_none() && self.focus != Focus::Tree {
             self.focus = Focus::Tree;
@@ -105,6 +105,11 @@ impl App {
         match ev {
             Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k, paste_burst),
             Event::Paste(s) => {
+                if self.compose.is_some() {
+                    self.compose_paste(&s);
+                    self.dirty = true;
+                    return;
+                }
                 if let Some(f) = self.finder.as_mut() {
                     f.query.insert_str(&s.replace('\n', " "));
                     f.refilter();
@@ -160,6 +165,14 @@ impl App {
         }
         if self.finder.is_some() {
             self.finder_key(k);
+            return;
+        }
+        if self.mail_move.is_some() {
+            self.move_key(k);
+            return;
+        }
+        if self.compose.is_some() && self.service == Service::GroupWise && self.focus != Focus::Command {
+            self.compose_key(k);
             return;
         }
         if self.totp && self.focus != Focus::Command {
@@ -348,7 +361,7 @@ impl App {
                 self.read_all(&[self.service]);
                 return;
             }
-            KeyCode::Char('i') | KeyCode::Char('a') if !matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle) => {
+            KeyCode::Char('i') | KeyCode::Char('a') if !matches!(self.service, Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise) => {
                 if self.current_chat().is_some() {
                     self.enter_insert();
                 } else {

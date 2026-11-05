@@ -471,6 +471,9 @@ pub enum Backend {
     Twos(Arc<Twos>),
     /// Read-only: courses and deadlines (deadlines can be ticked off).
     Moodle(Arc<Moodle>),
+    /// GroupWise mail: folders, mails, sending (with `:mail`, `r`).
+    #[cfg(feature = "groupwise")]
+    GroupWise(Arc<crate::groupwise::mail::GroupWise>),
 }
 
 impl Backend {
@@ -480,6 +483,8 @@ impl Backend {
             Backend::Microsoft(t) => t.sync().await.map(|(lists, tasks)| (lists, tasks, Vec::new())),
             Backend::Twos(t) => t.sync().await,
             Backend::Moodle(m) => m.sync().await,
+            #[cfg(feature = "groupwise")]
+            Backend::GroupWise(g) => g.sync().await,
         }
     }
 
@@ -487,18 +492,28 @@ impl Backend {
     pub fn poll(&self) -> Duration {
         match self {
             Backend::Moodle(m) => m.poll(),
+            #[cfg(feature = "groupwise")]
+            Backend::GroupWise(g) => g.poll(),
             _ => POLL,
         }
     }
 
     /// Whether tasks can be added, edited and deleted (not just ticked off).
     pub fn editable(&self) -> bool {
-        !matches!(self, Backend::Moodle(_))
+        !matches!(self, Backend::Moodle(_)) && !self.is_mail()
     }
 
     /// Whether the main pane shows whole lists (`page`) rather than task details.
     pub fn has_pages(&self) -> bool {
-        matches!(self, Backend::Twos(_) | Backend::Moodle(_))
+        matches!(self, Backend::Twos(_) | Backend::Moodle(_)) || self.is_mail()
+    }
+
+    /// The mail tab (GroupWise).
+    pub fn is_mail(&self) -> bool {
+        #[cfg(feature = "groupwise")]
+        return matches!(self, Backend::GroupWise(_));
+        #[cfg(not(feature = "groupwise"))]
+        false
     }
 
     pub async fn page(&self, list: &str) -> Result<Page, String> {
@@ -506,6 +521,8 @@ impl Backend {
             Backend::Microsoft(_) => Err("To Do lists have no pages".into()),
             Backend::Twos(t) => t.page(list).await,
             Backend::Moodle(m) => m.page(list).await,
+            #[cfg(feature = "groupwise")]
+            Backend::GroupWise(g) => g.page(list).await,
         }
     }
 
@@ -513,6 +530,8 @@ impl Backend {
     pub async fn download(&self, url: &str) -> Result<String, String> {
         match self {
             Backend::Moodle(m) => m.download(url).await,
+            #[cfg(feature = "groupwise")]
+            Backend::GroupWise(g) => g.download(url).await,
             _ => Err("nothing to download".into()),
         }
     }
@@ -523,6 +542,8 @@ impl Backend {
             Backend::Microsoft(t) => t.create(list, text).await,
             Backend::Twos(t) => t.create(list, text).await,
             Backend::Moodle(_) => Err(READ_ONLY.into()),
+            #[cfg(feature = "groupwise")]
+            Backend::GroupWise(_) => Err(READ_ONLY.into()),
         }
     }
 
@@ -531,6 +552,8 @@ impl Backend {
             Backend::Microsoft(t) => t.update(list, id, text).await,
             Backend::Twos(t) => t.update(id, text).await,
             Backend::Moodle(_) => Err(READ_ONLY.into()),
+            #[cfg(feature = "groupwise")]
+            Backend::GroupWise(_) => Err(READ_ONLY.into()),
         }
     }
 
@@ -539,6 +562,8 @@ impl Backend {
             Backend::Microsoft(t) => t.set_done(list, id, done).await,
             Backend::Twos(t) => t.set_done(id, done).await,
             Backend::Moodle(m) => m.set_done(id, done).await,
+            #[cfg(feature = "groupwise")]
+            Backend::GroupWise(_) => Err(READ_ONLY.into()),
         }
     }
 
@@ -547,6 +572,8 @@ impl Backend {
             Backend::Microsoft(t) => t.delete(list, id).await,
             Backend::Twos(t) => t.delete(id).await,
             Backend::Moodle(_) => Err(READ_ONLY.into()),
+            #[cfg(feature = "groupwise")]
+            Backend::GroupWise(_) => Err(READ_ONLY.into()),
         }
     }
 }

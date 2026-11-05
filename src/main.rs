@@ -211,6 +211,15 @@ fn main() {
                 if sound::BUILT {
                     built.push("sound");
                 }
+                if pdf::BUILT {
+                    built.push("PDF viewer");
+                }
+                if system::totp::BUILT {
+                    built.push("authenticator");
+                }
+                if cfg!(feature = "groupwise") {
+                    built.push("GroupWise");
+                }
                 return println!("discommand {} ({})", env!("CARGO_PKG_VERSION"), built.join(", "));
             }
             "--logout" => {
@@ -320,6 +329,7 @@ async fn run(wa_phone: Option<String>, paste_token: bool) -> Result<(), String> 
     app.todo_sync(Service::Tasks);
     app.todo_sync(Service::Twos);
     app.todo_sync(Service::Moodle);
+    app.todo_sync(Service::GroupWise);
     for ev in replay {
         app.on_event(AppEvent::Wa(Service::WhatsApp, ev));
     }

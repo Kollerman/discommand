@@ -10,6 +10,7 @@
 //! - `tree`: the sidebar
 //! - `keys`: what each key does
 //! - `pdf_viewer`: the PDF viewer
+//! - `mail`: the compose window of the GroupWise tab
 //! - `authenticator`: the authenticator tab (`:totp`)
 //! - `commands`: the `:` commands
 
@@ -18,6 +19,7 @@ mod chat;
 mod commands;
 mod authenticator;
 mod keys;
+pub mod mail;
 mod pdf_viewer;
 mod tasks;
 mod tree;
@@ -69,6 +71,9 @@ pub enum AppEvent {
     Transcript(String, Result<String, String>),
     /// A voice message started playing (its `voice::key`), this long.
     Playing(String, Result<std::time::Duration, String>),
+    /// Address suggestions for what was typed in the compose window.
+    #[cfg_attr(not(feature = "groupwise"), allow(dead_code))]
+    Suggest(String, Vec<(String, String)>),
     /// From the PDF viewer (opening, text, pictures of pages).
     Pdf(pdf_viewer::PdfMsg),
 }
@@ -135,6 +140,7 @@ pub enum Service {
     Tasks,
     Twos,
     Moodle,
+    GroupWise,
 }
 
 impl Service {
@@ -156,6 +162,8 @@ impl Service {
         Service::Twos,
         #[cfg(feature = "moodle")]
         Service::Moodle,
+        #[cfg(feature = "groupwise")]
+        Service::GroupWise,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -182,6 +190,7 @@ impl Service {
             Service::Tasks => "Microsoft To Do",
             Service::Twos => "Twos",
             Service::Moodle => "Moodle",
+            Service::GroupWise => "GroupWise",
         }
     }
 
@@ -197,7 +206,7 @@ impl Service {
 
     /// A task tab (one task app each, see `TaskTab`).
     pub fn is_tasks(self) -> bool {
-        matches!(self, Service::Tasks | Service::Twos | Service::Moodle)
+        matches!(self, Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise)
     }
 }
 
@@ -387,6 +396,7 @@ pub struct App {
     pub todo: TaskTab,
     pub twos: TaskTab,
     pub moodle: TaskTab,
+    pub groupwise: TaskTab,
 
     pub focus: Focus,
     /// Pane to return to when leaving insert/command mode.
@@ -456,6 +466,15 @@ pub struct App {
     pub clear_screen: bool,
     /// The authenticator tab is shown (`:totp`).
     pub totp: bool,
+    /// The compose window of the GroupWise tab, while a mail is written.
+    pub compose: Option<mail::Compose>,
+    /// The mails selected in the GroupWise tab (`x`, `a`), and the move menu (`m`).
+    #[cfg_attr(not(feature = "groupwise"), allow(dead_code))]
+    pub mail_selected: HashSet<String>,
+    pub mail_move: Option<mail::MoveMenu>,
+    /// Unread mails in the mailbox at the last sync, for the new-mail alert.
+    #[cfg_attr(not(feature = "groupwise"), allow(dead_code))]
+    mail_unread: Option<usize>,
 }
 
 impl App {
@@ -506,6 +525,7 @@ impl App {
             moodle: TaskTab::new(
                 moodle::Creds::load().filter(|_| Service::Moodle.built()).map(|c| Backend::Moodle(Arc::new(Moodle::new(c)))),
             ),
+            groupwise: TaskTab::new(groupwise_backend()),
             twos: TaskTab::new(twos::load_key().filter(|_| Service::Twos.built()).map(|k| Backend::Twos(Arc::new(Twos::new(k))))),
             focus: Focus::Tree,
             last_pane: Focus::Tree,
@@ -556,6 +576,10 @@ impl App {
             pdf_id: 0,
             clear_screen: false,
             totp: false,
+            compose: None,
+            mail_selected: HashSet::new(),
+            mail_move: None,
+            mail_unread: None,
         }
     }
 
@@ -605,7 +629,7 @@ impl App {
         match self.service {
             Service::Discord => self.current.as_deref(),
             Service::WhatsApp | Service::Matrix => self.open_of(self.service).as_deref(),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => None,
         }
     }
 
@@ -613,7 +637,7 @@ impl App {
         match self.service {
             Service::Discord => self.state.channel_title(id),
             Service::WhatsApp | Service::Matrix => self.chats(self.service).title(id),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => String::new(),
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => String::new(),
         }
     }
 
@@ -621,7 +645,7 @@ impl App {
         match self.service {
             Service::Discord => self.current_messages().iter().find(|m| m.id == id).map(|m| m.author.name().to_string()),
             Service::WhatsApp | Service::Matrix => self.wa_messages().iter().find(|m| m.id == id).map(|m| m.sender_name.clone()),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => None,
         }
     }
 
@@ -634,6 +658,7 @@ impl App {
             Service::Tasks => format!("t:{id}"),
             Service::Twos => format!("2:{id}"),
             Service::Moodle => format!("md:{id}"),
+            Service::GroupWise => format!("gw:{id}"),
         }
     }
 
@@ -671,7 +696,7 @@ impl App {
         match self.service {
             Service::Discord => self.loading.contains(id),
             Service::WhatsApp | Service::Matrix => self.chats(self.service).loading.contains(id),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => false,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => false,
         }
     }
 
@@ -679,7 +704,7 @@ impl App {
         match self.service {
             Service::Discord => self.state.complete.contains(id),
             Service::WhatsApp | Service::Matrix => self.chats(self.service).complete.contains(id),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => false,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => false,
         }
     }
 
@@ -687,7 +712,7 @@ impl App {
         let mut msgs = match self.service {
             Service::Discord => self.state.view_messages(id),
             Service::WhatsApp | Service::Matrix => self.chats(self.service).view_messages(id),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => None,
         }?;
         for m in &mut msgs {
             m.transcript = self.voice.get(&voice::key(self.service.name(), &m.id)).map(String::from);
@@ -707,7 +732,7 @@ impl App {
         match self.service {
             Service::Discord => self.current_messages().len(),
             Service::WhatsApp | Service::Matrix => self.wa_messages().len(),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => 0,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => 0,
         }
     }
 
@@ -718,7 +743,7 @@ impl App {
                 self.current_messages().iter().rposition(|m| &m.author.id == me)
             }
             Service::WhatsApp | Service::Matrix => self.wa_messages().iter().rposition(|m| m.from_me && !m.deleted),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => None,
         }
     }
 
@@ -726,7 +751,7 @@ impl App {
         match self.service {
             Service::Discord => self.selected_message().map(|m| m.id.clone()),
             Service::WhatsApp | Service::Matrix => self.wa_messages().get(self.msg_sel?).map(|m| m.id.clone()),
-            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle => None,
+            Service::Calendar | Service::Tasks | Service::Twos | Service::Moodle | Service::GroupWise => None,
         }
     }
 
@@ -779,7 +804,7 @@ impl App {
         if self.cal.next_poll.is_some_and(|t| t <= std::time::Instant::now()) {
             self.cal_sync();
         }
-        for s in [Service::Tasks, Service::Twos, Service::Moodle] {
+        for s in [Service::Tasks, Service::Twos, Service::Moodle, Service::GroupWise] {
             let tasks: Vec<String> = self.tab_mut(s).state.due_reminders(now).into_iter().map(|t| format!("☐ {}", t.title)).collect();
             if !tasks.is_empty() {
                 self.status = format!("⏰ {}: {}", s.name(), tasks.join(" · "));
@@ -838,6 +863,7 @@ impl App {
                 }
                 Err(e) => self.status = format!("couldn't play it: {e}"),
             },
+            AppEvent::Suggest(typed, people) => self.on_suggest(typed, people),
             AppEvent::Pdf(msg) => self.on_pdf(msg),
             AppEvent::Wa(s, ev) => self.on_wa(s, ev),
             AppEvent::Pic { key, pic } => self.pics.finish(key, pic),
@@ -873,6 +899,14 @@ async fn fetch_pic(http: &reqwest::Client, url: &str, key: String) -> Option<Pic
     }
     let bytes = resp.bytes().await.ok()?;
     tokio::task::spawn_blocking(move || pics::decode_for(&key, &bytes)).await.ok().flatten()
+}
+
+/// The mail tab's backend, once `--groupwise-login` has stored the login.
+fn groupwise_backend() -> Option<Backend> {
+    #[cfg(feature = "groupwise")]
+    return crate::groupwise::Creds::load().map(|c| Backend::GroupWise(Arc::new(crate::groupwise::mail::GroupWise::new(c))));
+    #[cfg(not(feature = "groupwise"))]
+    None
 }
 
 /// The reactions offered by the picker (`+`, then 1–5).

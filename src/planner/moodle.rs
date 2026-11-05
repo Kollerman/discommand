@@ -1602,6 +1602,20 @@ fn forms_free_links(html: &str) -> Vec<String> {
     out
 }
 
+/// HTML as the lines of a page (for mails too).
+#[cfg_attr(not(feature = "groupwise"), allow(dead_code))]
+pub fn html_text_lines(list: &str, html: &str, base: &Url) -> Vec<Task> {
+    html_lines(list, html, base).1
+}
+
+/// HTML as plain text with its line breaks (for quoting a mail).
+#[cfg_attr(not(feature = "groupwise"), allow(dead_code))]
+pub fn plain_text(html: &str) -> String {
+    let breaks = html.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n").replace("</p>", "\n\n").replace("</div>", "\n");
+    let text = plain(&breaks);
+    text.lines().map(str::trim_end).collect::<Vec<_>>().join("\n")
+}
+
 /// A Moodle page's main content (`role="main"`) as lines: headings, text,
 /// list items and links. Links to Moodle pages open as pages here, files
 /// download, other links go to the browser. Returns the title too.
