@@ -1,19 +1,83 @@
-//! Whisper with quantized weights, after candle-transformers'
-//! `whisper::quantized_model` (Apache-2.0/MIT), changed for speed and beam
-//! search: the decoder's view of the audio is prepared once per piece, each
-//! step only computes the new token (its earlier ones are cached), and the
-//! beams of a search run together as one batch.
+//! The Whisper model, after candle-transformers' `whisper::quantized_model`
+//! (Apache-2.0/MIT), changed for speed and beam search: the decoder's view of
+//! the audio is prepared once per piece, each step only computes the new
+//! token (its earlier ones are cached), and the beams of a search run
+//! together as one batch.
+//!
+//! Nothing here makes candle copy weights: its matrix product copies a
+//! matrix that is "broadcast" to a batch, which for the beams of a search
+//! meant hundreds of megabytes per word.
 
+use std::fs::File;
+use std::path::Path;
+
+use candle_core::quantized::QMatMul;
+use candle_core::quantized::gguf_file::Content;
 use candle_core::{D, Device, Module, Result, Tensor};
-use candle_nn::{Conv1d, Conv1dConfig, LayerNorm};
-use candle_transformers::models::whisper::Config;
-use candle_transformers::quantized_nn::{Embedding, Linear, layer_norm, linear, linear_no_bias};
-use candle_transformers::quantized_var_builder::VarBuilder;
+use candle_nn::{Conv1d, Conv1dConfig, Embedding, LayerNorm};
+use serde::Deserialize;
 
-fn conv1d(inputs: usize, outputs: usize, config: Conv1dConfig, vb: VarBuilder) -> Result<Conv1d> {
-    let weight = vb.get((outputs, inputs, 3), "weight")?.dequantize(vb.device())?;
-    let bias = vb.get(outputs, "bias")?.dequantize(vb.device())?;
-    Ok(Conv1d::new(weight, Some(bias), config))
+/// The model's sizes (`config.json`).
+#[derive(Deserialize)]
+pub struct Config {
+    pub num_mel_bins: usize,
+    pub max_source_positions: usize,
+    pub d_model: usize,
+    pub encoder_attention_heads: usize,
+    pub encoder_layers: usize,
+    pub vocab_size: usize,
+    pub max_target_positions: usize,
+    pub decoder_attention_heads: usize,
+    pub decoder_layers: usize,
+    /// Tokens Whisper never writes.
+    #[serde(default)]
+    pub suppress_tokens: Vec<u32>,
+}
+
+/// The weights file (GGUF); each tensor is read when asked for.
+struct Weights {
+    file: File,
+    content: Content,
+}
+
+impl Weights {
+    /// A tensor as plain numbers (the small ones: norms, positions, …).
+    fn get(&mut self, name: &str) -> Result<Tensor> {
+        self.content.tensor(&mut self.file, name, &Device::Cpu)?.dequantize(&Device::Cpu)
+    }
+
+    fn linear(&mut self, name: &str, bias: bool) -> Result<Linear> {
+        let bias = if bias { Some(self.get(&format!("{name}.bias"))?) } else { None };
+        let weight = self.content.tensor(&mut self.file, &format!("{name}.weight"), &Device::Cpu)?;
+        Ok(Linear { weight: QMatMul::from_qtensor(weight)?, bias })
+    }
+
+    fn layer_norm(&mut self, name: &str) -> Result<LayerNorm> {
+        Ok(LayerNorm::new(self.get(&format!("{name}.weight"))?, self.get(&format!("{name}.bias"))?, 1e-5))
+    }
+
+    fn conv1d(&mut self, name: &str, stride: usize) -> Result<Conv1d> {
+        let config = Conv1dConfig { padding: 1, stride, groups: 1, dilation: 1, cudnn_fwd_algo: None };
+        Ok(Conv1d::new(self.get(&format!("{name}.weight"))?, Some(self.get(&format!("{name}.bias"))?), config))
+    }
+}
+
+/// A linear layer, its weights still quantized (as they come in the file):
+/// multiplied that way they take a quarter of the memory, which also makes
+/// writing word after word faster than with plain numbers.
+struct Linear {
+    weight: QMatMul,
+    bias: Option<Tensor>,
+}
+
+impl Module for Linear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let y = self.weight.forward(x)?;
+        match &self.bias {
+            Some(bias) => y.broadcast_add(bias),
+            None => Ok(y),
+        }
+    }
 }
 
 struct Attention {
@@ -30,12 +94,12 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(state: usize, heads: usize, vb: VarBuilder) -> Result<Self> {
+    fn load(w: &mut Weights, name: &str, heads: usize) -> Result<Self> {
         Ok(Self {
-            query: linear(state, state, vb.pp("q_proj"))?,
-            key: linear_no_bias(state, state, vb.pp("k_proj"))?,
-            value: linear(state, state, vb.pp("v_proj"))?,
-            out: linear(state, state, vb.pp("out_proj"))?,
+            query: w.linear(&format!("{name}.q_proj"), true)?,
+            key: w.linear(&format!("{name}.k_proj"), false)?,
+            value: w.linear(&format!("{name}.v_proj"), true)?,
+            out: w.linear(&format!("{name}.out_proj"), true)?,
             heads,
             audio: None,
             earlier: None,
@@ -58,6 +122,13 @@ impl Attention {
     /// `x`: the tokens from position `at` on. `mask` (causal) and `at` are
     /// for the decoder's attention to its own tokens.
     fn forward(&mut self, x: &Tensor, audio: Option<&Tensor>, mask: Option<&Tensor>, flush: bool, at: usize) -> Result<Tensor> {
+        // Attention to the audio is the same for every token of every beam:
+        // they all go in one row, so the audio's keys and values (one row)
+        // needn't be copied for each beam.
+        if audio.is_some() && x.dim(0)? > 1 {
+            let (batch, ctx, state) = x.dims3()?;
+            return self.forward(&x.reshape((1, batch * ctx, state))?, audio, mask, flush, at)?.reshape((batch, ctx, state));
+        }
         let (k, v) = match audio {
             None if mask.is_some() => {
                 let (k, v) = self.keys_values(x)?;
@@ -79,13 +150,12 @@ impl Attention {
         let (_, ctx, state) = x.dims3()?;
         let scale = ((state / self.heads) as f64).powf(-0.25);
         let q = (self.heads(&self.query.forward(x)?)? * scale)?;
-        // Broadcast: several beams (a batch) attend to the same audio (one).
-        let mut qk = q.broadcast_matmul(&k)?;
+        let mut qk = q.matmul(&k)?;
         if let Some(mask) = mask.filter(|_| ctx > 1) {
             qk = qk.broadcast_add(&mask.narrow(0, at, ctx)?.narrow(1, 0, at + ctx)?)?;
         }
         let w = candle_nn::ops::softmax_last_dim(&qk)?;
-        let wv = w.broadcast_matmul(&v)?.transpose(1, 2)?.flatten_from(2)?;
+        let wv = w.matmul(&v)?.transpose(1, 2)?.flatten_from(2)?;
         self.out.forward(&wv)
     }
 
@@ -108,19 +178,19 @@ struct Block {
 }
 
 impl Block {
-    fn load(state: usize, heads: usize, cross: bool, vb: VarBuilder) -> Result<Self> {
+    fn load(w: &mut Weights, name: &str, heads: usize, cross: bool) -> Result<Self> {
         let cross = if cross {
-            Some((Attention::load(state, heads, vb.pp("encoder_attn"))?, layer_norm(state, 1e-5, vb.pp("encoder_attn_layer_norm"))?))
+            Some((Attention::load(w, &format!("{name}.encoder_attn"), heads)?, w.layer_norm(&format!("{name}.encoder_attn_layer_norm"))?))
         } else {
             None
         };
         Ok(Self {
-            attn: Attention::load(state, heads, vb.pp("self_attn"))?,
-            attn_ln: layer_norm(state, 1e-5, vb.pp("self_attn_layer_norm"))?,
+            attn: Attention::load(w, &format!("{name}.self_attn"), heads)?,
+            attn_ln: w.layer_norm(&format!("{name}.self_attn_layer_norm"))?,
             cross,
-            mlp1: linear(state, state * 4, vb.pp("fc1"))?,
-            mlp2: linear(state * 4, state, vb.pp("fc2"))?,
-            mlp_ln: layer_norm(state, 1e-5, vb.pp("final_layer_norm"))?,
+            mlp1: w.linear(&format!("{name}.fc1"), true)?,
+            mlp2: w.linear(&format!("{name}.fc2"), true)?,
+            mlp_ln: w.layer_norm(&format!("{name}.final_layer_norm"))?,
         })
     }
 
@@ -153,17 +223,16 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let conv = |stride| Conv1dConfig { padding: 1, stride, groups: 1, dilation: 1, cudnn_fwd_algo: None };
-        let state = cfg.d_model;
+    fn load(w: &mut Weights, cfg: &Config) -> Result<Self> {
+        let name = "model.encoder";
         Ok(Self {
-            conv1: conv1d(cfg.num_mel_bins, state, conv(1), vb.pp("conv1"))?,
-            conv2: conv1d(state, state, conv(2), vb.pp("conv2"))?,
-            positions: sinusoids(cfg.max_source_positions, state)?,
+            conv1: w.conv1d(&format!("{name}.conv1"), 1)?,
+            conv2: w.conv1d(&format!("{name}.conv2"), 2)?,
+            positions: sinusoids(cfg.max_source_positions, cfg.d_model)?,
             blocks: (0..cfg.encoder_layers)
-                .map(|i| Block::load(state, cfg.encoder_attention_heads, false, vb.pp(format!("layers.{i}"))))
+                .map(|i| Block::load(w, &format!("{name}.layers.{i}"), cfg.encoder_attention_heads, false))
                 .collect::<Result<_>>()?,
-            ln: layer_norm(state, 1e-5, vb.pp("layer_norm"))?,
+            ln: w.layer_norm(&format!("{name}.layer_norm"))?,
         })
     }
 
@@ -189,16 +258,17 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let (state, ctx) = (cfg.d_model, cfg.max_target_positions);
+    fn load(w: &mut Weights, cfg: &Config) -> Result<Self> {
+        let name = "model.decoder";
+        let ctx = cfg.max_target_positions;
         let mask: Vec<f32> = (0..ctx).flat_map(|i| (0..ctx).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 })).collect();
         Ok(Self {
-            tokens: Embedding::new(cfg.vocab_size, state, vb.pp("embed_tokens"))?,
-            positions: vb.get((ctx, state), "embed_positions.weight")?.dequantize(vb.device())?,
+            tokens: Embedding::new(w.get(&format!("{name}.embed_tokens.weight"))?, cfg.d_model),
+            positions: w.get(&format!("{name}.embed_positions.weight"))?,
             blocks: (0..cfg.decoder_layers)
-                .map(|i| Block::load(state, cfg.decoder_attention_heads, true, vb.pp(format!("layers.{i}"))))
+                .map(|i| Block::load(w, &format!("{name}.layers.{i}"), cfg.decoder_attention_heads, true))
                 .collect::<Result<_>>()?,
-            ln: layer_norm(state, 1e-5, vb.pp("layer_norm"))?,
+            ln: w.layer_norm(&format!("{name}.layer_norm"))?,
             mask: Tensor::from_vec(mask, (ctx, ctx), &Device::Cpu)?,
         })
     }
@@ -224,9 +294,12 @@ impl Decoder {
         Ok(())
     }
 
+    /// The score of every token of the vocabulary, for each row of `x`
+    /// (rows by model width).
     pub fn final_linear(&self, x: &Tensor) -> Result<Tensor> {
-        let w = self.tokens.embeddings().broadcast_left(x.dim(0)?)?;
-        x.matmul(&w.t()?)
+        // Embeddings times the rows as columns: the embeddings (160 MB) are
+        // used as they lie in memory, not copied.
+        self.tokens.embeddings().matmul(&x.t()?.contiguous()?)?.t()?.contiguous()
     }
 }
 
@@ -237,7 +310,11 @@ pub struct Whisper {
 }
 
 impl Whisper {
-    pub fn load(vb: &VarBuilder, config: Config) -> Result<Self> {
-        Ok(Self { encoder: Encoder::load(vb.pp("model.encoder"), &config)?, decoder: Decoder::load(vb.pp("model.decoder"), &config)?, config })
+    /// Reads the weights (a GGUF file).
+    pub fn load(weights: &Path, config: Config) -> Result<Self> {
+        let mut file = File::open(weights)?;
+        let content = Content::read(&mut file)?;
+        let mut w = Weights { file, content };
+        Ok(Self { encoder: Encoder::load(&mut w, &config)?, decoder: Decoder::load(&mut w, &config)?, config })
     }
 }

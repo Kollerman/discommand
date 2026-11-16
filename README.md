@@ -351,11 +351,13 @@ All of this is the `sound` option of the install script.
 - **Accurate.** German and English come out nearly word for word. Noise without
   speech may still turn into a stray phrase. Like OpenAI's own Whisper, it uses beam
   search: five candidate transcripts are followed at once, and the most likely one
-  wins, which avoids many single wrong words.
+  wins, which avoids many single wrong words. Whisper takes in 30 seconds at a time:
+  longer messages are cut in pauses, never in the middle of a word.
 - **Knows the chat.** Whisper is given the names in the chat and the last few text
   messages before the voice message (up to five, about 600 characters) as the text
   that came before. Names, course names and slang are then spelled the way the chat
-  writes them. This context stays on the computer too.
+  writes them. This context stays on the computer too. A short list of slang words
+  (`SLANG` in `src/audio/transcribe/mod.rs`) is always part of it.
 - **Kept.** Transcripts are saved in `<config dir>/discommand/transcripts.json`, so
   each message is transcribed only once. `--logout-a` deletes them.
 - **Built in by choice.** It's the `transcribe` option of the install script. Without

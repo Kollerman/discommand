@@ -2,20 +2,32 @@
 //! 259 MB, downloaded once on first use), run with candle (pure Rust, so no
 //! C++ tools are needed to build it). The audio never leaves the computer.
 
+mod mel;
 mod whisper;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{Device, Tensor};
-use candle_transformers::models::whisper::{self as m, Config, audio};
-use candle_transformers::quantized_var_builder::VarBuilder;
 use sha2::{Digest, Sha256};
 
-use whisper::Whisper;
+use whisper::{Config, Whisper};
 
 /// Mel filter bank of the Whisper models with 80 bins (from candle's example).
 const MEL_FILTERS: &[u8] = include_bytes!("melfilters.bytes");
+
+/// Whisper's own rule for leaving out a piece without speech: "no speech"
+/// is likelier than this and the words found are less sure than that.
+const NO_SPEECH: f64 = 0.6;
+const UNSURE: f64 = -1.0;
+/// The language changes from one piece to the next only when this sure.
+const LANGUAGE_SURE: f32 = 0.9;
+/// Slang Whisper wouldn't write by itself: always the start of the context,
+/// so these words are spelled this way when they are said. Add more here.
+const SLANG: &str = "For real, goated, goat, yippih.";
+/// Of the chat's context, this many tokens (its start: the names) stay with
+/// every piece; the rest makes room for what was said in the pieces before.
+const CONTEXT_KEPT: usize = 64;
 
 /// The model files: Whisper small, its weights quantized to 8 bits for
 /// candle, the rest from OpenAI; each pinned to one revision and checked
@@ -102,7 +114,20 @@ pub fn transcribe(data: &[u8], context: &str) -> Result<String, String> {
     let dir = model_dir().ok_or("no folder for the speech model")?;
     // Loaded for each message (in about a second) and dropped after: its
     // ~600 MB of memory are only in use while transcribing.
-    Model::load(&dir)?.transcribe(&pcm, context)
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads()).build().map_err(err)?;
+    pool.install(|| Model::load(&dir)?.transcribe(&pcm, context))
+}
+
+/// How many threads transcribing uses: half of the processor's (logical)
+/// cores when it has more than four. Those are its real or its fast cores;
+/// with the slow ones of a laptop (or hyper-threads) helping, the work takes
+/// longer, not shorter. `RAYON_NUM_THREADS` overrides it.
+fn threads() -> usize {
+    if let Some(n) = std::env::var("RAYON_NUM_THREADS").ok().and_then(|n| n.parse().ok()).filter(|n| *n > 0) {
+        return n;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cores > 4 { cores / 2 } else { cores }
 }
 
 struct Model {
@@ -117,39 +142,37 @@ impl Model {
     fn load(dir: &Path) -> Result<Self, String> {
         let config: Config = serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(err)?).map_err(err)?;
         let tokens = Tokens::load(&dir.join("tokenizer.json"))?;
-        let vb = VarBuilder::from_gguf(dir.join(WEIGHTS), &Device::Cpu).map_err(err)?;
         let suppress: Vec<f32> =
             (0..config.vocab_size as u32).map(|i| if config.suppress_tokens.contains(&i) { f32::NEG_INFINITY } else { 0.0 }).collect();
         let filters = MEL_FILTERS.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-        let whisper = Whisper::load(&vb, config).map_err(err)?;
+        let whisper = Whisper::load(&dir.join(WEIGHTS), config).map_err(err)?;
         Ok(Self { whisper, tokens, filters, suppress })
     }
 
     /// The text spoken in `pcm` (16 kHz mono), in its own language.
     fn transcribe(&mut self, pcm: &[f32], context: &str) -> Result<String, String> {
         let bins = self.whisper.config.num_mel_bins;
-        let mel = audio::pcm_to_mel(&self.whisper.config, pcm, &self.filters);
-        let frames = mel.len() / bins;
-        let mel = Tensor::from_vec(mel, (1, bins, frames), &Device::Cpu).map_err(err)?;
-        // What came before: the context, then (as Whisper does it) what was
-        // understood in the pieces so far.
-        let mut before = if context.trim().is_empty() { Vec::new() } else { self.tokens.encode(&format!(" {}", context.trim())) };
-        // The spectrogram is padded with silence: stop at the end of the audio.
-        let content = pcm.len() / m::HOP_LENGTH;
+        let context = self.tokens.encode(format!(" {SLANG} {}", context.trim()).trim_end());
+        // Half of what the model can take in is for the text before a piece.
+        let room = self.whisper.config.max_target_positions / 2 - 1;
+        let mut said: Vec<u32> = Vec::new();
+        let mut language = None;
         let mut text = String::new();
-        let mut seek = 0;
-        while seek < content {
-            let len = m::N_FRAMES.min(frames - seek);
-            let segment = mel.narrow(2, seek, len).map_err(err)?;
-            seek += len;
-            let said = self.segment(&segment, &before).map_err(err)?;
-            let part = self.tokens.text(&said);
+        for piece in mel::pieces(pcm) {
+            // Nothing can be said in a tenth of a second.
+            if piece.len() < mel::RATE / 10 {
+                continue;
+            }
+            let mel = mel::spectrogram(&pcm[piece], &self.filters, bins);
+            let mel = Tensor::from_vec(mel, (1, bins, mel::FRAMES), &Device::Cpu).map_err(err)?;
+            let tokens = self.segment(&mel, &before(&context, &said, room), &mut language).map_err(err)?;
+            let part = self.tokens.text(&tokens);
             if !part.is_empty() {
                 if !text.is_empty() {
                     text.push(' ');
                 }
                 text.push_str(&part);
-                before.extend(said);
+                said.extend(tokens);
             }
         }
         Ok(text)
@@ -157,23 +180,30 @@ impl Model {
 
     /// One 30-second piece: its language, then the words, found by beam
     /// search as OpenAI's Whisper does it (`BEAMS` candidates at a time).
-    /// `before`: the text before it, as tokens (its end is used, up to half
-    /// of what the model can take in).
-    fn segment(&mut self, mel: &Tensor, before: &[u32]) -> candle_core::Result<Vec<u32>> {
+    /// `before`: the text before it, as tokens. `language`: the one of the
+    /// piece before; kept unless this piece is clearly in another.
+    fn segment(&mut self, mel: &Tensor, before: &[u32], language: &mut Option<u32>) -> candle_core::Result<Vec<u32>> {
         let t = &self.tokens;
-        let features = self.whisper.encoder.forward(mel)?;
+            let features = self.whisper.encoder.forward(mel)?;
         let decoder = &mut self.whisper.decoder;
         // The language: the most likely language token after the start.
         let start = scores(decoder, &features, &[t.sot], 1, 0, true)?.remove(0);
         let langs = t.sot as usize + 1..t.translate as usize;
-        let lang = langs.clone().max_by(|&a, &b| start[a].total_cmp(&start[b])).unwrap_or(langs.start) as u32;
+        let heard = langs.clone().max_by(|&a, &b| start[a].total_cmp(&start[b])).unwrap_or(langs.start);
+        // How sure, among the languages only.
+        let sure = 1.0 / langs.clone().map(|l| (start[l] - start[heard]).exp()).sum::<f32>();
+        let lang = match *language {
+            Some(l) if l != heard as u32 && sure < LANGUAGE_SURE => l,
+            _ => heard as u32,
+        };
+        *language = Some(lang);
         let no_speech = log_probs(&start, None)[t.no_speech as usize].exp() as f64;
 
         let max = self.whisper.config.max_target_positions;
         let mut prompt = Vec::new();
         if !before.is_empty() {
             prompt.push(t.prev);
-            prompt.extend_from_slice(&before[before.len().saturating_sub(max / 2 - 1)..]);
+            prompt.extend_from_slice(before);
         }
         prompt.extend([t.sot, lang, t.transcribe, t.no_timestamps]);
 
@@ -229,11 +259,22 @@ impl Model {
         let avg = |(tokens, score): &(Vec<u32>, f64)| score / tokens.len().max(1) as f64;
         let Some(said) = done.into_iter().max_by(|a, b| avg(a).total_cmp(&avg(b))) else { return Ok(Vec::new()) };
         // Silence or noise: Whisper's own rule for leaving a piece out.
-        if no_speech > m::NO_SPEECH_THRESHOLD && avg(&said) < m::LOGPROB_THRESHOLD {
+        if no_speech > NO_SPEECH && avg(&said) < UNSURE {
             return Ok(Vec::new());
         }
         Ok(said.0)
     }
+}
+
+/// The text given to Whisper as what came before a piece, at most `room`
+/// tokens: the chat's context, then what was said in the pieces so far. As
+/// that grows, the context gives way from its end; its start (the names in
+/// the chat) stays, so names are still spelled right late in a long message.
+fn before(context: &[u32], said: &[u32], room: usize) -> Vec<u32> {
+    let kept = context.len().min(CONTEXT_KEPT).min(room);
+    let said = &said[said.len().saturating_sub(room - kept)..];
+    let context = &context[..context.len().min(room - said.len())];
+    [context, said].concat()
 }
 
 /// Candidates followed at a time (as in OpenAI's Whisper).
@@ -244,7 +285,7 @@ const BEAMS: usize = 5;
 fn scores(decoder: &mut whisper::Decoder, audio: &Tensor, input: &[u32], rows: usize, at: usize, flush: bool) -> candle_core::Result<Vec<Vec<f32>>> {
     let len = input.len() / rows;
     let ys = decoder.forward(&Tensor::from_slice(input, (rows, len), &Device::Cpu)?, audio, flush, at)?;
-    decoder.final_linear(&ys.narrow(1, len - 1, 1)?)?.squeeze(1)?.to_vec2()
+    decoder.final_linear(&ys.narrow(1, len - 1, 1)?.squeeze(1)?)?.to_vec2()
 }
 
 /// Log-probabilities from scores; `suppress` rules tokens out (-∞).
@@ -341,12 +382,12 @@ impl Tokens {
         let id = |s: &str| special.get(s).copied().ok_or(format!("tokenizer.json: no {s}"));
         Ok(Self {
             prev: id("<|startofprev|>")?,
-            sot: id(m::SOT_TOKEN)?,
-            eot: id(m::EOT_TOKEN)?,
-            translate: id(m::TRANSLATE_TOKEN)?,
-            transcribe: id(m::TRANSCRIBE_TOKEN)?,
-            no_timestamps: id(m::NO_TIMESTAMPS_TOKEN)?,
-            no_speech: m::NO_SPEECH_TOKENS.iter().find_map(|s| id(s).ok()).ok_or("tokenizer.json: no no-speech token")?,
+            sot: id("<|startoftranscript|>")?,
+            eot: id("<|endoftext|>")?,
+            translate: id("<|translate|>")?,
+            transcribe: id("<|transcribe|>")?,
+            no_timestamps: id("<|notimestamps|>")?,
+            no_speech: ["<|nocaptions|>", "<|nospeech|>"].iter().find_map(|s| id(s).ok()).ok_or("tokenizer.json: no no-speech token")?,
             text,
             ids,
             merges,
@@ -473,6 +514,20 @@ mod tests {
     }
 
     #[test]
+    fn names_stay_in_the_context() {
+        let context: Vec<u32> = (0..100).collect();
+        // Nothing said yet: the context, as far as there is room.
+        assert_eq!(super::before(&context, &[], 223), context);
+        // Much said: its end, after the start of the context.
+        let said: Vec<u32> = (1000..1400).collect();
+        let b = super::before(&context, &said, 223);
+        assert_eq!(b.len(), 223);
+        assert_eq!(b[..super::CONTEXT_KEPT], context[..super::CONTEXT_KEPT]);
+        assert_eq!(b[super::CONTEXT_KEPT], 1400 - (223 - super::CONTEXT_KEPT as u32));
+        assert_eq!(b[222], 1399);
+    }
+
+    #[test]
     fn splits_like_gpt2() {
         assert_eq!(pieces(" Hallo Anna, wie geht's?"), [" Hallo", " Anna", ",", " wie", " geht", "'s", "?"]);
         assert_eq!(pieces("um 15:30  Uhr\nok"), ["um", " 15", ":", "30", " ", " Uhr", "\n", "ok"]);
@@ -509,3 +564,4 @@ mod tests {
         assert_eq!(map[&'a'], b'a');
     }
 }
+

@@ -23,7 +23,7 @@ twos = []
 moodle = []
 # Voice messages to text (t), on this computer: Whisper "small", run with candle
 # (pure Rust). The 259 MB model is downloaded on first use.
-transcribe = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:ogg", "dep:opus-decoder"]
+transcribe = ["dep:candle-core", "dep:candle-nn", "dep:rayon", "dep:ogg", "dep:opus-decoder"]
 # Sound: voice messages played (p), with a retro crunch, and an alert for new
 # messages while the window isn't focused. Linux needs the ALSA headers (libasound2-dev).
 # PDFs shown in the app: pages as pictures (Sixel or Kitty, where the terminal can) and
@@ -80,7 +80,8 @@ mime = { version = "0.3", optional = true }
 # for voice messages.
 candle-core = { version = "0.11", optional = true }
 candle-nn = { version = "0.11", optional = true }
-candle-transformers = { version = "0.11", default-features = false, optional = true }
+# Already used by candle: named here to choose how many cores transcribing takes.
+rayon = { version = "1", optional = true }
 ogg = { version = "0.9", optional = true }
 opus-decoder = { version = "0.1", optional = true }
 # PDFs: hayro draws and reads them; ratatui-image puts the pictures on screen (8.x is
@@ -105,7 +106,6 @@ security-framework = "3"
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+lto = "thin"
 strip = true
 panic = "abort"
