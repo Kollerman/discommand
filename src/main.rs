@@ -151,6 +151,7 @@ async fn logout_all() {
         moodle::Creds::remove();
         println!("Moodle: login removed");
     }
+    moodle::forget_recent();
     if twos::load_key().is_some() {
         twos::remove_key();
         println!("Twos: API key removed (revoke it in Twos → Settings → API Keys)");
@@ -427,6 +428,8 @@ async fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, rx: &mut Unbo
                 app.rebuild_tree();
             }
             app.sync_page();
+            // A PDF page made ahead is put in place before drawing.
+            app.load_pdf_page();
             terminal.draw(|f| ui::draw(f, app))?;
             app.dirty = false;
             app.load_pics();

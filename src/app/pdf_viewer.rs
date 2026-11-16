@@ -93,12 +93,17 @@ impl App {
                 v.making = None;
                 match result {
                     Ok((picture, page)) => {
-                        // Where the old picture showed and the new one doesn't, it must go.
-                        if v.picture.as_ref().is_some_and(|(s, _)| s.cells != shot.cells) {
-                            self.clear_screen = true;
+                        // The page drawn is kept for scrolling it; the picture is
+                        // shown if it's the one needed now, else kept for later.
+                        let area = v.area;
+                        if v.drawn.as_ref().is_none_or(|(p, ..)| *p != v.page) || shot.page == v.page {
+                            v.drawn = Some((shot.page, shot.width, page));
                         }
-                        v.picture = Some((shot, picture));
-                        v.drawn = Some((shot.page, shot.width, page));
+                        if v.shot(area) == Some(shot) {
+                            self.clear_screen |= show(v, shot, picture);
+                        } else {
+                            v.take_picture(shot, picture);
+                        }
                     }
                     Err(e) => self.status = e,
                 }
@@ -107,24 +112,43 @@ impl App {
         }
     }
 
-    /// After drawing: makes the picture the page view needs, if it isn't
-    /// there yet. One at a time; the newest wish is made next.
+    /// Makes the pictures the page view needs, one at a time: this page's
+    /// first, then (while nothing else is asked for) the next two pages and
+    /// the one before, so turning pages shows them at once. Runs before and
+    /// after drawing.
     pub fn load_pdf_page(&mut self) {
         let Some(v) = self.pdf.as_mut() else { return };
-        if v.text_view || v.making.is_some() {
+        if v.text_view {
             return;
         }
         let area = v.area;
         let Some(shot) = v.shot(area) else { return };
-        if v.picture.as_ref().is_some_and(|(s, _)| *s == shot) {
+        let shown = v.picture.as_ref().is_some_and(|(s, _)| *s == shot);
+        // Made ahead: shown right away.
+        if !shown {
+            if let Some(picture) = v.ready_picture(&shot) {
+                self.clear_screen |= show(v, shot, picture);
+                self.dirty = true;
+                return;
+            }
+        }
+        if v.making.is_some() {
             return;
         }
-        v.making = Some(shot);
-        let drawn = v.drawn.as_ref().filter(|(p, w, _)| *p == shot.page && *w == shot.width).map(|d| d.2.clone());
+        let want = if shown {
+            match v.neighbours(area).into_iter().find(|s| !v.is_ready(s)) {
+                Some(s) => s,
+                None => return,
+            }
+        } else {
+            shot
+        };
+        v.making = Some(want);
+        let drawn = v.drawn.as_ref().filter(|(p, w, _)| *p == want.page && *w == want.width).map(|d| d.2.clone());
         let (data, id) = (v.data.clone(), v.id);
         self.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || pdf::picture(&data, shot, drawn)).await.map_err(|e| e.to_string()).and_then(|r| r);
-            Some(AppEvent::Pdf(PdfMsg::Picture(id, shot, result)))
+            let result = tokio::task::spawn_blocking(move || pdf::picture(&data, want, drawn)).await.map_err(|e| e.to_string()).and_then(|r| r);
+            Some(AppEvent::Pdf(PdfMsg::Picture(id, want, result)))
         });
     }
 
@@ -256,6 +280,21 @@ impl App {
             None => self.status = format!("“{}” isn't in this PDF", v.search),
         }
     }
+}
+
+/// Shows a picture as this page's; the one it replaces is kept if it was
+/// another page's (to go back to). Whether the screen must be cleared: where
+/// the old picture showed and the new one doesn't, it would stay.
+fn show(v: &mut Viewer, shot: Shot, picture: Picture) -> bool {
+    let mut clear = false;
+    if let Some((old, old_picture)) = v.picture.take() {
+        clear = old.cells != shot.cells;
+        if old.page != shot.page {
+            v.take_picture(old, old_picture);
+        }
+    }
+    v.picture = Some((shot, picture));
+    clear
 }
 
 /// Scrolls: lines in the text view; in the page view down the page, and on

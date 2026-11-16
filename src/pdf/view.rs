@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 use ratatui::layout::Rect;
 
+/// Pictures kept ready besides the one shown: the next two pages and the
+/// one before (from its top and its end).
+const READY_MAX: usize = 4;
+
 /// A page encoded for the terminal (Sixel, Kitty, or half blocks).
 #[cfg(feature = "pdf")]
 pub type Picture = ratatui_image::protocol::Protocol;
@@ -52,6 +56,9 @@ pub struct Viewer {
     /// The picture shown, and the one being made.
     pub picture: Option<(Shot, Picture)>,
     pub making: Option<Shot>,
+    /// Pictures made ahead (the pages around this one), to show at once
+    /// when turned to.
+    pub ready: Vec<(Shot, Picture)>,
     /// The last page drawn (page, width), kept so scrolling only crops it.
     pub drawn: Option<(usize, u32, Arc<image::RgbaImage>)>,
     /// Which opening this is: answers for an earlier one are dropped.
@@ -79,6 +86,7 @@ impl Viewer {
             area: Rect::default(),
             picture: None,
             making: None,
+            ready: Vec::new(),
             drawn: None,
             id,
         }
@@ -87,8 +95,16 @@ impl Viewer {
     /// The picture the page view needs now, for `area` (cells), if any;
     /// scrolling is kept within the page.
     pub fn shot(&mut self, area: Rect) -> Option<Shot> {
+        let (shot, top, left) = self.shot_of(self.page, self.top, self.left, area)?;
+        (self.top, self.left) = (top, left);
+        Some(shot)
+    }
+
+    /// The picture page `page` needs, scrolled to `top` and `left` (in cells,
+    /// kept within the page: those are returned too).
+    fn shot_of(&self, page: usize, top: u16, left: u16, area: Rect) -> Option<(Shot, u16, u16)> {
         let (cw, ch) = cell_size();
-        let &(pw, ph) = self.pages.get(self.page)?;
+        let &(pw, ph) = self.pages.get(page)?;
         if area.width == 0 || area.height == 0 || pw <= 0.0 || ph <= 0.0 {
             return None;
         }
@@ -99,15 +115,54 @@ impl Viewer {
         // Scrolled no further than to the page's end.
         let max_top = height.div_ceil(ch as u32).saturating_sub(area.height as u32) as u16;
         let max_left = width.div_ceil(cw as u32).saturating_sub(area.width as u32) as u16;
-        self.top = self.top.min(max_top);
-        self.left = self.left.min(max_left);
-        let (x, y) = (self.left as u32 * cw as u32, self.top as u32 * ch as u32);
+        let (top, left) = (top.min(max_top), left.min(max_left));
+        let (x, y) = (left as u32 * cw as u32, top as u32 * ch as u32);
         let crop = (x, y, (width - x).min(box_w as u32), (height - y).min(box_h as u32));
         // A page narrower than the space is centered.
         let cols = (crop.2.div_ceil(cw as u32) as u16).min(area.width);
         let rows = (crop.3.div_ceil(ch as u32) as u16).min(area.height);
         let cells = Rect::new(area.x + (area.width - cols) / 2, area.y, cols, rows);
-        Some(Shot { page: self.page, width, crop, cells })
+        Some((Shot { page, width, crop, cells }, top, left))
+    }
+
+    /// The pictures worth having ready besides this page's: the next two
+    /// pages and the one before, as they look when turned to (from their
+    /// top; the one before also from its end, for scrolling back up).
+    pub fn neighbours(&self, area: Rect) -> Vec<Shot> {
+        let p = self.page;
+        let wanted = [(p + 1, 0), (p + 2, 0), (p.wrapping_sub(1), 0), (p.wrapping_sub(1), u16::MAX)];
+        let mut out: Vec<Shot> = Vec::new();
+        for (page, top) in wanted {
+            if let Some((shot, ..)) = self.shot_of(page, top, self.left, area) {
+                if !out.contains(&shot) {
+                    out.push(shot);
+                }
+            }
+        }
+        out
+    }
+
+    /// A finished picture: shown if it's the one needed, kept for later if it's
+    /// for a page near this one (older ones are let go).
+    pub fn take_picture(&mut self, shot: Shot, picture: Picture) {
+        self.ready.retain(|(s, _)| *s != shot);
+        self.ready.push((shot, picture));
+        let near = self.page.saturating_sub(1)..=self.page + 2;
+        self.ready.retain(|(s, _)| near.contains(&s.page));
+        // At most one per page and way of looking at it, newest kept.
+        while self.ready.len() > READY_MAX {
+            self.ready.remove(0);
+        }
+    }
+
+    /// The picture for `shot` from the ready ones, if it was made already.
+    pub fn ready_picture(&mut self, shot: &Shot) -> Option<Picture> {
+        let i = self.ready.iter().position(|(s, _)| s == shot)?;
+        Some(self.ready.remove(i).1)
+    }
+
+    pub fn is_ready(&self, shot: &Shot) -> bool {
+        self.ready.iter().any(|(s, _)| s == shot) || self.picture.as_ref().is_some_and(|(s, _)| s == shot)
     }
 
     /// Whether the page view is at the top or bottom of the page.
@@ -247,6 +302,27 @@ mod tests {
         assert!(v.top > 0);
         assert_eq!(s.crop.1 + s.crop.3, (s.width as f32 * 842.0 / 595.0).round() as u32);
         assert!(v.at_bottom());
+    }
+
+    #[test]
+    fn prepares_the_pages_around() {
+        let mut v = viewer();
+        v.pages = vec![(595.0, 842.0); 5];
+        let area = Rect::new(0, 0, 100, 40);
+        // On the first page: the next two (no page before it).
+        assert_eq!(v.neighbours(area).iter().map(|s| s.page).collect::<Vec<_>>(), [1, 2]);
+        // In the middle: the next two and the one before (whole pages fit, so
+        // its top and end are the same picture).
+        v.page = 2;
+        assert_eq!(v.neighbours(area).iter().map(|s| s.page).collect::<Vec<_>>(), [3, 4, 1]);
+        // Page width, taller than the screen: the page before from its end too.
+        v.fit_width = true;
+        let n = v.neighbours(area);
+        assert_eq!(n.iter().map(|s| s.page).collect::<Vec<_>>(), [3, 4, 1, 1]);
+        assert!(n[3].crop.1 > n[2].crop.1);
+        // On the last page: only the one before.
+        v.page = 4;
+        assert!(v.neighbours(area).iter().all(|s| s.page == 3));
     }
 
     #[test]

@@ -89,7 +89,9 @@ pub enum TodoMsg {
     /// A task changed; the text is shown, and `true` re-syncs.
     Changed(String, bool),
     /// A file linked from a page was downloaded (its path), to be opened.
-    File(Result<String, String>),
+    /// With what to remember it by in "Recently viewed": its name, where it
+    /// was shown and its address.
+    File(Option<(String, String, String)>, Result<String, String>),
     /// An action was prepared and checked: ask before doing it.
     Confirm(Result<Box<Confirm>, String>),
     /// An action on a page finished (the page to read again, and what happened).

@@ -395,7 +395,8 @@ dialog). There are two views of the same PDF, `Tab` switches between them:
 PDFs are read with [hayro](https://github.com/LaurenzV/hayro), which is pure Rust, so
 nothing extra is needed to build. It draws the vast majority of PDFs correctly;
 password-protected ones can't be opened. Pages are drawn in the background, about
-0.1–0.5 s each. Discord attachments are downloaded into the cache folder first (at most
+0.1–0.5 s each. While you read, the next two pages and the one before are drawn
+ahead, so turning pages shows them at once. Discord attachments are downloaded into the cache folder first (at most
 100 MB). It's the `pdf` option of the install script.
 
 ## Authenticator
@@ -580,7 +581,9 @@ password (hidden).
 
 - **Sidebar:** **Deadlines** first (assignments, quizzes and the like from the last
   two weeks on, overdue ones in red), then **Notifications** (the bell) and
-  **Messages** with their unread counts, **Grades**, and your courses. GRIPS users get
+  **Messages** with their unread counts, **Grades**, **Recently viewed** (the last 30
+  files you opened from Moodle, with their course; kept on this computer, `--logout-a`
+  deletes the list), and your courses. GRIPS users get
   their own "Meine Kurse" folders; other sites group courses by course category.
   Folders with running courses start open.
 - **Main pane:** a course opens as a page of its sections and activities.

@@ -711,6 +711,9 @@ impl Moodle {
         if self.creds.token.is_empty() {
             lists.push(TaskList { id: GRADES.into(), name: "Grades".into(), emoji: "📊".into(), pos: 3, ..TaskList::default() });
         }
+        // Kept on this computer: no request needed.
+        lists.push(recent_list());
+        pages.push(recent_page());
         Ok((lists, tasks, pages))
     }
 
@@ -2160,6 +2163,87 @@ fn unread_in(title: &str) -> usize {
 pub const NOTIFICATIONS: &str = "notifications";
 pub const MESSAGES: &str = "messages";
 pub const GRADES: &str = "grades";
+pub const RECENT: &str = "recent";
+
+// ---- recently viewed ---------------------------------------------------------
+
+/// How many files the "Recently viewed" list keeps.
+const RECENT_MAX: usize = 30;
+
+/// A file opened from Moodle: its name, where it was shown (the course or
+/// page), its download address and when.
+#[derive(Serialize, Deserialize, Clone)]
+struct Viewed {
+    title: String,
+    #[serde(default)]
+    from: String,
+    url: String,
+    at: i64,
+}
+
+fn recent_path() -> Option<std::path::PathBuf> {
+    secret::data_dir().map(|d| d.join("moodle_recent.json"))
+}
+
+fn load_recent() -> Vec<Viewed> {
+    recent_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Remembers a file that was opened (most recent first; once each).
+pub fn remember_recent(title: &str, from: &str, url: &str) {
+    let mut all = load_recent();
+    all.retain(|v| v.url != url);
+    all.insert(0, Viewed { title: title.trim().to_string(), from: from.trim().to_string(), url: url.to_string(), at: Local::now().timestamp() });
+    all.truncate(RECENT_MAX);
+    if let (Some(path), Ok(json)) = (recent_path(), serde_json::to_vec(&all)) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// What a file in the list was remembered by: its name and page.
+pub fn recent_entry(url: &str) -> Option<(String, String)> {
+    load_recent().into_iter().find(|v| v.url == url).map(|v| (v.title, v.from))
+}
+
+/// Forgets the files opened (`--logout-a`).
+pub fn forget_recent() {
+    if let Some(p) = recent_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// The list of recently viewed files.
+pub fn recent_list() -> TaskList {
+    TaskList { id: RECENT.into(), name: "Recently viewed".into(), emoji: "🕘".into(), pos: 4, ..TaskList::default() }
+}
+
+/// The page of recently viewed files: opening one downloads it again (so
+/// it's current), like opening it in its course.
+pub fn recent_page() -> Page {
+    let mut lines: Vec<Task> = load_recent()
+        .into_iter()
+        .map(|v| {
+            let from = if v.from.is_empty() { String::new() } else { format!(" — {}", v.from) };
+            Task { title: format!("📄 {}  · {}{from}", v.title, day(Some(v.at))), sublist: Some(format!("{FILE}{}", v.url)), ..Task::default() }
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Task { title: "Nothing opened yet: files you open in a course appear here.".into(), ..Task::default() });
+    }
+    numbered(RECENT, "Recently viewed", "🕘", lines)
+}
+
+#[cfg(test)]
+mod recent_tests {
+    use super::{RECENT, recent_page};
+
+    #[test]
+    fn recent_page_always_has_a_line() {
+        let page = recent_page();
+        assert_eq!(page.list, RECENT);
+        assert!(!page.lines.is_empty());
+    }
+}
 pub const CONVERSATION: &str = "conversation:";
 /// Messages read per request, and at most per chat.
 const CHAT_PAGE: usize = 100;

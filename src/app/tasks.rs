@@ -63,6 +63,19 @@ impl App {
         }
     }
 
+    /// A downloaded file: PDFs in the viewer, other safe types in their
+    /// program, anything that could run code only shown in its folder.
+    fn open_downloaded(&mut self, path: String) {
+        if crate::pdf::is_pdf(&path) {
+            return self.open_pdf(path.into());
+        }
+        self.status = match open_file(&path) {
+            Ok(true) => format!("opened {path}"),
+            Ok(false) => format!("saved {path}; not opened because this file type can run code"),
+            Err(e) => format!("could not open {path}: {e}"),
+        };
+    }
+
     pub fn todo_sync(&mut self, s: Service) {
         let tab = self.tab_mut(s);
         let Some(api) = tab.api.clone() else { return };
@@ -103,13 +116,19 @@ impl App {
                 }
                 self.done_refreshing();
             }
-            TodoMsg::File(Ok(path)) if crate::pdf::is_pdf(&path) => self.open_pdf(path.into()),
-            TodoMsg::File(Ok(path)) => match open_file(&path) {
-                Ok(true) => self.status = format!("opened {path}"),
-                Ok(false) => self.status = format!("saved {path}; not opened because this file type can run code"),
-                Err(e) => self.status = format!("could not open {path}: {e}"),
-            },
-            TodoMsg::File(Err(e)) => self.status = e,
+            TodoMsg::File(viewed, Ok(path)) => {
+                if let Some((title, from, url)) = viewed {
+                    moodle::remember_recent(&title, &from, &url);
+                    let st = &mut self.tab_mut(s).state;
+                    if !st.lists.iter().any(|l| l.id == moodle::RECENT) {
+                        st.lists.push(moodle::recent_list());
+                    }
+                    st.pages.insert(moodle::RECENT.into(), moodle::recent_page());
+                    self.tree_dirty = true;
+                }
+                self.open_downloaded(path);
+            }
+            TodoMsg::File(_, Err(e)) => self.status = e,
             TodoMsg::Confirm(Ok(c)) => {
                 self.status.clear();
                 self.confirm = Some(c);
@@ -423,8 +442,21 @@ impl App {
                 if let (Some(url), false) = (file, browser) {
                     let s = self.service;
                     let Some(api) = self.tab(s).api.clone() else { return };
-                    self.status = format!("downloading {}…", t.title);
-                    self.spawn(async move { Some(AppEvent::Todo(s, TodoMsg::File(api.download(&url).await))) });
+                    // Remembered as shown: by its name and its page (in "Recently
+                    // viewed" itself, by what it was remembered with).
+                    let tab = self.tab(s);
+                    let page = tab.page.as_deref().unwrap_or("");
+                    let viewed = match (s, page) {
+                        (Service::Moodle, moodle::RECENT) => moodle::recent_entry(&url).map(|(title, from)| (title, from, url.clone())),
+                        (Service::Moodle, _) => {
+                            let from = tab.state.pages.get(page).map(|p| p.title.clone()).unwrap_or_default();
+                            Some((t.title.clone(), from, url.clone()))
+                        }
+                        _ => None,
+                    };
+                    let name = viewed.as_ref().map(|v| v.0.clone()).or_else(|| self.page_task().map(|t| t.title.clone())).unwrap_or_default();
+                    self.status = format!("downloading {name}…");
+                    self.spawn(async move { Some(AppEvent::Todo(s, TodoMsg::File(viewed, api.download(&url).await))) });
                 } else if let (Some(sub), false) = (t.sublist.clone(), browser) {
                     let tab = self.tab_mut(self.service);
                     if let Some(current) = tab.page.replace(sub.clone()) {
